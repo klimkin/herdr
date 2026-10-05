@@ -1297,8 +1297,8 @@ impl Terminal {
         for x in 0..cols {
             grid_ref.x = x;
             let wide = grid_ref_wide(&grid_ref)?;
-            grid_ref_graphemes_into(&grid_ref, &mut graphemes)?;
-            visit(wide, &graphemes);
+            let cell_graphemes = grid_ref_graphemes_into(&grid_ref, &mut graphemes)?;
+            visit(wide, cell_graphemes);
         }
         Ok(())
     }
@@ -2341,26 +2341,37 @@ fn grid_ref_graphemes(grid_ref: &ffi::GhosttyGridRef) -> Result<Vec<u32>, Error>
     Ok(buffer)
 }
 
-fn grid_ref_graphemes_into(
+#[cfg(test)]
+thread_local! {
+    static GRID_REF_GRAPHEME_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[inline]
+fn read_grid_ref_graphemes(
     grid_ref: &ffi::GhosttyGridRef,
-    buffer: &mut Vec<u32>,
-) -> Result<(), Error> {
-    let mut required = 0usize;
-    let result =
-        unsafe { ffi::ghostty_grid_ref_graphemes(grid_ref, ptr::null_mut(), 0, &mut required) };
-    if result != ffi::GhosttyResult_GHOSTTY_OUT_OF_SPACE {
-        result.into_result()?;
+    buffer: &mut [u32],
+    written: &mut usize,
+) -> ffi::GhosttyResult {
+    #[cfg(test)]
+    GRID_REF_GRAPHEME_CALLS.with(|calls| calls.set(calls.get() + 1));
+    unsafe { ffi::ghostty_grid_ref_graphemes(grid_ref, buffer.as_mut_ptr(), buffer.len(), written) }
+}
+
+fn grid_ref_graphemes_into<'a>(
+    grid_ref: &ffi::GhosttyGridRef,
+    buffer: &'a mut Vec<u32>,
+) -> Result<&'a [u32], Error> {
+    let mut written = 0usize;
+    let mut result = read_grid_ref_graphemes(grid_ref, buffer, &mut written);
+    if result == ffi::GhosttyResult_GHOSTTY_OUT_OF_SPACE {
+        // The native call writes nothing when storage is too small. Initialize
+        // spare capacity once after growth, then retain it even for empty cells.
+        buffer.resize(written, 0);
+        buffer.resize(buffer.capacity(), 0);
+        result = read_grid_ref_graphemes(grid_ref, buffer, &mut written);
     }
-    buffer.resize(required, 0);
-    if required == 0 {
-        return Ok(());
-    }
-    unsafe {
-        ffi::ghostty_grid_ref_graphemes(grid_ref, buffer.as_mut_ptr(), buffer.len(), &mut required)
-            .into_result()?;
-    }
-    buffer.truncate(required);
-    Ok(())
+    result.into_result()?;
+    Ok(&buffer[..written])
 }
 
 fn grid_ref_wide(grid_ref: &ffi::GhosttyGridRef) -> Result<CellWide, Error> {
@@ -3728,6 +3739,12 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn count_grid_ref_grapheme_calls<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        let before = GRID_REF_GRAPHEME_CALLS.get();
+        let result = operation();
+        (result, GRID_REF_GRAPHEME_CALLS.get() - before)
+    }
+
     fn write_numbered_lines(terminal: &mut Terminal, count: usize) {
         for i in 0..count {
             terminal.write(format!("{i:06}\r\n").as_bytes());
@@ -4765,6 +4782,73 @@ mod tests {
                 "one reusable grapheme buffer per ASCII row, got {allocations} allocations for {cols} cells"
             );
         }
+    }
+
+    #[test]
+    fn borrowed_screen_row_grapheme_calls_do_not_query_each_cell_size() {
+        for cols in [80, 330] {
+            let mut terminal = Terminal::new(cols, 1, 100).unwrap();
+            terminal.write("x".repeat(usize::from(cols)).as_bytes());
+            let mut cells = 0;
+            let (result, calls) = count_grid_ref_grapheme_calls(|| {
+                terminal.for_each_screen_row_cell(0, |_, graphemes| {
+                    assert_eq!(graphemes, &['x' as u32]);
+                    cells += 1;
+                })
+            });
+            result.unwrap();
+            assert_eq!(cells, cols);
+            assert_eq!(calls, usize::from(cols) + 1, "one initial growth retry");
+        }
+    }
+
+    #[test]
+    fn borrowed_cell_graphemes_reuse_storage_after_empty_and_long_cells() {
+        let mut terminal = Terminal::new(10, 1, 100).unwrap();
+        terminal.write(format!("x\x1b[3Ge{}\x1b[5G界\x1b[7Gz", "\u{301}".repeat(40)).as_bytes());
+        let expected = terminal.screen_text_rows().unwrap();
+        assert_eq!(expected[0].cells[2].graphemes.len(), 41);
+        assert_eq!(expected[0].cells[5].wide, CellWide::SpacerTail);
+
+        let mut buffer = Vec::new();
+        for (x, calls) in [(0, 2), (1, 1), (0, 1), (2, 2), (3, 1), (4, 1), (5, 1)] {
+            let grid_ref = terminal.grid_ref(ghostty_screen_point(x, 0)).unwrap();
+            let (result, actual_calls) =
+                count_grid_ref_grapheme_calls(|| grid_ref_graphemes_into(&grid_ref, &mut buffer));
+            assert_eq!(
+                result.unwrap(),
+                &expected[0].cells[usize::from(x)].graphemes
+            );
+            assert_eq!(actual_calls, calls, "cell {x}");
+        }
+
+        let initialized = buffer.len();
+        let ((result, calls), allocations) = crate::test_allocations::count(|| {
+            count_grid_ref_grapheme_calls(|| -> Result<(), Error> {
+                for x in [0, 1, 2, 3, 4, 5, 6, 2, 1, 0] {
+                    let grid_ref = terminal.grid_ref(ghostty_screen_point(x, 0))?;
+                    let graphemes = grid_ref_graphemes_into(&grid_ref, &mut buffer)?;
+                    assert_eq!(graphemes, &expected[0].cells[usize::from(x)].graphemes);
+                }
+                Ok(())
+            })
+        });
+        result.unwrap();
+        assert_eq!(calls, 10);
+        assert_eq!(allocations, 0);
+        assert_eq!(buffer.len(), initialized);
+    }
+
+    #[test]
+    fn borrowed_cell_graphemes_preserve_native_errors() {
+        let grid_ref = ffi::GhosttyGridRef::default();
+        let mut buffer = vec![0; 4];
+        let (result, calls) =
+            count_grid_ref_grapheme_calls(|| grid_ref_graphemes_into(&grid_ref, &mut buffer));
+
+        assert_eq!(result, Err(Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE)));
+        assert_eq!(calls, 1);
+        assert_eq!(buffer, vec![0; 4]);
     }
 
     #[test]
