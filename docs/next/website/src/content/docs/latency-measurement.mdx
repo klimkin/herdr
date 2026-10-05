@@ -1,0 +1,100 @@
+---
+title: Latency measurement
+description: Measure terminal-byte delivery through controlled server and client workloads.
+---
+
+# Latency measurement
+
+Measure committed terminal bytes through an isolated server, controlled pane
+processes, and real TUI clients attached to owned outer PTYs.
+
+```sh
+just bench-latency --path output --samples 200 --output .local/latency/output
+just bench-latency --path echo --load hidden --panes 15
+just bench-latency --path echo --load visible --layout active --panes 15
+just bench-latency --path action --clients 3 --slow-reader-ms 120
+just bench-latency --path action --clients 3 --stall-ms 500
+just bench-latency --path echo --load visible --burst 4 --load-hz 20
+just latency-check
+just latency-smoke
+```
+
+Each invocation creates a unique subdirectory containing `samples.json`, raw
+client VT output, helper events, server logs, and optional diagnostic records.
+Use `--binary` and `--probe` with the standalone benchmark for build comparisons.
+`just latency-build ''` builds without instrumentation; `just latency-build`
+enables the optional feature. Keep copies of both optimized binaries.
+
+| Path | Start | Completion |
+|---|---|---|
+| output | Controlled process response write start | Complete matching output in outer PTY |
+| echo | Input injection into TUI | Complete distinct process response in outer PTY |
+| action | Enter confirming prepared workspace rename | Authoritative label after rename modal closes |
+| action with clients | Same source-client Enter | Matching label in each client's outer PTY |
+
+Action preparation is paced through actual UI. Action timing covers commit
+response; it excludes modal opening and label entry. APIs only prepare or inspect
+sessions. Echo disables line-discipline echo and uses explicit input identities.
+The observer reconstructs VT state and respects synchronized-output commits.
+
+`--warmups` defaults to 10; `--max-pending` bounds outstanding required effects.
+Record intended and actual injection times. Rejected, interrupted, and timed-out
+probes remain in samples. A 20 ms diagnostic threshold reports misses; it is not
+a production SLO. Percentiles use nearest rank. p99.9 requires 10,000 completed
+samples. Short runs do not support strong tail claims.
+
+Visible active layouts use a balanced grid and run every pane producer. Hidden
+load uses unfocused tabs. Reports retain actual layout and estimated geometry,
+per-pane generated events, observed generations, byte/event rates, freshness,
+and supersession proved by newer observations. Final undelivered generations
+remain pending or missing. Load statistics include warmup and drain; required
+probe statistics exclude warmup. Do not compare their denominators directly.
+
+## Tracy and diagnostic records
+
+`latency-prof` pins `tracy-client` 0.19.0, embedding Tracy 0.14.1. Profiling is
+compiled out by default. In feature builds, set `HERDR_LATENCY_TRACE_DIR=1` to
+enable bounded diagnostic recording; the harness places records under each
+run's `traces/` directory. Set `HERDR_TRACY=1` as well to enable Tracy.
+
+```sh
+HERDR_LATENCY_TRACE_DIR=1 HERDR_TRACY=1 just bench-latency \
+  --path echo --load visible --samples 200 --tracy-port 18086
+# Concurrent collectors: server port 18086; client 0 port 18087.
+tracy-capture -a 127.0.0.1 -p 18086 -o server.tracy -s 15
+tracy-capture -a 127.0.0.1 -p 18087 -o client.tracy -s 15
+python3 scripts/latency_report.py RUN/samples.json \
+  --traces RUN/traces --output RUN/report.md
+```
+
+Start collectors concurrently with benchmark execution. Additional clients use
+successive ports. Retain original captures. Tracy 0.14.1 supports `tracy-merge`,
+but merging does not synchronize clocks and drops lock events, context switches,
+callstacks, GPU zones, allocation events, and frame images.
+
+Diagnostics use static synchronous zones and host-monotonic numeric anchors.
+JSONL records carry PID, thread, stage, correlation identity, scope, timestamp,
+and dropped count. Per-client queue scopes prevent identical frame payloads
+from cross-pairing. Shutdown attempts a bounded flush; absent `process.finish`
+records or nonzero dropped counts invalidate complete-trace claims.
+
+Controlled output identities link terminal revisions to serialized surfaces,
+writer queues, socket completion, client receipt and successful terminal output.
+Snapshot label identities link runtime actions. Ambiguous fingerprints,
+superseded markers, deferred redraws lacking a direct causal record, and absent
+stages remain unavailable. Input identities join stdin, client-frame queue/write and server-frame receipt. Server dispatch and PTY write completion join echo identities; PTY submission queue residence remains unavailable. Render
+attempts and selected presentation opportunities use separate records. Elapsed
+zones do not establish CPU execution or off-CPU cause; baseline mode provides
+no scheduler evidence. Overlapping stage intervals must not be summed.
+
+Same-host timestamps use an explicitly checked shared monotonic clock. Socket
+RTT is a matched health response, separate from application presentation. No
+remote one-way subtraction, half-RTT assumption, physical pixels, GPU, or scanout
+latency is measured. Native macOS, Windows/ConPTY, and controlled SSH acceptance
+need their own hosts. Linux execution does not establish their parity.
+
+Use repeated optimized runs and reversed comparison order for overhead studies.
+Keep geometry, seeds, sample counts, load and observers identical; compare
+profiling disabled, enabled without Tracy capture, and active capture. Record
+latency, coverage, event volume, observer cost, CPU and memory. Repeat material
+performance differences with at least 60 seconds of samples.

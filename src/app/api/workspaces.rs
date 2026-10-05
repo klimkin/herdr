@@ -113,6 +113,11 @@ impl App {
             return workspace_not_found(id, &params.workspace_id);
         };
         ws.set_custom_name(params.label.clone());
+        crate::latency_prof::record(
+            "server.action_committed",
+            crate::latency_prof::bytes_id(id.as_bytes()),
+            crate::latency_prof::bytes_id(params.label.as_bytes()),
+        );
         crate::logging::workspace_renamed(&ws.id);
         self.schedule_session_save();
         self.emit_event(EventEnvelope {

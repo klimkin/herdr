@@ -527,6 +527,23 @@ impl HeadlessServer {
             // bounded classification cadence without delaying presentation work
             // that joins the same coalesced request.
             let render_cadence_due = self.app.can_render_now(now);
+            #[cfg(feature = "latency-prof")]
+            if needs_render {
+                let deadline = self.app.render_attempt_deadline(now);
+                crate::latency_prof::record(
+                    "render.attempt_deadline_remaining",
+                    0,
+                    deadline.saturating_duration_since(now).as_nanos() as u64,
+                );
+                crate::latency_prof::record(
+                    "render.attempt_deadline_overdue",
+                    0,
+                    now.saturating_duration_since(deadline).as_nanos() as u64,
+                );
+            }
+            if needs_render {
+                crate::latency_prof::record("render.gate", 0, u64::from(render_cadence_due));
+            }
             if needs_render
                 && (render_cadence_due
                     || (self.app.can_present_now(now)
@@ -535,6 +552,7 @@ impl HeadlessServer {
                             needs_graphics_render,
                         )))
             {
+                crate::latency_prof::record("render.attempt_eligible", 0, 0);
                 crate::render_prof::event("render.attempt");
                 let render_request = self.app.render_dirty.take();
                 let pty_dirty = !render_request.pty_sources.is_empty();
@@ -569,6 +587,38 @@ impl HeadlessServer {
                     && !needs_full_render
                     && !needs_graphics_render
                     && !self.pty_sources_visible_to_any_render_target(&render_request.pty_sources);
+                #[cfg(feature = "latency-prof")]
+                if !hidden_only {
+                    let anchor = std::time::Instant::now();
+                    let anchor_ns = crate::latency_prof::now();
+                    let deadline = self.app.presentation_deadline(anchor);
+                    let deadline_ns = if deadline >= anchor {
+                        anchor_ns.saturating_add(deadline.duration_since(anchor).as_nanos() as u64)
+                    } else {
+                        anchor_ns.saturating_sub(anchor.duration_since(deadline).as_nanos() as u64)
+                    };
+                    crate::latency_prof::record_at(
+                        "presentation.selected_deadline",
+                        0,
+                        deadline_ns,
+                        0,
+                        anchor_ns,
+                    );
+                    crate::latency_prof::record_at(
+                        "presentation.selected_remaining",
+                        0,
+                        deadline_ns.saturating_sub(anchor_ns),
+                        0,
+                        anchor_ns,
+                    );
+                    crate::latency_prof::record_at(
+                        "presentation.selected_overdue",
+                        0,
+                        anchor_ns.saturating_sub(deadline_ns),
+                        0,
+                        anchor_ns,
+                    );
+                }
                 if hidden_only {
                     crate::render_prof::event("render.skipped.hidden_sources");
                 } else if !needs_full_render
@@ -1030,6 +1080,7 @@ impl HeadlessServer {
 
     /// Drains server events from the dedicated channel.
     fn drain_server_events(&mut self) -> bool {
+        crate::latency_prof::zone!("server.dispatch_batch");
         let mut changed = false;
         for _ in 0..EXTERNAL_EVENT_DRAIN_LIMIT {
             if self.should_quit.load(Ordering::Acquire) {
@@ -1540,8 +1591,14 @@ impl HeadlessServer {
         msg: &ServerMessage,
         max_frame_size: usize,
     ) -> Result<Vec<u8>, protocol::FramingError> {
+        crate::latency_prof::zone!("server.serialize");
+        crate::latency_prof::message(msg, "server.surface");
         let mut framed = Vec::new();
         protocol::write_message(&mut framed, msg)?;
+        crate::latency_prof::surface_links(
+            msg,
+            crate::latency_prof::bytes_id(framed.get(4..).unwrap_or_default()),
+        );
         let payload_len = framed.len().saturating_sub(4);
         if payload_len > max_frame_size {
             return Err(protocol::FramingError::Oversized {
@@ -1814,6 +1871,7 @@ impl HeadlessServer {
 
     /// Handles a server event. Returns true if the event requires a re-render.
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
+        crate::latency_prof::zone!("server.dispatch");
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
             return false;
         }
@@ -2329,6 +2387,7 @@ impl HeadlessServer {
                 pane_id,
                 events,
             } => {
+                crate::latency_prof::input_dispatch(&events, "input.server_dispatch", client_id);
                 if self.handoff_in_progress
                     || !self
                         .clients

@@ -349,11 +349,23 @@ impl ClientState {
         crate::render_prof::duration_since("client_surface_patch.encode", encode_started);
         let write_started = crate::render_prof::timer();
         if !encoded.bytes.is_empty() {
+            crate::latency_prof::zone!("client.patch_write");
+            crate::latency_prof::record(
+                "client.output_start",
+                crate::latency_prof::bytes_id(&encoded.bytes),
+                encoded.bytes.len() as u64,
+            );
             let mut stdout = io::stdout();
             stdout.write_all(&encoded.bytes)?;
             stdout.flush()?;
+            crate::latency_prof::record(
+                "client.output_complete",
+                crate::latency_prof::bytes_id(&encoded.bytes),
+                encoded.bytes.len() as u64,
+            );
         }
         crate::render_prof::duration_since("client_surface_patch.write", write_started);
+        crate::latency_prof::delivery(encoded.bytes.len());
         let committed = self.blit_encoder.commit_patch(&rows, patch.cursor, encoded);
         crate::render_prof::event(if committed {
             "client_surface_patch.success"
@@ -511,6 +523,12 @@ impl ClientState {
         encoded: &[u8],
         mut graphics: crate::kitty_graphics::GraphicsOutput,
     ) -> io::Result<()> {
+        crate::latency_prof::zone!("client.terminal_write");
+        crate::latency_prof::record(
+            "client.output_start",
+            crate::latency_prof::bytes_id(encoded),
+            encoded.len() as u64,
+        );
         if self.kitty_graphics_enabled {
             if !self.pending_native_cleanup.is_empty() {
                 graphics.operations.insert(
@@ -530,6 +548,12 @@ impl ClientState {
             writer.write_all(encoded)?;
         }
         writer.flush()?;
+        crate::latency_prof::record(
+            "client.output_complete",
+            crate::latency_prof::bytes_id(encoded),
+            encoded.len() as u64,
+        );
+        crate::latency_prof::delivery(encoded.len());
         if self.kitty_graphics_enabled {
             self.pending_native_cleanup.clear();
         }
@@ -546,20 +570,25 @@ impl ClientState {
         if self.presentation_frozen {
             return false;
         }
+        crate::latency_prof::zone!("client.present");
         let frame_output::ComposedFrame {
             frame: frame_data,
             graphics,
         } = frame_data.into();
-        let frame_data = if self.draw_host_cursor {
-            render_ansi::frame_with_drawn_cursor(frame_data)
-        } else {
-            frame_data
-        };
-        let encoded = if self.draw_host_cursor {
-            self.blit_encoder
-                .encode_with_suppressed_visible_cursor(&frame_data, self.repaint_pending)
-        } else {
-            self.blit_encoder.encode(&frame_data, self.repaint_pending)
+        let (frame_data, encoded) = {
+            crate::latency_prof::zone!("client.encode");
+            let frame_data = if self.draw_host_cursor {
+                render_ansi::frame_with_drawn_cursor(frame_data)
+            } else {
+                frame_data
+            };
+            let encoded = if self.draw_host_cursor {
+                self.blit_encoder
+                    .encode_with_suppressed_visible_cursor(&frame_data, self.repaint_pending)
+            } else {
+                self.blit_encoder.encode(&frame_data, self.repaint_pending)
+            };
+            (frame_data, encoded)
         };
         let mut stdout = io::stdout();
         if let Err(error) = self.write_composed_output(&mut stdout, &encoded.bytes, graphics) {

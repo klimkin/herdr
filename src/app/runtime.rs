@@ -87,6 +87,19 @@ impl App {
         }
     }
 
+    #[cfg(feature = "latency-prof")]
+    pub(crate) fn render_attempt_deadline(&self, now: Instant) -> Instant {
+        self.last_render_at
+            .map(|last| last + MIN_RENDER_INTERVAL)
+            .unwrap_or(now)
+    }
+    #[cfg(feature = "latency-prof")]
+    pub(crate) fn presentation_deadline(&self, now: Instant) -> Instant {
+        self.last_presentation_at
+            .map(|last| last + MIN_RENDER_INTERVAL)
+            .unwrap_or(now)
+    }
+
     pub(crate) fn record_render_attempt(&mut self, now: Instant, presentation: bool) {
         self.last_render_at = Some(now);
         if presentation {

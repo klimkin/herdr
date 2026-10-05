@@ -382,6 +382,8 @@ impl HeadlessServer {
     }
 
     fn render_and_stream_with_graphics_limit(&mut self, graphics_frame_limit: usize) {
+        crate::latency_prof::zone!("server.full_render");
+        crate::latency_prof::record("server.frame_start", 0, self.clients.len() as u64);
         let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
 
@@ -647,6 +649,7 @@ impl HeadlessServer {
                         broken_clients.push(client_id);
                         continue;
                     };
+                    crate::latency_prof::snapshot_links(&candidate, &snapshot_framed);
                     if projection_framed.is_some_and(|framed| writer.control.send(framed).is_err())
                         || writer.control.send(completion_framed).is_err()
                         || writer.control.send(snapshot_framed).is_err()

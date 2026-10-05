@@ -422,6 +422,7 @@ impl PtyIoActor {
         };
 
         let mut runner = PtyIoActorRunner {
+            diagnostic_input: crate::latency_prof::InputStimuli::default(),
             pane_id: config.pane_id,
             file: master,
             data_rx,
@@ -465,6 +466,7 @@ struct PtyIoActorRunner {
     data_rx: mpsc::Receiver<PtyIoDataCommand>,
     control_rx: std_mpsc::Receiver<PtyIoControlCommand>,
     state: ActorState,
+    diagnostic_input: crate::latency_prof::InputStimuli,
     pending_writes: VecDeque<PendingWrite>,
     current_write_offset: usize,
     active_submission: Option<ActiveSubmission>,
@@ -828,6 +830,7 @@ impl PtyIoActorRunner {
     }
 
     fn read_once(&mut self) -> bool {
+        crate::latency_prof::zone!("pty.read_batch");
         let mut buf = [0u8; 8192];
         match self.file.as_ref().read(&mut buf) {
             Ok(0) => false,
@@ -838,6 +841,7 @@ impl PtyIoActorRunner {
                 false
             }
             Ok(n) => {
+                crate::latency_prof::record("pty.read", self.pane_id as u64, n as u64);
                 let response_order = Arc::clone(&self.response_order);
                 let _order = response_order
                     .lock()
@@ -943,6 +947,12 @@ impl PtyIoActorRunner {
     }
 
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
+        crate::latency_prof::zone!("pty.write_batch");
+        crate::latency_prof::record(
+            "pty.write_start",
+            self.pane_id as u64,
+            self.pending_writes.len() as u64,
+        );
         while let Some(write) = self.pending_writes.front() {
             let chunk = &write.bytes[self.current_write_offset..];
             match self.file.as_ref().write(chunk) {
@@ -956,6 +966,11 @@ impl PtyIoActorRunner {
                     self.current_write_offset += written;
                     if self.current_write_offset >= write.bytes.len() {
                         let completed = self.pending_writes.pop_front().unwrap();
+                        self.diagnostic_input.observe(
+                            &completed.bytes,
+                            "input.pty_write_complete",
+                            self.pane_id as u64,
+                        );
                         self.current_write_offset = 0;
                         if let Some(boundary) = completed.boundary {
                             self.file.as_ref().flush()?;
@@ -1111,6 +1126,7 @@ mod tests {
         let (_control_tx, control_rx) = std_mpsc::channel();
         let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
         let runner = PtyIoActorRunner {
+            diagnostic_input: crate::latency_prof::InputStimuli::default(),
             pane_id: 1,
             file: Arc::new(std::fs::File::from(owned)),
             data_rx,
@@ -1816,6 +1832,7 @@ mod tests {
         let light = Arc::new(AtomicBool::new(false));
         let query_light = Arc::clone(&light);
         let runner = PtyIoActorRunner {
+            diagnostic_input: crate::latency_prof::InputStimuli::default(),
             pane_id: 1,
             file: Arc::new(std::fs::File::from(owned)),
             data_rx,
@@ -1955,6 +1972,7 @@ mod tests {
             )))
             .expect("queued write");
         let mut runner = PtyIoActorRunner {
+            diagnostic_input: crate::latency_prof::InputStimuli::default(),
             pane_id: 1,
             file: Arc::new(std::fs::File::from(unsafe {
                 OwnedFd::from_raw_fd(actor_socket.into_raw_fd())

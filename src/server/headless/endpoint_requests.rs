@@ -7,6 +7,8 @@ impl HeadlessServer {
         boot_id: String,
         mut request: Box<api::schema::Request>,
     ) -> bool {
+        let diagnostic_id = crate::latency_prof::bytes_id(request.id.as_bytes());
+        crate::latency_prof::record("server.action_received", diagnostic_id, client_id);
         let Some(client) = self.clients.get(&client_id) else {
             return false;
         };
@@ -80,6 +82,13 @@ impl HeadlessServer {
             "endpoint:{}:{client_id}:{request_id}",
             self.client_shell_boot_id
         );
+        crate::latency_prof::record_at(
+            "action.request_link",
+            diagnostic_id,
+            crate::latency_prof::bytes_id(api_request_id.as_bytes()),
+            client_id,
+            crate::latency_prof::now(),
+        );
         request.id = api_request_id.clone();
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         if let Err(err) = crate::server::client_commands::spawn_response_waiter(
@@ -120,7 +129,7 @@ impl HeadlessServer {
             client.shell_deferred_navigation_response = deferred_navigation.then(Vec::new);
         }
         let foreground_changed = self.promote_client_to_foreground(client_id);
-        foreground_changed
+        let changed = foreground_changed
             | self.handle_client_shell_api_request(
                 client_id,
                 api::ApiRequestMessage {
@@ -128,6 +137,8 @@ impl HeadlessServer {
                     respond_to,
                     response_write_complete: None,
                 },
-            )
+            );
+        crate::latency_prof::record("server.action_dispatched", diagnostic_id, client_id);
+        changed
     }
 }

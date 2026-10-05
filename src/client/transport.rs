@@ -68,8 +68,11 @@ pub(super) fn server_reader_thread(
         });
         match message {
             Ok(msg) => {
+                crate::latency_prof::message(&msg, "client.surface_received");
                 if event_tx
                     .blocking_send(ClientLoopEvent::ServerMessage {
+                        #[cfg(feature = "latency-prof")]
+                        diagnostic_id: crate::latency_prof::wire_id(),
                         endpoint_id: endpoint_id.clone(),
                         generation,
                         message: Box::new(msg),

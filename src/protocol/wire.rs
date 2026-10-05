@@ -1719,6 +1719,8 @@ pub fn read_message<R: Read, M: for<'de> Deserialize<'de>>(
     let mut payload = vec![0u8; claimed_len];
     read_exact_or_eof(reader, &mut payload)?;
 
+    crate::latency_prof::wire_received(&payload);
+    crate::latency_prof::zone!("transport.decode");
     let (msg, consumed) = bincode::serde::decode_from_slice(&payload, bincode::config::standard())
         .map_err(|e| FramingError::Bincode(e.to_string()))?;
 

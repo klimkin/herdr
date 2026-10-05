@@ -3,6 +3,9 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+#[cfg(feature = "latency-prof")]
+pub(crate) mod latency;
+
 #[cfg(unix)]
 pub(crate) mod ssh_agent;
 

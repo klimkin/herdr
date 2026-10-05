@@ -31,6 +31,7 @@ enum WriterCommand {
 /// A worker owns partial writes, cancellation, and the bridge lifetime; socket backpressure and
 /// bridge teardown never block other endpoints.
 pub(crate) struct NativeEndpointTransport {
+    diagnostic_input: crate::latency_prof::InputStimuli,
     sender: mpsc::SyncSender<WriterCommand>,
     pending_batch: Option<Arc<Mutex<FrameBatch>>>,
     queued_bytes: Arc<AtomicUsize>,
@@ -77,6 +78,7 @@ impl NativeEndpointTransport {
                 }
             })?;
         Ok(Self {
+            diagnostic_input: crate::latency_prof::InputStimuli::default(),
             sender,
             pending_batch: None,
             queued_bytes,
@@ -86,6 +88,11 @@ impl NativeEndpointTransport {
     }
 
     fn enqueue_frame(&mut self, frame: Vec<u8>) -> io::Result<()> {
+        crate::latency_prof::plot!(
+            "client.queued_bytes",
+            self.queued_bytes.load(Ordering::Relaxed)
+        );
+        crate::latency_prof::frames("client.input_enqueue", &frame);
         if let Some(batch) = &self.pending_batch {
             let mut batch = batch
                 .lock()
@@ -131,6 +138,13 @@ impl EndpointTransport for NativeEndpointTransport {
         let mut frame = Vec::new();
         crate::protocol::write_message(&mut frame, message)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        if let ClientMessage::ClientShellPaneInput { events, .. } = message {
+            self.diagnostic_input.events(
+                events,
+                "input.client_frame",
+                crate::latency_prof::bytes_id(frame.get(4..).unwrap_or_default()),
+            );
+        }
         let len = frame.len();
         if self
             .queued_bytes
@@ -219,6 +233,9 @@ fn write_frame(
     mut frame: &[u8],
     stopped: &AtomicBool,
 ) -> io::Result<()> {
+    crate::latency_prof::zone!("client.input_write");
+    crate::latency_prof::frames("client.input_claim", frame);
+    let complete = frame;
     let deadline = Instant::now() + WRITE_TIMEOUT;
     #[cfg(windows)]
     let mut deadline = deadline;
@@ -251,6 +268,7 @@ fn write_frame(
         }
         std::thread::sleep(IO_POLL_INTERVAL);
     }
+    crate::latency_prof::frames("client.input_write_complete", complete);
     Ok(())
 }
 
@@ -469,6 +487,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(capacity);
         (
             NativeEndpointTransport {
+                diagnostic_input: crate::latency_prof::InputStimuli::default(),
                 sender,
                 pending_batch: None,
                 queued_bytes: Arc::new(AtomicUsize::new(0)),

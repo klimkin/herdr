@@ -228,6 +228,8 @@ impl HeadlessServer {
         &mut self,
         pty_sources: &HashSet<crate::layout::PaneId>,
     ) -> bool {
+        crate::latency_prof::zone!("server.retained_render");
+        crate::latency_prof::record("server.frame_start", 0, self.clients.len() as u64);
         crate::render_prof::event("retained_surface.attempt");
         let started = crate::render_prof::timer();
         macro_rules! fallback {

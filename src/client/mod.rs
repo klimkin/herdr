@@ -372,6 +372,7 @@ fn run_client_with_mode(
             return Ok(());
         }
 
+        crate::latency_prof::shutdown();
         std::process::exit(1);
     }
 
@@ -798,10 +799,16 @@ async fn run_client_loop(
             shell.tick_popup_pending(now);
         }
 
+        crate::latency_prof::set_delivery(0);
         match event {
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
+                crate::latency_prof::record(
+                    "client.input_dispatch",
+                    crate::latency_prof::bytes_id(&data),
+                    data.len() as u64,
+                );
                 let image_bridge_active = endpoint_accepts_local_images(
                     is_remote_client,
                     write_stream.active_id(),
@@ -1104,6 +1111,7 @@ async fn run_client_loop(
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
+                crate::latency_prof::record("client.input_dispatch", 0, events.len() as u64);
                 let image_bridge_active = endpoint_accepts_local_images(
                     is_remote_client,
                     write_stream.active_id(),
@@ -1380,6 +1388,8 @@ async fn run_client_loop(
                 )?;
             }
             ClientLoopEvent::ServerMessage {
+                #[cfg(feature = "latency-prof")]
+                diagnostic_id,
                 endpoint_id,
                 generation,
                 message,
@@ -1387,6 +1397,8 @@ async fn run_client_loop(
                 if !write_stream.accepts(&endpoint_id, generation) {
                     continue;
                 }
+                #[cfg(feature = "latency-prof")]
+                crate::latency_prof::set_delivery(diagnostic_id);
                 write_stream.received(&endpoint_id, generation, now);
                 // Retirements belong to the exact live connection, even after deactivation.
                 // They must not be dropped with frozen/inactive presentation effects.

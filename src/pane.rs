@@ -2593,7 +2593,9 @@ impl PaneRuntime {
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
             let delay_rt = rt.clone();
+            let mut diagnostic_stimuli = crate::latency_prof::Stimuli::default();
             let on_read = Box::new(move |bytes: &[u8]| {
+                let diagnostic_ids = diagnostic_stimuli.observe(bytes);
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
@@ -2602,8 +2604,22 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
-                content_seq.fetch_add(1, Ordering::Release);
+                let revision = content_seq.fetch_add(1, Ordering::Release) + 1;
                 drop(_content_write_guard);
+                crate::latency_prof::record(
+                    "terminal.content_ready",
+                    pane_id.raw() as u64,
+                    revision,
+                );
+                for id in diagnostic_ids {
+                    crate::latency_prof::record_at(
+                        "terminal.stimulus",
+                        id,
+                        revision,
+                        pane_id.raw() as u64,
+                        crate::latency_prof::now(),
+                    );
+                }
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
                 observe_detection_content_change(bytes, &detection_content_seq);
@@ -2797,7 +2813,9 @@ impl PaneRuntime {
             let reported_cwd = reported_cwd.clone();
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
+            let mut diagnostic_stimuli = crate::latency_prof::Stimuli::default();
             let on_read = Box::new(move |bytes: &[u8]| {
+                let diagnostic_ids = diagnostic_stimuli.observe(bytes);
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
@@ -2806,8 +2824,22 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
-                content_seq.fetch_add(1, Ordering::Release);
+                let revision = content_seq.fetch_add(1, Ordering::Release) + 1;
                 drop(_content_write_guard);
+                crate::latency_prof::record(
+                    "terminal.content_ready",
+                    pane_id.raw() as u64,
+                    revision,
+                );
+                for id in diagnostic_ids {
+                    crate::latency_prof::record_at(
+                        "terminal.stimulus",
+                        id,
+                        revision,
+                        pane_id.raw() as u64,
+                        crate::latency_prof::now(),
+                    );
+                }
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
                 if agent_detection == AgentDetection::Enabled {

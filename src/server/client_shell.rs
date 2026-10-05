@@ -349,6 +349,11 @@ pub(super) fn render_pane_surface(
                 .iter()
                 .filter_map(|pane| {
                     app.public_pane_id(workspace_index, pane.id).map(|pane_id| {
+                        crate::latency_prof::record(
+                            "pane.identity",
+                            pane.id.raw() as u64,
+                            crate::latency_prof::bytes_id(pane_id.as_bytes()),
+                        );
                         let runtime = app.state.runtime_for_pane_in_workspace(
                             &app.terminal_runtimes,
                             workspace_index,

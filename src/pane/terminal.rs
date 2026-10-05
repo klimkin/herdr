@@ -1353,6 +1353,12 @@ impl GhosttyPaneTerminal {
         _response_writer: &mpsc::Sender<Bytes>,
     ) -> ProcessBytesResult {
         crate::render_prof::counter("pty.bytes", bytes.len() as u64);
+        crate::latency_prof::zone!("terminal.parse_batch");
+        crate::latency_prof::record(
+            "terminal.lock_wait",
+            pane_id.raw() as u64,
+            bytes.len() as u64,
+        );
         let Ok(mut core) = self.core.lock() else {
             error!(pane = pane_id.raw(), "ghostty core lock poisoned in reader");
             return ProcessBytesResult {
@@ -1365,6 +1371,11 @@ impl GhosttyPaneTerminal {
                 terminal_responses: Vec::new(),
             };
         };
+
+        let lock_acquired_ns = crate::latency_prof::now();
+        #[cfg(feature = "latency-prof")]
+        let lock_zone =
+            crate::latency_prof::span(tracy_client::span_location!("terminal.lock_held"));
 
         let _ = core.terminal.take_pwd_changes();
         // Restored history may have exercised terminal callbacks before this live PTY write.
@@ -1472,6 +1483,24 @@ impl GhosttyPaneTerminal {
         if synchronized_output {
             crate::render_prof::event("pty.synchronized_output_suppressed");
         }
+        drop(core);
+        let lock_released_ns = crate::latency_prof::now();
+        #[cfg(feature = "latency-prof")]
+        drop(lock_zone);
+        crate::latency_prof::record_at(
+            "terminal.lock_acquired",
+            pane_id.raw() as u64,
+            bytes.len() as u64,
+            0,
+            lock_acquired_ns,
+        );
+        crate::latency_prof::record_at(
+            "terminal.lock_released",
+            pane_id.raw() as u64,
+            bytes.len() as u64,
+            0,
+            lock_released_ns,
+        );
         ProcessBytesResult {
             request_render,
             render_delay,

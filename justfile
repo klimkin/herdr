@@ -113,6 +113,29 @@ bench-retained-graphics:
 bench-api-fairness:
     cargo test --release --locked --bin herdr external_api_burst_profile -- --ignored --nocapture --test-threads=1
 
+# Build equivalent optimized binaries with optional instrumentation.
+latency-build features='latency-prof':
+    cargo build --release --locked --features '{{features}}' --bin herdr --examples
+
+# Measure exact output, echo, or runtime-action effects through owned TUI PTYs.
+bench-latency *args:
+    just latency-build
+    "${CARGO_TARGET_DIR:-target}/release/examples/latency_bench" --binary "${CARGO_TARGET_DIR:-target}/release/herdr" --probe "${CARGO_TARGET_DIR:-target}/release/examples/latency_probe" {{args}}
+
+# Verify real-session required outcomes, repeated-run isolation, and cleanup.
+latency-smoke:
+    cargo build --locked --features latency-prof --bin herdr --examples
+    {{python}} scripts/latency_smoke.py --binary "${CARGO_TARGET_DIR:-target}/debug/herdr" --bench "${CARGO_TARGET_DIR:-target}/debug/examples/latency_bench" --probe "${CARGO_TARGET_DIR:-target}/debug/examples/latency_probe"
+
+# Isolate fixed-geometry rendering from optional native-image filesystem profiles.
+latency-render-scale:
+    cargo test --release --locked --bin herdr server::render_scale_benchmark::render_scale_profile -- --exact --ignored --nocapture --test-threads=1
+
+# Check optional instrumentation and the public measurement/report contracts.
+latency-check:
+    cargo clippy --all-targets --features latency-prof --locked -- -D warnings
+    cargo test --locked --test latency_measurement --test latency_report
+
 # ~3-5 minute CPU comparison; downloads stable unless HERDR_PERF_BASELINE_BIN is set
 bench-release-smoke:
     cargo build --release --locked

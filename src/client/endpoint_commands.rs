@@ -76,6 +76,11 @@ impl EndpointCommands {
         boot_id: String,
         request: Box<Request>,
     ) {
+        crate::latency_prof::record(
+            "client.action_enqueue",
+            crate::latency_prof::bytes_id(request.id.as_bytes()),
+            generation,
+        );
         self.lanes
             .entry(endpoint_id)
             .or_default()
@@ -115,6 +120,11 @@ impl EndpointCommands {
                 boot_id: queued.boot_id.clone(),
                 request,
             };
+            crate::latency_prof::record(
+                "client.action_send",
+                crate::latency_prof::bytes_id(request_id.as_bytes()),
+                queued.generation,
+            );
             if endpoints.send_to(endpoint_id, &message) != EndpointSendOutcome::Sent {
                 cancelled.push(request_id);
                 continue;
