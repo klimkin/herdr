@@ -406,16 +406,14 @@ fn foreground_job_from_members(
 /// foreground groups. This mode is explicit because background jobs cannot be
 /// distinguished from foreground jobs without the native terminal signal.
 fn child_groups_foreground_process_group(child_pid: u32) -> Option<u32> {
-    let shell_group_id = process_pgrp_comm_and_state(child_pid)
-        .map(|(pgrp, _, _)| pgrp)
-        .filter(|pgrp| *pgrp > 0)? as u32;
+    let shell_group_id = process_group_id(child_pid).filter(|pgrp| *pgrp > 0)? as u32;
 
     child_groups_foreground_process_group_with(
         child_pid,
         shell_group_id,
         process_task_ids,
         process_task_children,
-        |pid| process_pgrp_comm_and_state(pid).map(|(pgrp, _, _)| pgrp),
+        process_group_id,
     )
 }
 
@@ -623,8 +621,13 @@ fn numeric_file_name(entry: &std::fs::DirEntry) -> Option<u32> {
 }
 
 fn live_process_group_member(process_group_id: u32, pid: u32) -> Option<ProcGroupMember> {
-    let (pgrp, comm, state) = process_pgrp_comm_and_state(pid)?;
-    (pgrp > 0 && pgrp as u32 == process_group_id).then_some(ProcGroupMember { pid, comm, state })
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (pgrp, comm, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
+    (pgrp > 0 && pgrp as u32 == process_group_id).then(|| ProcGroupMember {
+        pid,
+        comm: comm.to_string(),
+        state,
+    })
 }
 
 pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJob> {
@@ -649,13 +652,13 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
 }
 
 pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
-    // /proc/<pid>/stat format: "pid (comm) state ppid pgrp session tty_nr tpgid ..."
-    // The (comm) field can contain spaces and parens, so we find the last ')' first.
     let stat = std::fs::read_to_string(format!("/proc/{child_pid}/stat")).ok()?;
-    let rest = stat.get(stat.rfind(')')? + 2..)?;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
+    foreground_process_group_id_from_stat(&stat)
+}
+
+fn foreground_process_group_id_from_stat(stat: &str) -> Option<u32> {
     // After (comm): state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5)
-    let tpgid: i32 = fields.get(5)?.parse().ok()?;
+    let tpgid: i32 = process_stat_fields(stat)?.nth(5)?.parse().ok()?;
     (tpgid > 0).then_some(tpgid as u32)
 }
 
@@ -738,17 +741,28 @@ pub(super) fn process_name_and_parent(pid: u32) -> Option<(String, u32)> {
 
 fn process_pgrp_comm_and_state(pid: u32) -> Option<(i32, String, char)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    process_pgrp_comm_and_state_from_stat(&stat)
+    let (pgrp, comm, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
+    Some((pgrp, comm.to_string(), state))
 }
 
-fn process_pgrp_comm_and_state_from_stat(stat: &str) -> Option<(i32, String, char)> {
+fn process_pgrp_comm_and_state_from_stat(stat: &str) -> Option<(i32, &str, char)> {
     let close = stat.rfind(')')?;
-    let comm = stat.get(1 + stat.find('(')?..close)?.to_string();
-    let rest = stat.get(close + 2..)?;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    let state = fields.first()?.chars().next()?;
-    let pgrp: i32 = fields.get(2)?.parse().ok()?;
+    let comm = stat.get(1 + stat.find('(')?..close)?;
+    let mut fields = process_stat_fields(stat)?;
+    let state = fields.next()?.parse().ok()?;
+    let pgrp = fields.nth(1)?.parse().ok()?;
     Some((pgrp, comm, state))
+}
+
+fn process_group_id(pid: u32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_stat_fields(&stat)?.nth(2)?.parse().ok()
+}
+
+fn process_stat_fields(stat: &str) -> Option<std::str::SplitWhitespace<'_>> {
+    // Linux comm may contain spaces and parentheses. Only fields after the final
+    // ')' are whitespace-separated; consume just the scalar a caller needs.
+    Some(stat.get(stat.rfind(')')? + 1..)?.split_whitespace())
 }
 
 fn process_state_allows_remote_memory_read(state: char) -> bool {
@@ -1229,9 +1243,7 @@ fn detach_clipboard_owner(child: std::process::Child) -> bool {
 
 fn process_session_id(pid: u32) -> Option<i32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = stat.get(stat.rfind(')')? + 2..)?;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    fields.get(3)?.parse().ok()
+    process_stat_fields(&stat)?.nth(3)?.parse().ok()
 }
 
 #[cfg(test)]
@@ -1655,7 +1667,58 @@ mod tests {
     fn proc_stat_parsing_keeps_group_leader_inputs_live() {
         assert_eq!(
             process_pgrp_comm_and_state_from_stat("123 (name with ) paren) S 1 456 789 0 456"),
-            Some((456, "name with ) paren".to_string(), 'S'))
+            Some((456, "name with ) paren", 'S'))
+        );
+    }
+
+    #[test]
+    fn proc_stat_parsing_reads_required_fields_from_complete_record() {
+        let stat = "4878 (name with (nested) parens)) S 1825 4878 1825 34816 4910 \
+            4194304 292648 0 13 0 263970 24852 0 0 20 0 19 0 152188414 \
+            366747648 16116 18446744073709551615 93824902758400 \
+            93824907269217 140732238683680 0 0 0 0 4096 0 0 0 0 17 6 0 0 0 \
+            0 0 93824908013424 93824908445240 93824931799040 \
+            140732238684913 140732238684955 140732238684955 140732238688223 0";
+        assert_eq!(foreground_process_group_id_from_stat(stat), Some(4910));
+        assert_eq!(
+            process_pgrp_comm_and_state_from_stat(stat),
+            Some((4878, "name with (nested) parens)", 'S'))
+        );
+        assert_eq!(process_stat_fields(stat).unwrap().nth(3), Some("1825"));
+    }
+
+    #[test]
+    fn foreground_stat_parsing_rejects_missing_or_nonpositive_groups() {
+        for stat in [
+            "",
+            "123 (shell) S 1 123 123 0",
+            "123 (shell) S 1 123 123 0 -1",
+            "123 (shell) S 1 123 123 0 0",
+            "123 (shell) S 1 123 123 0 invalid",
+            "123 (shell) S 1 123 123 0 2147483648",
+        ] {
+            assert_eq!(foreground_process_group_id_from_stat(stat), None, "{stat}");
+        }
+        assert_eq!(
+            foreground_process_group_id_from_stat("123 (shell)\tS\t1 123 123 0 456"),
+            Some(456)
+        );
+    }
+
+    #[test]
+    fn group_member_stat_parsing_rejects_incomplete_identity() {
+        for stat in [
+            "123 shell S 1 456",
+            "123 (shell) S 1",
+            "123 (shell) S 1 invalid",
+            "123 (shell) SS 1 456",
+            "123 (shell) S 1 2147483648",
+        ] {
+            assert_eq!(process_pgrp_comm_and_state_from_stat(stat), None, "{stat}");
+        }
+        assert_eq!(
+            process_pgrp_comm_and_state_from_stat("123 (shell) Z 1 -1"),
+            Some((-1, "shell", 'Z'))
         );
     }
 

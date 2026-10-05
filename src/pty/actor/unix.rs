@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io::{Read, Write},
     os::fd::{AsRawFd, OwnedFd, RawFd},
-    sync::{mpsc as std_mpsc, Arc, Mutex},
+    sync::{mpsc as std_mpsc, Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
@@ -84,7 +84,6 @@ enum PtyIoDataCommand {
 enum PtyIoControlCommand {
     BeginHandoff(std_mpsc::Sender<std::io::Result<()>>),
     DuplicateForHandoff(std_mpsc::Sender<std::io::Result<RawFd>>),
-    ForegroundProcessGroup(std_mpsc::Sender<Option<u32>>),
     RollbackHandoff(std_mpsc::Sender<std::io::Result<()>>),
     ReleaseAfterCommit(std_mpsc::Sender<std::io::Result<()>>),
     Shutdown,
@@ -98,6 +97,23 @@ pub(crate) struct PtyIoActorHandle {
     user_writes: Arc<Mutex<UserWriteGate>>,
     controls: Arc<Mutex<SharedPtyControls>>,
     response_order: Arc<Mutex<()>>,
+    foreground_observer: PtyForegroundObserver,
+}
+
+/// Reads the current kernel foreground group without waking or waiting for the
+/// actor. The weak file reference cannot retain the PTY after actor teardown.
+#[derive(Clone)]
+pub(crate) struct PtyForegroundObserver {
+    master: Weak<std::fs::File>,
+}
+
+impl PtyForegroundObserver {
+    pub(crate) fn foreground_process_group_id(&self) -> Option<u32> {
+        // Hold ownership only across the ioctl, preventing descriptor reuse while
+        // allowing actor shutdown and handoff release to close the master normally.
+        let master = self.master.upgrade()?;
+        crate::platform::foreground_process_group_id_for_tty_fd(master.as_raw_fd())
+    }
 }
 
 #[derive(Debug)]
@@ -300,12 +316,11 @@ impl PtyIoActorHandle {
     }
 
     pub(crate) fn foreground_process_group_id(&self) -> Option<u32> {
-        let (reply_tx, reply_rx) = std_mpsc::channel();
-        self.control_tx
-            .send(PtyIoControlCommand::ForegroundProcessGroup(reply_tx))
-            .ok()?;
-        self.wake_actor();
-        reply_rx.recv_timeout(Duration::from_secs(1)).ok()?
+        self.foreground_observer.foreground_process_group_id()
+    }
+
+    pub(crate) fn foreground_observer(&self) -> PtyForegroundObserver {
+        self.foreground_observer.clone()
     }
 
     pub(crate) fn rollback_handoff(&self) -> std::io::Result<()> {
@@ -393,6 +408,7 @@ impl PtyIoActor {
         }));
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let response_order = Arc::new(Mutex::new(()));
+        let master = Arc::new(std::fs::File::from(config.master_fd));
         let handle = PtyIoActorHandle {
             data_tx,
             control_tx,
@@ -400,11 +416,14 @@ impl PtyIoActor {
             user_writes,
             controls: Arc::clone(&controls),
             response_order: Arc::clone(&response_order),
+            foreground_observer: PtyForegroundObserver {
+                master: Arc::downgrade(&master),
+            },
         };
 
         let mut runner = PtyIoActorRunner {
             pane_id: config.pane_id,
-            file: std::fs::File::from(config.master_fd),
+            file: master,
             data_rx,
             control_rx,
             state: if config.initially_quiesced {
@@ -442,7 +461,7 @@ impl PtyIoActor {
 
 struct PtyIoActorRunner {
     pane_id: u32,
-    file: std::fs::File,
+    file: Arc<std::fs::File>,
     data_rx: mpsc::Receiver<PtyIoDataCommand>,
     control_rx: std_mpsc::Receiver<PtyIoControlCommand>,
     state: ActorState,
@@ -686,11 +705,6 @@ impl PtyIoActorRunner {
                 };
                 let _ = reply.send(result);
             }
-            PtyIoControlCommand::ForegroundProcessGroup(reply) => {
-                let result =
-                    crate::platform::foreground_process_group_id_for_tty_fd(self.file.as_raw_fd());
-                let _ = reply.send(result);
-            }
             PtyIoControlCommand::RollbackHandoff(reply) => {
                 self.pending_handoff.take();
                 let result = if self.state == ActorState::Released {
@@ -815,7 +829,7 @@ impl PtyIoActorRunner {
 
     fn read_once(&mut self) -> bool {
         let mut buf = [0u8; 8192];
-        match self.file.read(&mut buf) {
+        match self.file.as_ref().read(&mut buf) {
             Ok(0) => false,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => true,
@@ -931,7 +945,7 @@ impl PtyIoActorRunner {
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
         while let Some(write) = self.pending_writes.front() {
             let chunk = &write.bytes[self.current_write_offset..];
-            match self.file.write(chunk) {
+            match self.file.as_ref().write(chunk) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -944,7 +958,7 @@ impl PtyIoActorRunner {
                         let completed = self.pending_writes.pop_front().unwrap();
                         self.current_write_offset = 0;
                         if let Some(boundary) = completed.boundary {
-                            self.file.flush()?;
+                            self.file.as_ref().flush()?;
                             return Ok(Some(boundary));
                         }
                     }
@@ -959,7 +973,7 @@ impl PtyIoActorRunner {
                 }
             }
         }
-        self.file.flush()?;
+        self.file.as_ref().flush()?;
         Ok(None)
     }
 
@@ -1098,7 +1112,7 @@ mod tests {
         let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
         let runner = PtyIoActorRunner {
             pane_id: 1,
-            file: std::fs::File::from(owned),
+            file: Arc::new(std::fs::File::from(owned)),
             data_rx,
             control_rx,
             state: ActorState::Running,
@@ -1123,6 +1137,137 @@ mod tests {
         assert!(!runner.handle_data_command(PtyIoDataCommand::WriteUserInput(Bytes::new())));
 
         assert!(runner.pending_writes.is_empty());
+    }
+
+    #[test]
+    fn foreground_observation_does_not_queue_or_wake_actor() {
+        let (actor_socket, _peer) = UnixStream::pair().expect("socket pair");
+        let master = Arc::new(std::fs::File::from(unsafe {
+            OwnedFd::from_raw_fd(actor_socket.into_raw_fd())
+        }));
+        let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = std_mpsc::channel();
+        let handle = PtyIoActorHandle {
+            data_tx,
+            control_tx,
+            wake: wake_pipe.writer,
+            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            controls: Arc::new(Mutex::new(SharedPtyControls::default())),
+            response_order: Arc::new(Mutex::new(())),
+            foreground_observer: PtyForegroundObserver {
+                master: Arc::downgrade(&master),
+            },
+        };
+
+        for _ in 0..64 {
+            assert_eq!(handle.foreground_process_group_id(), None);
+            assert_eq!(
+                handle.foreground_observer().foreground_process_group_id(),
+                None
+            );
+        }
+
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+        let mut wake = std::fs::File::from(wake_pipe.read_fd);
+        assert_eq!(
+            wake.read(&mut [0; 1])
+                .expect_err("observation leaves wake pipe empty")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(Arc::strong_count(&master), 1);
+    }
+
+    #[test]
+    fn foreground_observer_does_not_retain_master_after_shutdown_or_release() {
+        for release in [false, true] {
+            let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+            let observer = handle.foreground_observer();
+            if release {
+                handle.release_after_commit().expect("actor released");
+            } else {
+                handle.shutdown();
+            }
+
+            assert_eq!(peer.read(&mut [0; 1]).expect("actor closes master"), 0);
+            assert!(observer.master.upgrade().is_none());
+            assert_eq!(observer.foreground_process_group_id(), None);
+            assert_eq!(handle.foreground_process_group_id(), None);
+        }
+    }
+
+    #[test]
+    fn foreground_observer_tracks_live_pty_job_transitions() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args([
+            "-c",
+            "set -m; printf 'ready\\n'; read -r line; sleep 30; printf 'returned\\n'; read -r line",
+        ]);
+        let mut spawned = crate::pty::backend::spawn_with_portable_pty(24, 80, command)
+            .expect("shell starts with controlling tty");
+        let shell_pid = spawned.child.process_id().expect("shell pid");
+        let (output_tx, output_rx) = std_mpsc::channel();
+        let handle = PtyIoActor::spawn(PtyIoActorConfig {
+            pane_id: 1,
+            master_fd: spawned.master_fd,
+            initially_quiesced: false,
+            on_read: Box::new(move |bytes| {
+                let _ = output_tx.send(Bytes::copy_from_slice(bytes));
+                PtyReadResult::empty()
+            }),
+            on_reader_exit: None,
+        })
+        .expect("actor starts");
+        let observer = handle.foreground_observer();
+        let wait_for_output = |marker: &str| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut output = Vec::new();
+            while !String::from_utf8_lossy(&output).contains(marker) {
+                output.extend(
+                    output_rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .expect("shell reaches requested state"),
+                );
+            }
+        };
+        wait_for_output("ready");
+        assert_eq!(observer.foreground_process_group_id(), Some(shell_pid));
+        handle
+            .try_write_user_input(Bytes::from_static(b"go\r"))
+            .expect("shell input accepted");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let foreground_pid = loop {
+            if let Some(pgid) = observer.foreground_process_group_id() {
+                if pgid != shell_pid {
+                    break pgid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "foreground sleep acquires terminal"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        handle
+            .begin_handoff(Duration::from_secs(1))
+            .expect("actor quiesces");
+        assert_eq!(observer.foreground_process_group_id(), Some(foreground_pid));
+        assert_eq!(
+            unsafe { libc::kill(-(foreground_pid as i32), libc::SIGTERM) },
+            0
+        );
+        handle.rollback_handoff().expect("actor resumes");
+        wait_for_output("returned");
+        assert_eq!(observer.foreground_process_group_id(), Some(shell_pid));
+
+        let _ = spawned.child.kill();
+        let _ = spawned.child.wait();
+        handle.shutdown();
     }
 
     #[test]
@@ -1618,6 +1763,9 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls: Arc::clone(&controls),
             response_order: Arc::new(Mutex::new(())),
+            foreground_observer: PtyForegroundObserver {
+                master: Weak::new(),
+            },
         };
 
         handle.resize(20, 80, 8, 16, vec![Bytes::from_static(b"old")]);
@@ -1669,7 +1817,7 @@ mod tests {
         let query_light = Arc::clone(&light);
         let runner = PtyIoActorRunner {
             pane_id: 1,
-            file: std::fs::File::from(owned),
+            file: Arc::new(std::fs::File::from(owned)),
             data_rx,
             control_rx,
             state: ActorState::Running,
@@ -1697,6 +1845,9 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls,
             response_order,
+            foreground_observer: PtyForegroundObserver {
+                master: Arc::downgrade(&runner.file),
+            },
         };
         let (changed_tx, changed_rx) = std_mpsc::channel();
         let (continue_tx, continue_rx) = std_mpsc::channel();
@@ -1766,6 +1917,9 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
+            foreground_observer: PtyForegroundObserver {
+                master: Weak::new(),
+            },
         };
 
         let handoff = std::thread::spawn(move || handle.begin_handoff(Duration::from_secs(1)));
@@ -1802,7 +1956,9 @@ mod tests {
             .expect("queued write");
         let mut runner = PtyIoActorRunner {
             pane_id: 1,
-            file: std::fs::File::from(unsafe { OwnedFd::from_raw_fd(actor_socket.into_raw_fd()) }),
+            file: Arc::new(std::fs::File::from(unsafe {
+                OwnedFd::from_raw_fd(actor_socket.into_raw_fd())
+            })),
             data_rx,
             control_rx,
             state: ActorState::Running,
