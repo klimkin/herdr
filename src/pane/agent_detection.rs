@@ -2,6 +2,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::detect::{Agent, AgentDetection, AgentState};
 
+pub(super) const TICK_UNIDENTIFIED: std::time::Duration = std::time::Duration::from_millis(500);
+pub(super) const TICK_IDENTIFIED: std::time::Duration = std::time::Duration::from_millis(300);
+const TICK_PENDING_RELEASE: std::time::Duration = std::time::Duration::from_millis(50);
+
+pub(super) fn detection_poll_interval(
+    agent: Option<Agent>,
+    pending_idle: bool,
+    pending_release: bool,
+) -> std::time::Duration {
+    if pending_release {
+        TICK_PENDING_RELEASE
+    } else if pending_idle {
+        AGENT_PENDING_IDLE_RECHECK
+    } else if agent.is_none() {
+        TICK_UNIDENTIFIED
+    } else {
+        TICK_IDENTIFIED
+    }
+}
+
 pub(super) const AGENT_PENDING_IDLE_RECHECK: std::time::Duration =
     std::time::Duration::from_millis(100);
 const AGENT_PENDING_IDLE_CONFIRMATIONS: u8 = 3;
@@ -77,65 +97,65 @@ impl PendingIdleConfirmation {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct IdleScreenScanSkipInput {
-    pub(super) state: AgentState,
-    pub(super) agent: Option<Agent>,
-    pub(super) pending_idle_active: bool,
-    pub(super) agent_changed: bool,
-    pub(super) process_exited: bool,
-    pub(super) current_detection_content_seq: Option<u64>,
-    pub(super) last_screen_scan_detection_content_seq: Option<u64>,
+/// Retains bottom-buffer evidence between ticks; deadlines still run every tick.
+#[derive(Debug, Default)]
+pub(super) struct DetectionScreenCache {
+    key: Option<(Option<Agent>, u64)>,
+    content: String,
+    detection: Option<AgentDetection>,
 }
 
-pub(super) fn should_skip_idle_screen_scan(input: IdleScreenScanSkipInput) -> bool {
-    let stable_state = input.state == AgentState::Idle
-        || (input.state == AgentState::Unknown && input.agent == Some(Agent::Codex));
-    if !stable_state
-        || input.agent.is_none()
-        || input.pending_idle_active
-        || input.agent_changed
-        || input.process_exited
-    {
-        return false;
+pub(super) struct DetectionScreenSnapshot {
+    pub(super) content: String,
+    pub(super) detection: Option<AgentDetection>,
+}
+
+pub(super) struct DetectionScreenObservation {
+    pub(super) detection: Option<AgentDetection>,
+    pub(super) content_changed: bool,
+    pub(super) refreshed: bool,
+}
+
+impl DetectionScreenCache {
+    pub(super) fn invalidate(&mut self) {
+        self.key = None;
     }
 
-    input.current_detection_content_seq.is_some()
-        && input.last_screen_scan_detection_content_seq == input.current_detection_content_seq
-}
+    pub(super) fn content(&self) -> &str {
+        &self.content
+    }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DetectionScreenReadDecision {
-    Read,
-    Skip,
-}
+    pub(super) fn observe(
+        &mut self,
+        agent: Option<Agent>,
+        content_seq: u64,
+        process_exited: bool,
+        read_snapshot: impl FnOnce() -> DetectionScreenSnapshot,
+    ) -> DetectionScreenObservation {
+        if process_exited {
+            return DetectionScreenObservation {
+                detection: detection_update_for_publish_with_osc(agent, "", "", "", true),
+                content_changed: false,
+                refreshed: false,
+            };
+        }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct DetectionScreenReadInput {
-    pub(super) state: AgentState,
-    pub(super) agent: Option<Agent>,
-    pub(super) pending_idle_active: bool,
-    pub(super) agent_changed: bool,
-    pub(super) process_exited: bool,
-    pub(super) current_detection_content_seq: Option<u64>,
-    pub(super) last_screen_scan_detection_content_seq: Option<u64>,
-}
-
-pub(super) fn decide_detection_screen_read(
-    input: DetectionScreenReadInput,
-) -> DetectionScreenReadDecision {
-    if should_skip_idle_screen_scan(IdleScreenScanSkipInput {
-        state: input.state,
-        agent: input.agent,
-        pending_idle_active: input.pending_idle_active,
-        agent_changed: input.agent_changed,
-        process_exited: input.process_exited,
-        current_detection_content_seq: input.current_detection_content_seq,
-        last_screen_scan_detection_content_seq: input.last_screen_scan_detection_content_seq,
-    }) {
-        DetectionScreenReadDecision::Skip
-    } else {
-        DetectionScreenReadDecision::Read
+        let refreshed = self.key != Some((agent, content_seq));
+        let mut content_changed = false;
+        if refreshed {
+            let snapshot = read_snapshot();
+            // Raw PTY generations include invisible controls. Only rendered-text
+            // changes count as evidence for same-process-group acquisition.
+            content_changed = snapshot.content != self.content;
+            self.content = snapshot.content;
+            self.detection = snapshot.detection;
+            self.key = Some((agent, content_seq));
+        }
+        DetectionScreenObservation {
+            detection: self.detection,
+            content_changed,
+            refreshed,
+        }
     }
 }
 
@@ -386,18 +406,6 @@ mod tests {
         }
     }
 
-    fn screen_read_input(state: AgentState, current_seq: u64) -> DetectionScreenReadInput {
-        DetectionScreenReadInput {
-            state,
-            agent: Some(Agent::Codex),
-            pending_idle_active: false,
-            agent_changed: false,
-            process_exited: false,
-            current_detection_content_seq: Some(current_seq),
-            last_screen_scan_detection_content_seq: Some(10),
-        }
-    }
-
     #[test]
     fn codex_startup_prompt_survives_terminal_wraps() {
         let wrapped = "header\n› Ask Codex to do\nanything\nfooter";
@@ -406,75 +414,217 @@ mod tests {
     }
 
     #[test]
-    fn screen_read_skips_unchanged_idle_bottom_buffer() {
-        assert_eq!(
-            decide_detection_screen_read(screen_read_input(AgentState::Idle, 10)),
-            DetectionScreenReadDecision::Skip
-        );
+    fn screen_cache_formats_quiet_panes_once_for_every_state() {
+        for agent in [None, Some(Agent::Codex), Some(Agent::Pi)] {
+            for state in [
+                AgentState::Idle,
+                AgentState::Working,
+                AgentState::Blocked,
+                AgentState::Unknown,
+            ] {
+                let mut cache = DetectionScreenCache::default();
+                let mut reads = 0;
+                for _ in 0..20 {
+                    let observation = cache.observe(agent, 10, false, || {
+                        reads += 1;
+                        DetectionScreenSnapshot {
+                            content: "unchanged".into(),
+                            detection: Some(screen_detection(state)),
+                        }
+                    });
+                    assert_eq!(observation.detection.unwrap().state, state);
+                }
+                assert_eq!(reads, 1, "agent={agent:?}, state={state:?}");
+            }
+        }
     }
 
     #[test]
-    fn screen_read_skips_unchanged_ambiguous_codex_but_not_new_content_or_replacement() {
-        let mut input = screen_read_input(AgentState::Unknown, 10);
-        assert_eq!(
-            decide_detection_screen_read(input),
-            DetectionScreenReadDecision::Skip
-        );
-        input.current_detection_content_seq = Some(11);
-        assert_eq!(
-            decide_detection_screen_read(input),
-            DetectionScreenReadDecision::Read
-        );
-        input.current_detection_content_seq = Some(10);
-        input.agent_changed = true;
-        assert_eq!(
-            decide_detection_screen_read(input),
-            DetectionScreenReadDecision::Read
-        );
-        input.agent_changed = false;
-        input.agent = Some(Agent::Pi);
-        assert_eq!(
-            decide_detection_screen_read(input),
-            DetectionScreenReadDecision::Read
-        );
+    fn screen_cache_invisible_output_preserves_semantic_content_change() {
+        let mut cache = DetectionScreenCache::default();
+        for (seq, expected_change) in [(1, true), (2, false), (2, false)] {
+            let observation = cache.observe(None, seq, false, || DetectionScreenSnapshot {
+                content: "same bottom buffer".into(),
+                detection: Some(screen_detection(AgentState::Unknown)),
+            });
+            assert_eq!(observation.content_changed, expected_change);
+        }
     }
 
     #[test]
-    fn screen_read_reads_when_idle_bottom_buffer_changes() {
-        assert_eq!(
-            decide_detection_screen_read(screen_read_input(AgentState::Idle, 11)),
-            DetectionScreenReadDecision::Read
-        );
+    fn screen_cache_rechecks_new_generation_agent_and_reset() {
+        let mut cache = DetectionScreenCache::default();
+        let mut reads = 0;
+        for (agent, seq, reset) in [
+            (Some(Agent::Codex), 1, false),
+            (Some(Agent::Codex), 2, false),
+            (Some(Agent::Pi), 2, false),
+            (Some(Agent::Pi), 2, true),
+        ] {
+            if reset {
+                cache.invalidate();
+            }
+            let observation = cache.observe(agent, seq, false, || {
+                reads += 1;
+                DetectionScreenSnapshot {
+                    content: "retained screen".into(),
+                    detection: Some(screen_detection(AgentState::Working)),
+                }
+            });
+            assert!(observation.refreshed);
+        }
+        assert_eq!(reads, 4);
     }
 
     #[test]
-    fn screen_read_reads_for_transitions_and_missing_agent() {
-        let mut input = screen_read_input(AgentState::Idle, 10);
-        input.pending_idle_active = true;
-        assert_eq!(
-            decide_detection_screen_read(input),
-            DetectionScreenReadDecision::Read
-        );
+    fn screen_cache_retains_skip_state_until_content_or_reset_changes() {
+        let mut cache = DetectionScreenCache::default();
+        let mut reads = 0;
+        for _ in 0..4 {
+            let observation = cache.observe(Some(Agent::Pi), 1, false, || {
+                reads += 1;
+                DetectionScreenSnapshot {
+                    content: "historical view".into(),
+                    detection: None,
+                }
+            });
+            assert!(observation.detection.is_none());
+        }
+        assert_eq!(reads, 1);
+        cache.invalidate();
+        let observation = cache.observe(Some(Agent::Pi), 1, false, || DetectionScreenSnapshot {
+            content: "historical view".into(),
+            detection: Some(screen_detection(AgentState::Working)),
+        });
+        assert!(observation.refreshed);
+        assert!(!observation.content_changed);
+        assert_eq!(observation.detection.unwrap().state, AgentState::Working);
+    }
 
-        let mut input = screen_read_input(AgentState::Idle, 10);
-        input.agent_changed = true;
+    #[test]
+    fn screen_cache_process_exit_publishes_without_formatting() {
+        let mut cache = DetectionScreenCache::default();
+        let observation = cache.observe(Some(Agent::Codex), 0, true, || {
+            panic!("process exit must not format a screen")
+        });
         assert_eq!(
-            decide_detection_screen_read(input),
-            DetectionScreenReadDecision::Read
+            observation.detection.unwrap(),
+            screen_detection(AgentState::Idle)
         );
+        assert!(!observation.content_changed);
+        assert!(!observation.refreshed);
+    }
 
-        let mut input = screen_read_input(AgentState::Idle, 10);
-        input.process_exited = true;
+    #[test]
+    fn screen_cache_rechecks_osc_only_evidence_on_new_generation() {
+        let mut cache = DetectionScreenCache::default();
+        for (seq, state) in [(1, AgentState::Working), (2, AgentState::Blocked)] {
+            let observation = cache.observe(Some(Agent::Codex), seq, false, || {
+                // Synthetic classifier changes only OSC evidence; screen stays fixed.
+                DetectionScreenSnapshot {
+                    content: "retained screen".into(),
+                    detection: Some(screen_detection(state)),
+                }
+            });
+            assert_eq!(observation.detection.unwrap().state, state);
+            assert_eq!(observation.content_changed, seq == 1);
+        }
+    }
+
+    #[test]
+    fn screen_cache_keeps_plain_idle_confirmations_without_new_snapshots() {
+        let mut cache = DetectionScreenCache::default();
+        let mut pending = PendingIdleConfirmation::default();
+        let now = std::time::Instant::now();
+        let mut reads = 0;
+        for tick in 0..=3 {
+            let observation = cache.observe(Some(Agent::Pi), 1, false, || {
+                reads += 1;
+                DetectionScreenSnapshot {
+                    content: "ready".into(),
+                    detection: Some(AgentDetection {
+                        visible_idle: false,
+                        ..screen_detection(AgentState::Idle)
+                    }),
+                }
+            });
+            let decision = decide_screen_detection_publish(
+                screen_publish_input(
+                    AgentState::Working,
+                    observation.detection.unwrap(),
+                    now + AGENT_PENDING_IDLE_RECHECK * tick,
+                ),
+                &mut pending,
+            );
+            if tick < 3 {
+                assert_eq!(decision, DetectionPublishDecision::NoPublish);
+            } else {
+                assert!(matches!(
+                    decision,
+                    DetectionPublishDecision::Publish {
+                        state: AgentState::Idle,
+                        ..
+                    }
+                ));
+            }
+        }
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn screen_cache_keeps_blocker_refresh_deadline_without_new_snapshots() {
+        let mut cache = DetectionScreenCache::default();
+        let mut pending = PendingIdleConfirmation::default();
+        let now = std::time::Instant::now();
+        let mut reads = 0;
+        for elapsed in [std::time::Duration::ZERO, STABLE_VISIBLE_SIGNAL_REFRESH] {
+            let observation = cache.observe(Some(Agent::Pi), 1, false, || {
+                reads += 1;
+                DetectionScreenSnapshot {
+                    content: "permission".into(),
+                    detection: Some(AgentDetection {
+                        visible_blocker: true,
+                        ..screen_detection(AgentState::Blocked)
+                    }),
+                }
+            });
+            let decision = decide_screen_detection_publish(
+                ScreenDetectionPublishInput {
+                    last_visible_blocker: true,
+                    last_visible_signal_refresh: Some(now),
+                    ..screen_publish_input(
+                        AgentState::Blocked,
+                        observation.detection.unwrap(),
+                        now + elapsed,
+                    )
+                },
+                &mut pending,
+            );
+            assert_eq!(
+                matches!(decision, DetectionPublishDecision::Publish { .. }),
+                !elapsed.is_zero()
+            );
+        }
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn detection_poll_interval_prioritizes_release_and_idle_confirmation() {
         assert_eq!(
-            decide_detection_screen_read(input),
-            DetectionScreenReadDecision::Read
+            detection_poll_interval(None, false, false),
+            TICK_UNIDENTIFIED
         );
-
-        let mut input = screen_read_input(AgentState::Idle, 10);
-        input.agent = None;
         assert_eq!(
-            decide_detection_screen_read(input),
-            DetectionScreenReadDecision::Read
+            detection_poll_interval(Some(Agent::Pi), false, false),
+            TICK_IDENTIFIED
+        );
+        assert_eq!(
+            detection_poll_interval(None, true, false),
+            AGENT_PENDING_IDLE_RECHECK
+        );
+        assert_eq!(
+            detection_poll_interval(None, true, true),
+            TICK_PENDING_RELEASE
         );
     }
 
