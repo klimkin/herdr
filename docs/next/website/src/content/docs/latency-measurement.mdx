@@ -37,6 +37,21 @@ response; it excludes modal opening and label entry. APIs only prepare or inspec
 sessions. Echo disables line-discipline echo and uses explicit input identities.
 The observer reconstructs VT state and respects synchronized-output commits.
 
+`--stall-ms` now acknowledges a paused outer-PTY reader before offering probes.
+A reserved unmeasured helper marker wakes a read already in progress, then the
+reader parks until the controller resets it. Reports retain installation,
+actual pause, reset, actual resume, first read attempt, and first receipt times.
+This acknowledged-pause cohort differs from older best-effort delay insertion.
+It measures outer-reader recovery; it does not prove server socket blockage.
+
+Recovery uses one fixed set of input operations completed before reset, including
+warmup probes. Rejected input is excluded from accepted deliveries but retains its
+outcome. Missing members prevent a catch-up duration; later probes cannot enlarge
+the cutoff. A receipt before reader resume cannot become a zero/negative recovery
+interval. Continuous throttle has no recovery endpoint; older artifacts without
+lifecycle/cutoff data report recovery unavailable. An initial stall followed by
+reset clears reader throttling, including when both options were requested.
+
 `--warmups` defaults to 10; `--max-pending` bounds outstanding required effects.
 Record intended and actual injection times. Rejected, interrupted, and timed-out
 probes remain in samples. A 20 ms diagnostic threshold reports misses; it is not

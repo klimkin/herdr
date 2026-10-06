@@ -612,6 +612,87 @@ def freshness(run):
     return results
 
 
+def reader_recovery(run):
+    """One fixed accepted-stimulus cohort at acknowledged outer-reader reset."""
+    limits = ['outer-reader recovery does not prove server socket blockage',
+              'required probe catch-up differs from superseded streaming generations',
+              'elapsed intervals include observer and host scheduling']
+    if not run.get('stall_ms'):
+        return {'status': 'not_applicable', 'reason': 'reader delay never reset', 'limits': limits}
+    calibration = run.get('clock_validation_ns')
+    if (not isinstance(calibration, list) or len(calibration) != 3
+            or any(type(value) is not int for value in calibration)
+            or not calibration[0] <= calibration[1] <= calibration[2]):
+        return {'status': 'unavailable', 'reason': 'host clock calibration absent or invalid', 'limits': limits}
+    lifecycle = run.get('reader_lifecycle')
+    if not isinstance(lifecycle, dict):
+        return {'status': 'unavailable', 'reason': 'reader lifecycle timestamps absent', 'limits': limits}
+    required = ['installed_ns', 'paused_ns', 'reset_request_ns', 'reset_complete_ns',
+                'reader_resumed_ns', 'first_read_attempt_ns', 'first_receipt_ns']
+    if any(type(lifecycle.get(name)) is not int for name in required) or lifecycle.get('stopped'):
+        return {'status': 'unavailable', 'reason': 'reader pause/reset/resume incomplete', 'limits': limits}
+    client = lifecycle.get('client_index')
+    pids = run.get('client_pids', [])
+    if (not isinstance(pids, list) or any(type(pid) is not int for pid in pids)
+            or len(pids) != run.get('clients') or len(set(pids)) != len(pids)
+            or not isinstance(client, int) or not 0 <= client < len(pids) or pids[client] != lifecycle.get('client_pid')):
+        return {'status': 'unavailable', 'reason': 'affected client identity unproven', 'limits': limits}
+    install, paused, request, reset, resumed, attempt, receipt = (lifecycle[name] for name in required)
+    if not install <= paused <= request <= reset <= resumed <= attempt <= receipt:
+        return {'status': 'unavailable', 'reason': 'reader lifecycle ordering invalid', 'limits': limits}
+    if not isinstance(run.get('recovery_warmups'), list):
+        return {'status': 'unavailable', 'reason': 'warmup recovery cohort absent', 'limits': limits}
+    if not isinstance(run.get('samples'), list) or type(run.get('finished_ns')) is not int or run['finished_ns'] < receipt:
+        return {'status': 'unavailable', 'reason': 'recovery sample/end metadata absent', 'limits': limits}
+    if (type(run.get('warmups')) is not int or len(run['recovery_warmups']) != run['warmups']
+            or type(run.get('offered_samples')) is not int or len(run['samples']) != run['offered_samples']):
+        return {'status': 'unavailable', 'reason': 'recovery offered/warmup cohort incomplete', 'limits': limits}
+    samples = run['recovery_warmups'] + run['samples']
+    if any(not isinstance(sample, dict) or not isinstance(sample.get('identity'), str)
+           or type(sample.get('injected_ns')) is not int or sample['injected_ns'] > run['finished_ns']
+           or not isinstance(sample.get('outcome'), str) or not isinstance(sample.get('observed_ns'), list)
+           or (sample.get('accepted_ns') is not None and type(sample.get('accepted_ns')) is not int)
+           or any(value is not None and (type(value) is not int or not sample['injected_ns'] <= value <= run['finished_ns']) for value in sample['observed_ns'])
+           for sample in samples):
+        return {'status': 'unavailable', 'reason': 'recovery samples malformed', 'limits': limits}
+    if (len({sample.get('identity') for sample in samples}) != len(samples)
+            or any(len(sample.get('observed_ns', [])) != len(pids) for sample in samples)
+            or any(isinstance(sample.get('accepted_ns'), int) and not sample['injected_ns'] <= sample['accepted_ns'] <= run['finished_ns'] for sample in samples)
+            or any(isinstance(sample.get('accepted_ns'), int) and sample['outcome'].startswith(('rejected', 'interrupted')) for sample in samples)):
+        return {'status': 'unavailable', 'reason': 'recovery cohort identity/timestamp invalid', 'limits': limits}
+    accepted = [sample for sample in samples if isinstance(sample.get('accepted_ns'), int) and sample['accepted_ns'] <= request]
+    ambiguous = [sample for sample in samples if not isinstance(sample.get('accepted_ns'), int)
+                 and sample['injected_ns'] <= request and not sample.get('outcome', '').startswith('rejected')]
+    rejected = [sample for sample in samples if sample['injected_ns'] <= request and sample.get('outcome', '').startswith('rejected')]
+    if ambiguous:
+        return {'status': 'unavailable', 'reason': 'submission completion unknown before reset',
+                'unknown_submissions': len(ambiguous), 'rejected_before_reset': len(rejected), 'limits': limits}
+    results = []
+    for index in range(run['clients']):
+        observed = [sample['observed_ns'][index] for sample in accepted]
+        unresolved = [sample for sample in accepted if sample['observed_ns'][index] is None or sample['observed_ns'][index] > request]
+        missing = sum(value is None for value in observed)
+        caught = max(observed) if observed and not missing else None
+        status = 'no_backlog' if not accepted else 'incomplete' if missing else 'already_caught_up' if not unresolved else 'caught_up'
+        reset_bounds = [caught-reset, caught-request] if caught is not None and caught >= reset else None
+        resume_delta = caught-resumed if caught is not None and caught >= resumed else None
+        ordering = ('receipt precedes reset completion or reader resume'
+                    if index == client and caught is not None and (caught < reset or caught < resumed)
+                    else 'already caught up before reset' if caught is not None and caught < request else None)
+        results.append({'client_index': index, 'client_pid': pids[index], 'status': status,
+                        'cohort_accepted': len(accepted), 'backlog_at_reset': len(unresolved), 'missing': missing,
+                        'oldest_pending_age_at_reset_ns': max((request-sample['injected_ns'] for sample in unresolved), default=None),
+                        'catch_up_ns': caught, 'reset_to_catch_up_bounds_ns': reset_bounds,
+                        'reader_resume_to_catch_up_ns': resume_delta if index == client else None,
+                        'pending_age_at_run_end_ns': max((run['finished_ns']-sample['injected_ns'] for sample in accepted if sample['observed_ns'][index] is None), default=None),
+                        'ordering': ordering})
+    cutoff = max(accepted, key=lambda sample: sample['accepted_ns'])['identity'] if accepted else None
+    return {'status': 'measured', 'affected_client_index': client, 'lifecycle': lifecycle,
+            'accepted_cutoff_identity': cutoff, 'cohort_accepted': len(accepted),
+            'cohort_scope': 'all successful harness input operations including warmup; completed before reset request',
+            'rejected_before_reset': len(rejected), 'clients': results, 'limits': limits}
+
+
 def miss_bursts(run):
     result = []
     for client in range(run["clients"]):
@@ -643,6 +724,8 @@ def main():
     lines.extend(["", f"Layout: {run.get('layout','unavailable')}; burst: {run.get('burst',1)}; warmups: {run.get('warmups',0)}.",
                   f"Maximum consecutive deadline misses per client: {miss_bursts(run)}.",
                   "", "Freshness and actual producer rates:", "", "```json", json.dumps(freshness(run),indent=2), "```"])
+    recovery = reader_recovery(run)
+    lines.extend(["", "Reader recovery:", "", "```json", json.dumps(recovery, indent=2), "```"])
     records = []
     trace_audit = None
     if args.traces:
@@ -691,7 +774,7 @@ def main():
     if args.output:
         args.output.with_suffix(".json").write_text(json.dumps({"queue_pairs": pairs,"critical_paths":paths,
             "stage_report":stage_report,"input_report":input_report,"trace_audit":trace_audit,"freshness":freshness(run),
-            "max_consecutive_deadline_misses":miss_bursts(run)}, indent=2)+"\n")
+            "max_consecutive_deadline_misses":miss_bursts(run),"reader_recovery":recovery}, indent=2)+"\n")
     lines.extend(["", "Queue pairing uses process and queue identity plus content fingerprints. Causal paths require terminal/snapshot links and client write completion. Ambiguous links remain unassigned.",
                   "", "Results include observer and host scheduling. No pixel, GPU, remote one-way, or production-SLO claim.", ""])
     text = "\n".join(lines)

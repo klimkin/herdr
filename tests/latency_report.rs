@@ -571,3 +571,81 @@ with tempfile.TemporaryDirectory() as directory:
         .expect("report executable");
     assert!(status.success());
 }
+
+#[test]
+fn latency_reader_recovery_keeps_fixed_cohort_and_missing_boundaries() {
+    let script = r#"
+import sys
+sys.path.insert(0, 'scripts')
+from latency_report import reader_recovery
+lifecycle = {'client_index':1,'client_pid':22,'requested_ms':1000,
+ 'installed_ns':80,'paused_ns':90,'reset_request_ns':200,'reset_complete_ns':205,
+ 'reader_resumed_ns':210,'first_read_attempt_ns':212,'first_receipt_ns':215,'stopped':False}
+run = {'clients':2,'client_pids':[21,22],'stall_ms':1000,'slow_reader_ms':0,
+ 'reader_lifecycle':lifecycle,'finished_ns':500,'clock_validation_ns':[10,20,30],
+ 'warmups':1,'offered_samples':3,
+ 'recovery_warmups':[{'identity':'00','injected_ns':95,'accepted_ns':100,'observed_ns':[120,250],'outcome':'presented'}],
+ 'samples':[{'identity':'01','injected_ns':140,'accepted_ns':150,'observed_ns':[170,300],'outcome':'presented'},
+ {'identity':'02','injected_ns':160,'accepted_ns':None,'observed_ns':[None,None],'outcome':'rejected: full'},
+ {'identity':'03','injected_ns':220,'accepted_ns':225,'observed_ns':[240,400],'outcome':'presented'}]}
+result=reader_recovery(run)
+assert result['status']=='measured'
+assert result['accepted_cutoff_identity']=='01'
+assert result['cohort_accepted']==2
+assert result['rejected_before_reset']==1
+assert result['clients'][1]['backlog_at_reset']==2
+assert result['clients'][1]['oldest_pending_age_at_reset_ns']==105
+assert result['clients'][1]['catch_up_ns']==300
+assert result['clients'][1]['reset_to_catch_up_bounds_ns']==[95,100]
+assert result['clients'][1]['reader_resume_to_catch_up_ns']==90
+assert result['clients'][0]['status']=='already_caught_up'
+# Later arrivals do not enlarge the fixed accepted cohort.
+run['samples'][2]['observed_ns'][1]=None
+assert reader_recovery(run)['clients'][1]['catch_up_ns']==300
+run['samples'][0]['observed_ns'][1]=None
+missing=reader_recovery(run)['clients'][1]
+assert missing['status']=='incomplete'
+assert missing['missing']==1 and missing['catch_up_ns'] is None
+# Controller reset and earlier in-flight receipt cannot become negative/zero resume latency.
+run['samples'][0]['observed_ns'][1]=202
+run['recovery_warmups'][0]['observed_ns'][1]=201
+early=reader_recovery(run)['clients'][1]
+assert early['catch_up_ns']==202
+assert early['reset_to_catch_up_bounds_ns'] is None
+assert early['reader_resume_to_catch_up_ns'] is None
+assert early['ordering']=='receipt precedes reset completion or reader resume'
+# Old archives never substitute started+requested delay for reset.
+old={**run,'started_ns':0};del old['reader_lifecycle']
+assert reader_recovery(old)['status']=='unavailable'
+assert reader_recovery({**old,'stall_ms':0,'slow_reader_ms':120})['status']=='not_applicable'
+assert reader_recovery({**run,'reader_lifecycle':{**lifecycle,'paused_ns':None}})['status']=='unavailable'
+assert reader_recovery({**run,'client_pids':[21,999]})['status']=='unavailable'
+# No accepted cohort and all-rejected probes retain counts rather than zero recovery.
+empty={**run,'recovery_warmups':[],'samples':run['samples'][1:2],'warmups':0,'offered_samples':1}
+none=reader_recovery(empty)
+assert none['cohort_accepted']==0 and none['rejected_before_reset']==1
+assert none['clients'][1]['status']=='no_backlog'
+assert none['clients'][1]['catch_up_ns'] is None
+assert none['clients'][1]['reset_to_catch_up_bounds_ns'] is None
+# Unknown interrupted completion and inconsistent membership remain unassigned.
+unknown={**run,'samples':[{**run['samples'][1],'outcome':'interrupted: timeout'}],'offered_samples':1}
+assert reader_recovery(unknown)['status']=='unavailable'
+assert reader_recovery(unknown)['unknown_submissions']==1
+invalid={**run,'reader_lifecycle':{**lifecycle,'reset_complete_ns':211}}
+assert reader_recovery(invalid)['status']=='unavailable'
+assert reader_recovery({**run,'client_pids':None})['status']=='unavailable'
+assert reader_recovery({**run,'clock_validation_ns':[10,30,20]})['status']=='unavailable'
+assert reader_recovery({**run,'samples':[{**run['samples'][0],'observed_ns':[None]}]})['status']=='unavailable'
+assert reader_recovery({**run,'samples':[None]})['status']=='unavailable'
+assert reader_recovery({**run,'recovery_warmups':[]})['status']=='unavailable'
+assert reader_recovery({**run,'samples':run['samples'][:-1]})['status']=='unavailable'
+
+
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
