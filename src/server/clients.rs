@@ -455,6 +455,18 @@ impl ClientConnection {
     }
 
     pub(crate) fn defer_full_render(&mut self) {
+        #[cfg(feature = "latency-prof")]
+        if !self.render_pending {
+            if let Some(writer) = &self.writer {
+                crate::latency_prof::record_at(
+                    "writer.deferred",
+                    0,
+                    1,
+                    writer.diagnostic_scope(),
+                    crate::latency_prof::now(),
+                );
+            }
+        }
         self.render_pending = true;
     }
 
