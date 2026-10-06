@@ -81,6 +81,22 @@ enum PtyIoDataCommand {
     },
 }
 
+struct QueuedDataCommand {
+    command: PtyIoDataCommand,
+    #[cfg(feature = "latency-prof")]
+    trace: super::input_trace::CommandTrace,
+}
+
+impl From<PtyIoDataCommand> for QueuedDataCommand {
+    fn from(command: PtyIoDataCommand) -> Self {
+        Self {
+            command,
+            #[cfg(feature = "latency-prof")]
+            trace: Default::default(),
+        }
+    }
+}
+
 enum PtyIoControlCommand {
     BeginHandoff(std_mpsc::Sender<std::io::Result<()>>),
     DuplicateForHandoff(std_mpsc::Sender<std::io::Result<RawFd>>),
@@ -91,7 +107,7 @@ enum PtyIoControlCommand {
 
 #[derive(Clone)]
 pub(crate) struct PtyIoActorHandle {
-    data_tx: mpsc::Sender<PtyIoDataCommand>,
+    data_tx: mpsc::Sender<QueuedDataCommand>,
     control_tx: std_mpsc::Sender<PtyIoControlCommand>,
     wake: fd::WakeWriter,
     user_writes: Arc<Mutex<UserWriteGate>>,
@@ -119,6 +135,8 @@ impl PtyForegroundObserver {
 #[derive(Debug)]
 struct UserWriteGate {
     accepting: bool,
+    #[cfg(feature = "latency-prof")]
+    trace: super::input_trace::InputQueueTrace,
 }
 
 impl PtyIoActorHandle {
@@ -133,27 +151,44 @@ impl PtyIoActorHandle {
         if !user_writes.accepting {
             return Err(mpsc::error::TrySendError::Closed(bytes));
         }
-        match self
-            .data_tx
-            .try_send(PtyIoDataCommand::WriteUserInput(bytes))
+        #[cfg(not(feature = "latency-prof"))]
+        self.data_tx
+            .try_send(PtyIoDataCommand::WriteUserInput(bytes).into())
+            .map_err(|err| match err {
+                mpsc::error::TrySendError::Full(queued) => {
+                    let PtyIoDataCommand::WriteUserInput(bytes) = queued.command else {
+                        unreachable!("queued write returned another command")
+                    };
+                    mpsc::error::TrySendError::Full(bytes)
+                }
+                mpsc::error::TrySendError::Closed(queued) => {
+                    let PtyIoDataCommand::WriteUserInput(bytes) = queued.command else {
+                        unreachable!("queued write returned another command")
+                    };
+                    mpsc::error::TrySendError::Closed(bytes)
+                }
+            })?;
+        #[cfg(feature = "latency-prof")]
         {
-            Ok(()) => {
-                self.wake_actor();
-                Ok(())
-            }
-            Err(mpsc::error::TrySendError::Full(command)) => {
-                let PtyIoDataCommand::WriteUserInput(bytes) = command else {
-                    unreachable!("queued write returned another command")
-                };
-                Err(mpsc::error::TrySendError::Full(bytes))
-            }
-            Err(mpsc::error::TrySendError::Closed(command)) => {
-                let PtyIoDataCommand::WriteUserInput(bytes) = command else {
-                    unreachable!("queued write returned another command")
-                };
-                Err(mpsc::error::TrySendError::Closed(bytes))
-            }
+            let mut user_writes = user_writes;
+            let permit = match self.data_tx.try_reserve() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Full(())) => {
+                    return Err(mpsc::error::TrySendError::Full(bytes))
+                }
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    return Err(mpsc::error::TrySendError::Closed(bytes))
+                }
+            };
+            let trace = user_writes.trace.accepted(&bytes, None);
+            trace.enqueue();
+            permit.send(QueuedDataCommand {
+                command: PtyIoDataCommand::WriteUserInput(bytes),
+                trace,
+            });
         }
+        self.wake_actor();
+        Ok(())
     }
 
     pub(crate) fn queue_user_input_submission(
@@ -173,13 +208,17 @@ impl PtyIoActorHandle {
             ));
         }
         let (reply_tx, reply_rx) = std_mpsc::channel();
+        #[cfg(not(feature = "latency-prof"))]
         self.data_tx
-            .try_send(PtyIoDataCommand::SubmitUserInput {
-                text,
-                enter,
-                delay,
-                reply: reply_tx,
-            })
+            .try_send(
+                PtyIoDataCommand::SubmitUserInput {
+                    text,
+                    enter,
+                    delay,
+                    reply: reply_tx,
+                }
+                .into(),
+            )
             .map_err(|err| match err {
                 mpsc::error::TrySendError::Full(_) => {
                     std::io::Error::new(std::io::ErrorKind::WouldBlock, "pty input queue is full")
@@ -188,6 +227,29 @@ impl PtyIoActorHandle {
                     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty actor closed")
                 }
             })?;
+        #[cfg(feature = "latency-prof")]
+        {
+            let mut user_writes = user_writes;
+            let permit = self.data_tx.try_reserve().map_err(|err| match err {
+                mpsc::error::TrySendError::Full(()) => {
+                    std::io::Error::new(std::io::ErrorKind::WouldBlock, "pty input queue is full")
+                }
+                mpsc::error::TrySendError::Closed(()) => {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty actor closed")
+                }
+            })?;
+            let trace = user_writes.trace.accepted(&text, Some(&enter));
+            trace.enqueue();
+            permit.send(QueuedDataCommand {
+                command: PtyIoDataCommand::SubmitUserInput {
+                    text,
+                    enter,
+                    delay,
+                    reply: reply_tx,
+                },
+                trace,
+            });
+        }
         self.wake_actor();
         Ok(reply_rx)
     }
@@ -405,6 +467,8 @@ impl PtyIoActor {
         let wake_pipe = fd::create_wake_pipe()?;
         let user_writes = Arc::new(Mutex::new(UserWriteGate {
             accepting: !config.initially_quiesced,
+            #[cfg(feature = "latency-prof")]
+            trace: Default::default(),
         }));
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let response_order = Arc::new(Mutex::new(()));
@@ -463,7 +527,7 @@ impl PtyIoActor {
 struct PtyIoActorRunner {
     pane_id: u32,
     file: Arc<std::fs::File>,
-    data_rx: mpsc::Receiver<PtyIoDataCommand>,
+    data_rx: mpsc::Receiver<QueuedDataCommand>,
     control_rx: std_mpsc::Receiver<PtyIoControlCommand>,
     state: ActorState,
     diagnostic_input: crate::latency_prof::InputStimuli,
@@ -483,6 +547,8 @@ struct ActiveSubmission {
     enter: Bytes,
     delay: Duration,
     phase: SubmissionPhase,
+    #[cfg(feature = "latency-prof")]
+    enter_trace: super::input_trace::PartTrace,
     reply: std_mpsc::Sender<std::io::Result<()>>,
 }
 
@@ -490,6 +556,10 @@ struct ActiveSubmission {
 struct PendingWrite {
     bytes: Bytes,
     boundary: Option<SubmissionBoundary>,
+    #[cfg(feature = "latency-prof")]
+    trace: super::input_trace::PartTrace,
+    #[cfg(feature = "latency-prof")]
+    attempted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,11 +575,36 @@ enum SubmissionPhase {
 }
 
 impl PtyIoActorRunner {
+    #[cfg(feature = "latency-prof")]
+    fn trace_last_write(&mut self, trace: super::input_trace::PartTrace) {
+        if trace.is_empty() {
+            return;
+        }
+        if let Some(write) = self.pending_writes.back_mut() {
+            if write.trace == Default::default() {
+                write.trace = trace;
+                trace.record("input.pty_pending");
+            }
+        }
+    }
+
+    fn discard_pending_writes(&mut self) {
+        #[cfg(feature = "latency-prof")]
+        for write in &self.pending_writes {
+            write.trace.record("input.pty_part_discard");
+        }
+        self.pending_writes.clear();
+    }
+
     fn enqueue_write(&mut self, bytes: Bytes) {
         if !bytes.is_empty() {
             self.pending_writes.push_back(PendingWrite {
                 bytes,
                 boundary: None,
+                #[cfg(feature = "latency-prof")]
+                trace: Default::default(),
+                #[cfg(feature = "latency-prof")]
+                attempted: false,
             });
         }
     }
@@ -519,6 +614,10 @@ impl PtyIoActorRunner {
             self.pending_writes.push_back(PendingWrite {
                 bytes,
                 boundary: Some(boundary),
+                #[cfg(feature = "latency-prof")]
+                trace: Default::default(),
+                #[cfg(feature = "latency-prof")]
+                attempted: false,
             });
         }
     }
@@ -655,11 +754,20 @@ impl PtyIoActorRunner {
         should_exit
     }
 
-    fn handle_data_command(&mut self, command: PtyIoDataCommand) -> bool {
-        match command {
+    fn handle_data_command(&mut self, queued: impl Into<QueuedDataCommand>) -> bool {
+        let queued = queued.into();
+        #[cfg(feature = "latency-prof")]
+        queued.trace.claim();
+        if self.state != ActorState::Running {
+            #[cfg(feature = "latency-prof")]
+            queued.trace.discard();
+        }
+        match queued.command {
             PtyIoDataCommand::WriteUserInput(bytes) => {
                 if self.state == ActorState::Running {
                     self.enqueue_write(bytes);
+                    #[cfg(feature = "latency-prof")]
+                    self.trace_last_write(queued.trace.text);
                 }
             }
             PtyIoDataCommand::SubmitUserInput {
@@ -673,12 +781,16 @@ impl PtyIoActorRunner {
                         SubmissionPhase::WaitingUntil(Instant::now() + delay)
                     } else {
                         self.enqueue_submission_write(text, SubmissionBoundary::Text);
+                        #[cfg(feature = "latency-prof")]
+                        self.trace_last_write(queued.trace.text);
                         SubmissionPhase::WritingText
                     };
                     self.active_submission = Some(ActiveSubmission {
                         enter,
                         delay,
                         phase,
+                        #[cfg(feature = "latency-prof")]
+                        enter_trace: queued.trace.enter,
                         reply,
                     });
                 } else {
@@ -722,7 +834,7 @@ impl PtyIoActorRunner {
             }
             PtyIoControlCommand::ReleaseAfterCommit(reply) => {
                 self.state = ActorState::Released;
-                self.pending_writes.clear();
+                self.discard_pending_writes();
                 let _ = reply.send(Ok(()));
                 return true;
             }
@@ -910,7 +1022,15 @@ impl PtyIoActorRunner {
                 let _ = submission.reply.send(Ok(()));
             } else {
                 self.active_submission.as_mut().unwrap().phase = SubmissionPhase::WritingEnter;
+                #[cfg(feature = "latency-prof")]
+                let enter_trace = self
+                    .active_submission
+                    .as_ref()
+                    .map(|submission| submission.enter_trace)
+                    .unwrap_or_default();
                 self.enqueue_submission_write(enter, SubmissionBoundary::Enter);
+                #[cfg(feature = "latency-prof")]
+                self.trace_last_write(enter_trace);
             }
         }
     }
@@ -932,15 +1052,20 @@ impl PtyIoActorRunner {
 
     fn fail_active_submission(&mut self, err: std::io::Error) {
         if let Some(submission) = self.active_submission.take() {
+            #[cfg(feature = "latency-prof")]
+            submission.enter_trace.record("input.pty_part_discard");
             let _ = submission.reply.send(Err(err));
         }
     }
 
     fn close_input_queue(&mut self) {
         self.data_rx.close();
+        self.discard_pending_writes();
         self.fail_active_submission(input_submission_closed_error());
         while let Some(command) = self.data_rx.blocking_recv() {
-            if let PtyIoDataCommand::SubmitUserInput { reply, .. } = command {
+            #[cfg(feature = "latency-prof")]
+            command.trace.discard();
+            if let PtyIoDataCommand::SubmitUserInput { reply, .. } = command.command {
                 let _ = reply.send(Err(input_submission_closed_error()));
             }
         }
@@ -953,7 +1078,12 @@ impl PtyIoActorRunner {
             self.pane_id as u64,
             self.pending_writes.len() as u64,
         );
-        while let Some(write) = self.pending_writes.front() {
+        while let Some(write) = self.pending_writes.front_mut() {
+            #[cfg(feature = "latency-prof")]
+            if !write.attempted {
+                write.trace.record("input.pty_write_attempt");
+                write.attempted = true;
+            }
             let chunk = &write.bytes[self.current_write_offset..];
             match self.file.as_ref().write(chunk) {
                 Ok(0) => {
@@ -966,6 +1096,8 @@ impl PtyIoActorRunner {
                     self.current_write_offset += written;
                     if self.current_write_offset >= write.bytes.len() {
                         let completed = self.pending_writes.pop_front().unwrap();
+                        #[cfg(feature = "latency-prof")]
+                        completed.trace.record("input.pty_part_complete");
                         self.diagnostic_input.observe(
                             &completed.bytes,
                             "input.pty_write_complete",
@@ -982,7 +1114,7 @@ impl PtyIoActorRunner {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return Ok(None),
                 Err(err) => {
                     warn!(pane = self.pane_id, err = %err, "PTY actor write failed");
-                    self.pending_writes.clear();
+                    self.discard_pending_writes();
                     self.current_write_offset = 0;
                     return Err(err);
                 }
@@ -1168,7 +1300,11 @@ mod tests {
             data_tx,
             control_tx,
             wake: wake_pipe.writer,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate {
+                accepting: true,
+                #[cfg(feature = "latency-prof")]
+                trace: Default::default(),
+            })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
             foreground_observer: PtyForegroundObserver {
@@ -1314,6 +1450,285 @@ mod tests {
         peer.read_exact(&mut buf).expect("peer receives write");
         assert_eq!(&buf, b"hello");
         handle.shutdown();
+    }
+
+    #[cfg(feature = "latency-prof")]
+    fn trace_scenario(name: &str, child: impl FnOnce()) -> Vec<serde_json::Value> {
+        if std::env::var("HERDR_ACTOR_TRACE_SCENARIO").as_deref() == Ok(name) {
+            child();
+            crate::latency_prof::shutdown();
+            return Vec::new();
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-actor-trace-{}-{}",
+            std::process::id(),
+            name.rsplit("::").next().expect("test name")
+        ));
+        std::fs::create_dir(&directory).expect("trace directory");
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([name, "--exact", "--nocapture"])
+            .env("HERDR_ACTOR_TRACE_SCENARIO", name)
+            .env("HERDR_LATENCY_TRACE_DIR", &directory)
+            .env_remove("HERDR_TRACY")
+            .status()
+            .expect("trace scenario starts");
+        assert!(status.success(), "trace scenario passes");
+        let records = std::fs::read_dir(&directory)
+            .expect("trace files")
+            .flat_map(|entry| {
+                std::fs::read_to_string(entry.expect("trace file").path())
+                    .expect("trace content")
+                    .lines()
+                    .map(|line| serde_json::from_str(line).expect("trace JSON"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        std::fs::remove_dir_all(directory).expect("trace cleanup");
+        records
+    }
+
+    #[cfg(feature = "latency-prof")]
+    #[test]
+    fn actor_trace_preserves_fragmented_and_batched_echo() {
+        const NAME: &str =
+            "pty::actor::unix::tests::actor_trace_preserves_fragmented_and_batched_echo";
+        let records = trace_scenario(NAME, || {
+            let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+            for fragment in [
+                b"!000000".as_slice(),
+                b"000001~!000000000002~!000000000003~".as_slice(),
+            ] {
+                handle
+                    .try_write_user_input(Bytes::copy_from_slice(fragment))
+                    .expect("fragment accepted");
+            }
+            let mut received = [0; 42];
+            peer.read_exact(&mut received)
+                .expect("echo bytes delivered");
+            assert_eq!(&received, b"!000000000001~!000000000002~!000000000003~");
+            handle.shutdown();
+            assert_eq!(peer.read(&mut [0]).expect("actor closes"), 0);
+        });
+        if records.is_empty() {
+            return;
+        }
+        for identity in [1, 2, 3] {
+            let fragments: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    record["stage"] == "input.actor_fragment" && record["id"] == identity
+                })
+                .collect();
+            assert_eq!(fragments.len(), if identity == 1 { 2 } else { 1 });
+            for fragment in fragments {
+                let part = fragment["value"].as_u64().expect("part id");
+                let boundary = |stage| {
+                    records
+                        .iter()
+                        .find(|record| {
+                            record["stage"] == stage
+                                && record["scope"] == fragment["scope"]
+                                && record["id"] == part
+                        })
+                        .expect("each accepted fragment has a boundary")["ns"]
+                        .as_u64()
+                        .expect("timestamp")
+                };
+                assert!(boundary("input.actor_enqueue") <= boundary("input.actor_claim"));
+                assert!(boundary("input.actor_claim") <= boundary("input.pty_pending"));
+                assert!(boundary("input.pty_pending") <= boundary("input.pty_write_attempt"));
+                assert!(boundary("input.pty_write_attempt") <= boundary("input.pty_part_complete"));
+            }
+        }
+    }
+
+    #[cfg(feature = "latency-prof")]
+    #[test]
+    fn actor_trace_separates_backpressure_delayed_enter_and_queue_wait() {
+        const NAME: &str = "pty::actor::unix::tests::actor_trace_separates_backpressure_delayed_enter_and_queue_wait";
+        let records = trace_scenario(NAME, || {
+            let (handle, mut peer, read_rx) = actor_with_socket_pair(false);
+            let mut text = vec![b'x'; 1024 * 1024];
+            text.extend_from_slice(b"!00000000000");
+            let text_len = text.len();
+            let completion = handle
+                .queue_user_input_submission(
+                    Bytes::from(text),
+                    Bytes::from_static(b"1~"),
+                    Duration::from_millis(40),
+                )
+                .expect("submission accepted");
+            handle
+                .try_write_user_input(Bytes::from_static(b"!000000000002~"))
+                .expect("echo queues behind Enter");
+            peer.write_all(b"readiness")
+                .expect("peer writes under backpressure");
+            assert_eq!(
+                read_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("actor reads under backpressure"),
+                Bytes::from_static(b"readiness")
+            );
+            let mut received = vec![0; text_len + 2 + 14];
+            peer.read_exact(&mut received)
+                .expect("ordered input delivered");
+            assert!(received[..text_len - 12].iter().all(|byte| *byte == b'x'));
+            assert_eq!(&received[text_len - 12..], b"!000000000001~!000000000002~");
+            completion
+                .recv_timeout(Duration::from_secs(1))
+                .expect("reply")
+                .expect("submission completes");
+            handle
+                .begin_handoff(Duration::from_secs(1))
+                .expect("handoff drains writes");
+            assert!(matches!(
+                handle.try_write_user_input(Bytes::from_static(b"!000000000003~")),
+                Err(mpsc::error::TrySendError::Closed(_))
+            ));
+            handle.rollback_handoff().expect("rollback resumes");
+            handle
+                .try_write_user_input(Bytes::from_static(b"!000000000004~"))
+                .expect("post rollback echo accepted");
+            let mut after = [0; 14];
+            peer.read_exact(&mut after).expect("post rollback bytes");
+            assert_eq!(&after, b"!000000000004~");
+            handle.shutdown();
+            assert_eq!(peer.read(&mut [0]).expect("actor closes"), 0);
+        });
+        if records.is_empty() {
+            return;
+        }
+        let parts: Vec<_> = records
+            .iter()
+            .filter(|record| record["stage"] == "input.actor_fragment" && record["id"] == 1)
+            .collect();
+        assert_eq!(parts.len(), 2);
+        let parent = |part: &serde_json::Value| {
+            records
+                .iter()
+                .find(|record| {
+                    record["stage"] == "input.actor_part"
+                        && record["scope"] == part["scope"]
+                        && record["id"] == part["value"]
+                })
+                .expect("parent link")["value"]
+                .as_u64()
+                .expect("command id")
+        };
+        assert_eq!(parent(parts[0]), parent(parts[1]));
+        let time = |stage: &str, id: u64| {
+            records
+                .iter()
+                .find(|record| record["stage"] == stage && record["id"] == id)
+                .expect("boundary")["ns"]
+                .as_u64()
+                .expect("timestamp")
+        };
+        let text = parts[0]["value"].as_u64().expect("text part");
+        let enter = parts[1]["value"].as_u64().expect("Enter part");
+        assert!(time("input.pty_write_attempt", text) < time("input.pty_part_complete", text));
+        assert!(time("input.pty_part_complete", text) < time("input.pty_pending", enter));
+        let following = records
+            .iter()
+            .find(|record| record["stage"] == "input.actor_fragment" && record["id"] == 2)
+            .expect("following echo");
+        assert!(
+            time("input.pty_part_complete", enter) <= time("input.actor_claim", parent(following))
+        );
+        assert!(!records
+            .iter()
+            .any(|record| record["stage"] == "input.actor_fragment" && record["id"] == 3));
+    }
+
+    #[cfg(feature = "latency-prof")]
+    #[test]
+    fn actor_trace_does_not_claim_rejected_or_closed_input() {
+        const NAME: &str =
+            "pty::actor::unix::tests::actor_trace_does_not_claim_rejected_or_closed_input";
+        let records = trace_scenario(NAME, || {
+            let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+            let active = handle
+                .queue_user_input_submission(
+                    Bytes::from_static(b"waiting"),
+                    Bytes::from_static(b"\r"),
+                    Duration::from_secs(10),
+                )
+                .expect("active submission accepted");
+            let mut text = [0; 7];
+            peer.read_exact(&mut text)
+                .expect("actor entered submission delay");
+            assert_eq!(&text, b"waiting");
+            for index in 0..ACTOR_COMMAND_BUFFER {
+                let bytes = if index == 0 {
+                    Bytes::from_static(b"!000000000001~")
+                } else {
+                    Bytes::from_static(b"queued")
+                };
+                handle
+                    .try_write_user_input(bytes)
+                    .expect("bounded queue accepts capacity");
+            }
+            let rejected = Bytes::from_static(b"!000000000002~");
+            assert!(
+                matches!(handle.try_write_user_input(rejected.clone()), Err(mpsc::error::TrySendError::Full(returned)) if returned == rejected)
+            );
+            assert_eq!(
+                handle
+                    .queue_user_input_submission(rejected, Bytes::new(), Duration::ZERO)
+                    .expect_err("full submission rejected")
+                    .kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            handle.shutdown();
+            active
+                .recv_timeout(Duration::from_secs(1))
+                .expect("closed reply")
+                .expect_err("active submission cancelled");
+            assert_eq!(peer.read(&mut [0]).expect("actor closes"), 0);
+            assert!(matches!(
+                handle.try_write_user_input(Bytes::from_static(b"!000000000003~")),
+                Err(mpsc::error::TrySendError::Closed(_))
+            ));
+        });
+        if records.is_empty() {
+            return;
+        }
+        assert!(!records
+            .iter()
+            .any(|record| record["stage"] == "input.actor_fragment"
+                && (record["id"] == 2 || record["id"] == 3)));
+        let fragment = records
+            .iter()
+            .find(|record| record["stage"] == "input.actor_fragment" && record["id"] == 1)
+            .expect("queued echo trace");
+        let parent = records
+            .iter()
+            .find(|record| {
+                record["stage"] == "input.actor_part"
+                    && record["scope"] == fragment["scope"]
+                    && record["id"] == fragment["value"]
+            })
+            .expect("parent link");
+        assert!(records
+            .iter()
+            .any(|record| record["stage"] == "input.actor_enqueue"
+                && record["scope"] == parent["scope"]
+                && record["id"] == parent["value"]));
+        assert!(records
+            .iter()
+            .any(|record| record["stage"] == "input.actor_discard"
+                && record["scope"] == parent["scope"]
+                && record["id"] == parent["value"]));
+        assert!(!records
+            .iter()
+            .any(|record| record["stage"] == "input.actor_claim"
+                && record["scope"] == parent["scope"]
+                && record["id"] == parent["value"]));
+        assert!(!records
+            .iter()
+            .any(|record| record["stage"] == "input.pty_part_complete"
+                && record["scope"] == fragment["scope"]
+                && record["id"] == fragment["value"]));
     }
 
     #[test]
@@ -1766,9 +2181,7 @@ mod tests {
         let (data_tx, _data_rx) = mpsc::channel(1);
         let (control_tx, _control_rx) = std_mpsc::channel();
         data_tx
-            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
-                b"fill",
-            )))
+            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(b"fill")).into())
             .expect("fill command queue");
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let (wake, _wake_read_fd) = test_wake_pair();
@@ -1776,7 +2189,11 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate {
+                accepting: true,
+                #[cfg(feature = "latency-prof")]
+                trace: Default::default(),
+            })),
             controls: Arc::clone(&controls),
             response_order: Arc::new(Mutex::new(())),
             foreground_observer: PtyForegroundObserver {
@@ -1859,7 +2276,11 @@ mod tests {
             data_tx,
             control_tx,
             wake: wake_pipe.writer,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate {
+                accepting: true,
+                #[cfg(feature = "latency-prof")]
+                trace: Default::default(),
+            })),
             controls,
             response_order,
             foreground_observer: PtyForegroundObserver {
@@ -1894,10 +2315,18 @@ mod tests {
                 PendingWrite {
                     bytes: Bytes::from_static(b"live-light"),
                     boundary: None,
+                    #[cfg(feature = "latency-prof")]
+                    trace: Default::default(),
+                    #[cfg(feature = "latency-prof")]
+                    attempted: false,
                 },
                 PendingWrite {
                     bytes: Bytes::from_static(b"query-light"),
                     boundary: None,
+                    #[cfg(feature = "latency-prof")]
+                    trace: Default::default(),
+                    #[cfg(feature = "latency-prof")]
+                    attempted: false,
                 },
             ])
         );
@@ -1922,16 +2351,18 @@ mod tests {
         let (data_tx, _data_rx) = mpsc::channel(1);
         let (control_tx, control_rx) = std_mpsc::channel();
         data_tx
-            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
-                b"fill",
-            )))
+            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(b"fill")).into())
             .expect("fill data queue");
         let (wake, _wake_read_fd) = test_wake_pair();
         let handle = PtyIoActorHandle {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate {
+                accepting: true,
+                #[cfg(feature = "latency-prof")]
+                trace: Default::default(),
+            })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
             foreground_observer: PtyForegroundObserver {
@@ -1967,9 +2398,9 @@ mod tests {
         let (data_tx, data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
         let (_control_tx, control_rx) = std_mpsc::channel();
         data_tx
-            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
-                b"queued-before-ack",
-            )))
+            .try_send(
+                PtyIoDataCommand::WriteUserInput(Bytes::from_static(b"queued-before-ack")).into(),
+            )
             .expect("queued write");
         let mut runner = PtyIoActorRunner {
             diagnostic_input: crate::latency_prof::InputStimuli::default(),

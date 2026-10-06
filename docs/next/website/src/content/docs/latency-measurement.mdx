@@ -82,8 +82,16 @@ Controlled output identities link terminal revisions to serialized surfaces,
 writer queues, socket completion, client receipt and successful terminal output.
 Snapshot label identities link runtime actions. Ambiguous fingerprints,
 superseded markers, deferred redraws lacking a direct causal record, and absent
-stages remain unavailable. Input identities join stdin, client-frame queue/write and server-frame receipt. Server dispatch and PTY write completion join echo identities; PTY submission queue residence remains unavailable. Render
-attempts and selected presentation opportunities use separate records. Elapsed
+stages remain unavailable. Input identities join stdin, client-frame queue/write,
+server-frame receipt, server dispatch, and PTY write completion. Unix actor
+records distinguish accepted command enqueue/claim from pending PTY writes,
+first write attempt, and write completion. Fragmented echo identities link every
+contributing accepted part; batched identities remain separate. Delayed Enter
+shares its command enqueue/claim but starts a separate pending-write interval
+when scheduled. Rejected input has no accepted interval; shutdown or handoff
+release cancels incomplete attribution. Diagnostics do not cross a process
+handoff, and the Windows actor queue leg remains unavailable. Render attempts
+and selected presentation opportunities use separate records. Elapsed
 zones do not establish CPU execution or off-CPU cause; baseline mode provides
 no scheduler evidence. Overlapping stage intervals must not be summed.
 
