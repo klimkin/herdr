@@ -48,7 +48,8 @@ use crate::protocol::{
 };
 #[cfg(unix)]
 use crate::server::client_accept::{
-    accept_pending_client_connections, reject_pending_client_connections,
+    accept_pending_client_connections, reject_client_connection_batch,
+    reject_pending_client_connections,
 };
 use crate::server::client_shell::{
     render_pane_surface as render_client_shell_pane_surface,
@@ -693,6 +694,7 @@ impl HeadlessServer {
                 #[cfg(windows)]
                 let listener_ready = std::future::pending::<io::Result<()>>();
                 tokio::select! {
+                    _ = self.server_stop.wait_requested() => LoopEvent::Timer,
                     maybe_api = self.app.api_rx.recv() => match maybe_api {
                         Some(msg) => LoopEvent::Api(Box::new(msg)),
                         None => LoopEvent::Timer,
@@ -1123,7 +1125,7 @@ impl HeadlessServer {
             None => None,
         };
         let stats = if self.handoff_in_progress {
-            reject_pending_client_connections(&self.client_listener)?
+            reject_client_connection_batch(&self.client_listener)?
         } else {
             accept_pending_client_connections(
                 &self.client_listener,

@@ -150,6 +150,52 @@ fn failed_client_registration_sends_shutdown_to_accepted_peer() {
     assert!(matches!(message, ServerMessage::ServerShutdown { .. }));
 }
 
+#[test]
+fn handoff_rejects_every_queued_peer_before_export() {
+    let server = test_headless_server();
+    let count = crate::server::client_accept::CLIENT_ACCEPT_BATCH_LIMIT + 9;
+    let mut peers: Vec<_> = (0..count)
+        .map(|_| {
+            let stream = crate::ipc::connect_local_stream(&server.client_socket_path).unwrap();
+            stream
+                .set_recv_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            stream
+        })
+        .collect();
+    let stats = reject_pending_client_connections(&server.client_listener).unwrap();
+    for peer in &mut peers {
+        let mut byte = [0];
+        assert_eq!(std::io::Read::read(peer, &mut byte).unwrap(), 0);
+    }
+    assert_eq!(stats.accepted, count as u64);
+    assert_eq!(stats.would_block, 1);
+    assert_eq!(server.next_client_id, 1);
+    assert!(server.server_event_rx.is_empty());
+}
+
+#[test]
+fn handoff_runtime_turn_bounds_rejection_without_losing_queued_peers() {
+    let mut server = test_headless_server();
+    server.handoff_in_progress = true;
+    let count = crate::server::client_accept::CLIENT_ACCEPT_BATCH_LIMIT + 1;
+    let mut peers: Vec<_> = (0..count)
+        .map(|_| crate::ipc::connect_local_stream(&server.client_socket_path).unwrap())
+        .collect();
+    let first = server.accept_client_connections().unwrap();
+    assert_eq!(first.accepted, 32);
+    assert_eq!(first.would_block, 0);
+    let remaining = server.accept_client_connections().unwrap();
+    assert_eq!(remaining.accepted, 1);
+    assert_eq!(remaining.would_block, 1);
+    for peer in &mut peers {
+        let mut byte = [0];
+        assert_eq!(std::io::Read::read(peer, &mut byte).unwrap(), 0);
+    }
+    assert_eq!(server.next_client_id, 1);
+    assert!(server.server_event_rx.is_empty());
+}
+
 #[tokio::test]
 async fn client_accept_readiness_rearms_after_empty_queue() {
     let mut server = test_headless_server();
