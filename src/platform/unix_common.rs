@@ -737,3 +737,49 @@ pub(crate) fn local_stream_peer_pid(stream: &crate::ipc::LocalStream) -> Option<
     let crate::ipc::LocalStream::UdSocket(socket) = stream;
     super::socket_peer_pid(socket.as_fd().as_raw_fd())
 }
+
+/// Readability registration owns a duplicated descriptor so cancellation and
+/// registration failure cannot invalidate the server's listening socket.
+pub(crate) struct LocalListenerReady {
+    registration: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+}
+
+pub(crate) struct LocalListenerReadyGuard<'a> {
+    guard: tokio::io::unix::AsyncFdReadyGuard<'a, std::os::fd::OwnedFd>,
+}
+
+impl LocalListenerReady {
+    pub(crate) fn new(listener: &crate::ipc::LocalListener) -> std::io::Result<Self> {
+        use std::os::fd::AsFd as _;
+        let crate::ipc::LocalListener::UdSocket(listener) = listener;
+        let descriptor = listener.as_fd().try_clone_to_owned()?;
+        let registration =
+            tokio::io::unix::AsyncFd::with_interest(descriptor, tokio::io::Interest::READABLE)?;
+        Ok(Self { registration })
+    }
+
+    pub(crate) fn try_ready(&self) -> std::io::Result<Option<LocalListenerReadyGuard<'_>>> {
+        use std::task::{Context, Poll, Waker};
+        let mut context = Context::from_waker(Waker::noop());
+        match self.registration.poll_read_ready(&mut context) {
+            Poll::Ready(Ok(guard)) => Ok(Some(LocalListenerReadyGuard { guard })),
+            Poll::Ready(Err(error)) => Err(error),
+            Poll::Pending => Ok(None),
+        }
+    }
+
+    pub(crate) async fn ready(&self) -> std::io::Result<LocalListenerReadyGuard<'_>> {
+        self.registration
+            .readable()
+            .await
+            .map(|guard| LocalListenerReadyGuard { guard })
+    }
+}
+
+impl LocalListenerReadyGuard<'_> {
+    /// Clear only the event captured before a real WouldBlock. New readiness
+    /// racing with the drain remains recorded by Tokio. Budget yields retain it.
+    pub(crate) fn drained(&mut self) {
+        self.guard.clear_ready();
+    }
+}

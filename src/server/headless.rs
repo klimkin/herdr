@@ -136,6 +136,7 @@ enum LoopEvent {
     Api(Box<api::ApiRequestMessage>),
     ServerEvent(ServerEvent),
     RenderRequested,
+    ClientListenerReady,
 }
 
 /// Presentation work caused by a server event.
@@ -156,18 +157,23 @@ enum RenderImpact {
 #[allow(dead_code)]
 const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How often the idle headless loop wakes to poll the local listener for new
-/// client connections.
-///
-/// The listener is non-blocking and not integrated into `tokio::select!`, so
-/// a low-frequency wake is required to notice new thin-client attaches while
-/// otherwise idle. Keep this much slower than the old resize-poll cadence to
-/// avoid reintroducing the idle CPU spin.
-const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
-
 // ---------------------------------------------------------------------------
 // Headless server
 // ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+async fn wait_for_client_listener(
+    ready: &Option<crate::platform::LocalListenerReady>,
+    retry_at: Option<Instant>,
+) -> io::Result<()> {
+    if retry_at.is_some_and(|deadline| deadline > Instant::now()) {
+        return std::future::pending().await;
+    }
+    match ready {
+        Some(ready) => ready.ready().await.map(|_| ()),
+        None => std::future::pending().await,
+    }
+}
 
 struct AltScreenReadSpec {
     terminal_id: crate::terminal::TerminalId,
@@ -193,6 +199,10 @@ pub struct HeadlessServer {
     api_server: Option<api::ServerHandle>,
     #[cfg(unix)]
     client_listener: LocalListener,
+    #[cfg(unix)]
+    client_listener_ready: Option<crate::platform::LocalListenerReady>,
+    #[cfg(unix)]
+    client_accept_retry_at: Option<Instant>,
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
@@ -322,7 +332,7 @@ impl HeadlessServer {
         let client_socket_identity = socket_file_identity(&client_path)?;
         info!(path = %client_path.display(), "client protocol socket listening");
 
-        // Set non-blocking on Unix so we can poll it from the event loop.
+        // Accepts must never block the runtime while readiness is drained.
         #[cfg(unix)]
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
 
@@ -344,6 +354,10 @@ impl HeadlessServer {
             api_server,
             #[cfg(unix)]
             client_listener: listener,
+            #[cfg(unix)]
+            client_listener_ready: None,
+            #[cfg(unix)]
+            client_accept_retry_at: None,
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
@@ -411,6 +425,13 @@ impl HeadlessServer {
         );
 
         let mut deadline_waiter = crate::platform::DeadlineWaiter::new();
+        #[cfg(unix)]
+        if self.client_listener_ready.is_none() {
+            self.client_listener_ready = Some(crate::platform::LocalListenerReady::new(
+                &self.client_listener,
+            )?);
+        }
+
         let mut needs_render = true;
         let mut needs_full_render = true;
         let mut needs_graphics_render = false;
@@ -457,7 +478,7 @@ impl HeadlessServer {
                 needs_graphics_render = false;
                 crate::render_prof::event("full_render_cause.internal_events");
             }
-            if self.should_quit.load(Ordering::Acquire) {
+            if self.app.state.should_quit || self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
             if self.app.expire_due_metadata(Instant::now()) {
@@ -472,7 +493,7 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.api_requests");
             }
-            if self.should_quit.load(Ordering::Acquire) {
+            if self.app.state.should_quit || self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
 
@@ -488,7 +509,7 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.server_events");
             }
-            if self.should_quit.load(Ordering::Acquire) {
+            if self.app.state.should_quit || self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
 
@@ -640,17 +661,18 @@ impl HeadlessServer {
                 continue;
             }
 
+            // A runtime/API shutdown can be requested without setting the
+            // external stop flag. It must not rely on another event or timer.
+            if self.app.state.should_quit || self.should_quit.load(Ordering::Acquire) {
+                continue;
+            }
+
             // 8. Wait for next event.
-            let accept_poll_deadline = now + CLIENT_ACCEPT_POLL_INTERVAL;
-            let next_deadline = self
-                .app
-                .next_headless_loop_deadline_with_git_refresh(
-                    now,
-                    needs_render,
-                    self.git_refresh_scheduled(),
-                )
-                .map(|deadline| deadline.min(accept_poll_deadline))
-                .or(Some(accept_poll_deadline));
+            let next_deadline = self.app.next_headless_loop_deadline_with_git_refresh(
+                now,
+                needs_render,
+                self.git_refresh_scheduled(),
+            );
             let next_deadline = self
                 .pending_alt_screen_reads
                 .iter()
@@ -658,7 +680,18 @@ impl HeadlessServer {
                 .fold(next_deadline, |deadline, pending| {
                     Some(deadline.map_or(pending, |current| current.min(pending)))
                 });
+            #[cfg(unix)]
+            let next_deadline = self.client_accept_retry_at.map_or(next_deadline, |retry| {
+                Some(next_deadline.map_or(retry, |deadline| deadline.min(retry)))
+            });
             let event = {
+                #[cfg(unix)]
+                let listener_ready = wait_for_client_listener(
+                    &self.client_listener_ready,
+                    self.client_accept_retry_at,
+                );
+                #[cfg(windows)]
+                let listener_ready = std::future::pending::<io::Result<()>>();
                 tokio::select! {
                     maybe_api = self.app.api_rx.recv() => match maybe_api {
                         Some(msg) => LoopEvent::Api(Box::new(msg)),
@@ -674,6 +707,10 @@ impl HeadlessServer {
                     },
                     _ = deadline_waiter.wait(next_deadline) => LoopEvent::Timer,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
+                    result = listener_ready => {
+                        result?;
+                        LoopEvent::ClientListenerReady
+                    },
                 }
             };
 
@@ -702,11 +739,7 @@ impl HeadlessServer {
             }
 
             match event {
-                LoopEvent::Timer => {
-                    if Instant::now() >= accept_poll_deadline {
-                        crate::render_prof::event("client.accept.poll_timer");
-                    }
-                }
+                LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
                     if self.handle_internal_event_with_forwarding(ev) {
                         needs_render = true;
@@ -725,6 +758,9 @@ impl HeadlessServer {
                         needs_render = true;
                         needs_full_render = true;
                     }
+                }
+                LoopEvent::ClientListenerReady => {
+                    crate::render_prof::event("client.accept.readiness_wake");
                 }
                 LoopEvent::RenderRequested => {
                     if self.app.render_dirty.is_pending() {
@@ -1065,19 +1101,49 @@ impl HeadlessServer {
         }
     }
 
-    /// Accepts pending client connections from the non-blocking listener.
+    /// Readiness gates event-loop admission; a bounded drain retains readiness
+    /// until WouldBlock so render and API activity cannot starve queued peers.
     #[cfg(unix)]
-    fn accept_client_connections(&mut self) -> io::Result<()> {
-        if self.handoff_in_progress {
-            return reject_pending_client_connections(&self.client_listener).map(|_| ());
+    fn accept_client_connections(
+        &mut self,
+    ) -> io::Result<crate::server::client_accept::AcceptStats> {
+        if self
+            .client_accept_retry_at
+            .is_some_and(|retry| retry > Instant::now())
+        {
+            return Ok(crate::server::client_accept::AcceptStats::default());
         }
-        accept_pending_client_connections(
-            &self.client_listener,
-            &mut self.next_client_id,
-            &self.should_quit,
-            &self.server_event_tx,
-        )
-        .map(|_| ())
+        self.client_accept_retry_at = None;
+        let ready = match &self.client_listener_ready {
+            Some(ready) => match ready.try_ready()? {
+                Some(guard) => Some(guard),
+                None => return Ok(crate::server::client_accept::AcceptStats::default()),
+            },
+            // Synchronous test callers characterize the same admission path.
+            None => None,
+        };
+        let stats = if self.handoff_in_progress {
+            reject_pending_client_connections(&self.client_listener)?
+        } else {
+            accept_pending_client_connections(
+                &self.client_listener,
+                &mut self.next_client_id,
+                &self.should_quit,
+                &self.server_event_tx,
+            )?
+        };
+        if stats.failed != 0 {
+            // Preserve listener recovery after resource exhaustion without
+            // letting persistent readiness failures spin the headless loop.
+            self.client_accept_retry_at = Some(Instant::now() + Duration::from_millis(250));
+            crate::render_prof::event("client.accept.error_retry");
+        }
+        if stats.would_block != 0 {
+            if let Some(mut ready) = ready {
+                ready.drained();
+            }
+        }
+        Ok(stats)
     }
 
     /// Windows named-pipe clients can block in connect unless the server has a
