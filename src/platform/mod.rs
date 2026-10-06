@@ -6,6 +6,73 @@
 #[cfg(feature = "latency-prof")]
 pub(crate) mod latency;
 
+/// Reusable, cancellation-safe server deadline wait with a portable fallback.
+///
+/// One owner waits at a time. Dropping a wait cancels its native timer.
+/// Without a deadline, the wait stays pending without arming or polling.
+pub(crate) struct DeadlineWaiter {
+    native: Option<NativeDeadlineWaiter>,
+}
+
+impl DeadlineWaiter {
+    pub(crate) fn new() -> Self {
+        let native = match NativeDeadlineWaiter::new() {
+            Ok(timer) => Some(timer),
+            Err(error) => {
+                tracing::warn!(%error, "native deadline timer unavailable; using Tokio fallback");
+                None
+            }
+        };
+        Self { native }
+    }
+
+    pub(crate) async fn wait(&mut self, deadline: Option<std::time::Instant>) {
+        if let Some(native) = &mut self.native {
+            match native.wait(deadline).await {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "native deadline timer failed; using Tokio fallback");
+                    // Closing a failed descriptor prevents residual readiness
+                    // from turning the server loop into a busy loop.
+                    self.native = None;
+                }
+            }
+        }
+        wait_portable_deadline(deadline).await;
+    }
+}
+
+async fn wait_portable_deadline(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) struct PortableDeadlineWaiter;
+
+#[cfg(not(target_os = "linux"))]
+impl PortableDeadlineWaiter {
+    pub(super) fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub(super) async fn wait(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> std::io::Result<()> {
+        wait_portable_deadline(deadline).await;
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+use PortableDeadlineWaiter as NativeDeadlineWaiter;
+
+#[cfg(test)]
+mod deadline_tests;
+
 #[cfg(unix)]
 pub(crate) mod ssh_agent;
 
