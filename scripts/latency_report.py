@@ -94,15 +94,30 @@ def input_actor_path(records, identity, pid, start, end):
                        'trace loss may omit contributing identity links']}
 
 
+def process_record_integrity(events):
+    """Audit finish/loss without sorting away contradictory recorder order."""
+    finished = [item for item in events if item["stage"] == "process.finish"]
+    dropped = max((event.get("dropped", 0) for event in events), default=0)
+    last = bool(events and events[-1]["stage"] == "process.finish")
+    issues = []
+    for condition, issue in ((not finished, "missing finish marker"),
+                             (bool(finished) and not last, "records after finish marker"),
+                             (bool(finished) and any(event["ns"] > finished[-1]["ns"] for event in events),
+                              "event timestamp after finish marker"),
+                             (len(finished) > 1, "multiple finish markers"),
+                             (dropped > 0, "reported dropped records")):
+        if condition:
+            issues.append(issue)
+    return {"finish_marker_present": bool(finished), "finish_marker_last": last,
+            "finish_marker_count": len(finished), "dropped_records": dropped,
+            "issues": issues, "complete": not issues}
+
+
 def process_trace_complete(records, pid, trace_audit=None):
     if trace_audit is not None:
         process = next((item for item in trace_audit.get("processes", []) if item["pid"] == pid), None)
         return bool(process and process.get("complete"))
-    events = [item for item in records if item["pid"] == pid]
-    finished = [item for item in events if item["stage"] == "process.finish"]
-    return (len(finished) == 1 and not any(item.get("dropped", 0) for item in events)
-            and events[-1]["stage"] == "process.finish"
-            and all(item["ns"] <= finished[0]["ns"] for item in events))
+    return process_record_integrity([item for item in records if item["pid"] == pid])["complete"]
 
 
 def helper_clock_verified(run):
@@ -119,17 +134,8 @@ def mapped_connection(records, queue, client_pid, trace_audit=None):
     The proof does not use receipt order, content alone, or timestamp proximity.
     """
     for pid in (queue["pid"], client_pid):
-        if trace_audit is not None:
-            process = next((item for item in trace_audit.get("processes", []) if item["pid"] == pid), None)
-            if process is None or not process.get("complete"):
-                return None
-        else:
-            process_records = [item for item in records if item["pid"] == pid]
-            finished = [item for item in process_records if item["stage"] == "process.finish"]
-            if len(finished) != 1 or any(item.get("dropped", 0) for item in process_records):
-                return None
-            if any(item["ns"] > finished[0]["ns"] for item in process_records):
-                return None
+        if not process_trace_complete(records, pid, trace_audit):
+            return None
     servers = [item for item in records if item["stage"] == "server.connection"
                and item["pid"] == queue["pid"] and item["value"] == client_pid]
     clients = [item for item in records if item["stage"] == "client.connection"
@@ -480,19 +486,9 @@ def stage_distributions(run, paths):
             "semantics": "Matched elapsed intervals include scheduling; stage percentiles are not additive. Socket write overlaps delivery and is excluded from pipeline accounting."}
 
 
-def load_traces(run, directory):
-    """Read usable records and audit flush/loss for every expected process."""
-    expected = defaultdict(list)
-    diagnostics = defaultdict(list)
-    valid_pid = lambda pid: type(pid) is int and pid > 0
-    if valid_pid(run.get("server_pid")):
-        expected[run["server_pid"]].append("server")
-        diagnostics[run["server_pid"]].append(directory.parent / "server.stderr")
-    for index, pid in enumerate(run.get("client_pids", [])):
-        if not valid_pid(pid):
-            continue
-        expected[pid].append(f"client {index}")
-        diagnostics[pid].append(directory.parent / f"client-{index}.vt")
+def read_process_traces(directory, expected, diagnostics=None):
+    """Read usable records and apply one process integrity/flush contract."""
+    diagnostics = diagnostics or {}
     paths = {path.name: path for path in directory.glob("*.jsonl")}
     for pid in expected:
         paths.setdefault(f"{pid}.jsonl", directory / f"{pid}.jsonl")
@@ -524,12 +520,9 @@ def load_traces(run, directory):
                     continue
                 events.append(record)
             records.extend(events)
-        finishes = [event for event in events if event["stage"] == "process.finish"]
-        post_finish = bool(finishes and any(event["ns"] > finishes[-1]["ns"] for event in events))
-        dropped = max((event.get("dropped", 0) for event in events), default=0)
-        finish_last = bool(events and events[-1]["stage"] == "process.finish")
+        integrity = process_record_integrity(events)
         flush_failures = set()
-        for diagnostic in diagnostics[pid]:
+        for diagnostic in diagnostics.get(pid, []):
             try:
                 content = diagnostic.read_bytes()
             except OSError:
@@ -537,30 +530,21 @@ def load_traces(run, directory):
             for message in ("latency recorder final flush timed out", "latency recorder final flush unavailable"):
                 if message.encode() in content:
                     flush_failures.add(message)
-        issues = []
+        issues = list(integrity["issues"])
         for condition, issue in ((not exists, "missing file"), (unreadable, "unreadable file"),
                                  (truncated, "truncated final record"), (invalid > 0, "invalid records"),
                                  (mismatch > 0, "record PID differs from filename"),
-                                 (not finishes, "missing finish marker"),
-                                 (bool(finishes) and not finish_last, "records after finish marker"),
-                                 (post_finish, "event timestamp after finish marker"),
-                                 (len(finishes) > 1, "multiple finish markers"),
-                                 (bool(flush_failures), "observed bounded-flush failure"),
-                                 (dropped > 0, "reported dropped records")):
+                                 (bool(flush_failures), "observed bounded-flush failure")):
             if condition:
                 issues.append(issue)
         processes.append({"pid": pid, "file": name, "roles": expected.get(pid, []),
                           "expected": pid in expected, "exists": exists,
                           "record_count": len(events), "invalid_records": invalid,
                           "mismatched_pid_records": mismatch, "truncated": truncated,
-                          "finish_marker_present": bool(finishes), "finish_marker_last": finish_last,
-                          "finish_marker_count": len(finishes), "dropped_records": dropped,
+                          **integrity,
                           "flush_failures": sorted(flush_failures),
                           "complete": not issues, "issues": issues})
-    process_pids = [run.get("server_pid"), *run.get("client_pids", [])]
-    expected_complete = (all(valid_pid(pid) for pid in process_pids)
-                         and len(set(process_pids)) == len(process_pids)
-                         and len(run.get("client_pids", [])) == run.get("clients"))
+    expected_complete = bool(expected) and all(type(pid) is int and pid > 0 for pid in expected)
     return records, {"expected_process_count": len(expected),
                      "expected_process_metadata_complete": expected_complete,
                      "all_expected_complete": expected_complete and all(item["complete"] for item in processes if item["expected"]),
@@ -568,6 +552,29 @@ def load_traces(run, directory):
                      "total_reported_dropped_records": sum(item["dropped_records"] for item in processes),
                      "processes": processes,
                      "semantics": "A final finish marker confirms recorder flush; missing markers leave bounded-flush outcome unknown. Zero drops alone does not prove complete traces."}
+
+
+def load_traces(run, directory):
+    """Audit benchmark process identities and their owned diagnostics."""
+    expected = defaultdict(list)
+    diagnostics = defaultdict(list)
+    valid_pid = lambda pid: type(pid) is int and pid > 0
+    if valid_pid(run.get("server_pid")):
+        expected[run["server_pid"]].append("server")
+        diagnostics[run["server_pid"]].append(directory.parent / "server.stderr")
+    for index, pid in enumerate(run.get("client_pids", [])):
+        if not valid_pid(pid):
+            continue
+        expected[pid].append(f"client {index}")
+        diagnostics[pid].append(directory.parent / f"client-{index}.vt")
+    records, audit = read_process_traces(directory, expected, diagnostics)
+    process_pids = [run.get("server_pid"), *run.get("client_pids", [])]
+    metadata_complete = (all(valid_pid(pid) for pid in process_pids)
+                         and len(set(process_pids)) == len(process_pids)
+                         and len(run.get("client_pids", [])) == run.get("clients"))
+    audit["expected_process_metadata_complete"] = metadata_complete
+    audit["all_expected_complete"] = metadata_complete and audit["all_expected_complete"]
+    return records, audit
 
 
 def freshness(run):
