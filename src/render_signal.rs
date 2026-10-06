@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::layout::PaneId;
 
@@ -9,6 +9,47 @@ pub(crate) struct RenderRequest {
     pub(crate) generic: bool,
     pub(crate) pty_sources: HashSet<PaneId>,
     pub(crate) terminal_title_sources: HashSet<PaneId>,
+}
+
+/// Owns one detached request. Unhandled work returns to the signal without a
+/// notification; the server retains its ordinary render scheduling obligation.
+pub(crate) struct PendingRenderRequest {
+    pub(crate) request: RenderRequest,
+    signal: Arc<RenderSignal>,
+}
+
+impl PendingRenderRequest {
+    /// Completes ordinary classification or transfers unsent work to the
+    /// existing per-client full-render recovery path.
+    pub(crate) fn complete(mut self) {
+        self.request = RenderRequest::default();
+    }
+}
+
+impl Drop for PendingRenderRequest {
+    fn drop(&mut self) {
+        if !self.request.generic
+            && self.request.pty_sources.is_empty()
+            && self.request.terminal_title_sources.is_empty()
+        {
+            return;
+        }
+        let mut state = self
+            .signal
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.request.generic |= self.request.generic;
+        state
+            .request
+            .pty_sources
+            .extend(self.request.pty_sources.drain());
+        state
+            .request
+            .terminal_title_sources
+            .extend(self.request.terminal_title_sources.drain());
+        self.signal.pending.store(true, Ordering::Release);
+    }
 }
 
 /// Coalesces render requests while retaining enough origin information for the
@@ -107,6 +148,13 @@ impl RenderSignal {
         self.pending.store(false, Ordering::Release);
         std::mem::take(&mut state.request)
     }
+
+    pub(crate) fn take_pending(self: &Arc<Self>) -> PendingRenderRequest {
+        PendingRenderRequest {
+            request: self.take(),
+            signal: Arc::clone(self),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +241,75 @@ mod tests {
         let request = signal.take();
         assert!(request.generic);
         assert_eq!(request.pty_sources, HashSet::from([pane_id]));
+    }
+
+    #[test]
+    fn completing_one_terminal_keeps_other_sources_titles_and_generic_work_pending() {
+        let signal = Arc::new(RenderSignal::new());
+        let selected = PaneId::from_raw(10);
+        let unrelated = PaneId::from_raw(20);
+        signal.request_generic();
+        signal.request_pty(selected);
+        signal.request_pty(unrelated);
+        signal.request_terminal_title(selected);
+
+        let mut pending = signal.take_pending();
+        pending.request.pty_sources.remove(&selected);
+        drop(pending);
+
+        let remaining = signal.take_pending();
+        assert!(remaining.request.generic);
+        assert_eq!(remaining.request.pty_sources, HashSet::from([unrelated]));
+        assert_eq!(
+            remaining.request.terminal_title_sources,
+            HashSet::from([selected])
+        );
+        remaining.complete();
+        assert!(!signal.is_pending());
+    }
+
+    #[test]
+    fn restoring_detached_work_preserves_later_producer_arrivals() {
+        let signal = Arc::new(RenderSignal::new());
+        let selected = PaneId::from_raw(10);
+        let residual = PaneId::from_raw(20);
+        let later = PaneId::from_raw(30);
+        signal.set_immediate_pty_sources(HashSet::from([selected]));
+        signal.request_pty(selected);
+        signal.request_pty(residual);
+        let mut pending = signal.take_pending();
+
+        let (published, received) = std::sync::mpsc::channel();
+        let producer_signal = Arc::clone(&signal);
+        let producer = std::thread::spawn(move || {
+            producer_signal.request_pty(selected);
+            producer_signal.request_pty(later);
+            producer_signal.request_generic();
+            producer_signal.request_terminal_title(later);
+            published.send(()).expect("publish arrivals");
+        });
+        received.recv().expect("later arrivals published");
+        pending.request.pty_sources.remove(&selected);
+        drop(pending);
+        producer.join().expect("producer completed");
+
+        let remaining = signal.take_pending();
+        assert!(remaining.request.generic);
+        assert_eq!(
+            remaining.request.pty_sources,
+            HashSet::from([selected, residual, later])
+        );
+        assert_eq!(
+            remaining.request.terminal_title_sources,
+            HashSet::from([later])
+        );
+        signal.request_pty(selected);
+        remaining.complete();
+        let newest = signal.take_pending();
+        assert!(!newest.request.generic);
+        assert_eq!(newest.request.pty_sources, HashSet::from([selected]));
+        assert!(newest.request.terminal_title_sources.is_empty());
+        newest.complete();
+        assert!(!signal.is_pending());
     }
 }
