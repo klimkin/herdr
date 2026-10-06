@@ -1866,6 +1866,156 @@ fn client_receives_pane_surface_after_pane_output() {
 }
 
 #[test]
+fn client_keeps_terminal_output_across_hidden_damage_source_switch_and_resize() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let (server, client, output) =
+        attach_thin_client(&config_home, &runtime_dir, &api_socket, &client_socket);
+
+    let created = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "dirty-workspace",
+            "method": "workspace.create",
+            "params": {"cwd": base, "focus": true, "label": "dirty-ownership"},
+        })
+        .to_string(),
+    );
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("workspace id");
+    let first_tab = created["result"]["tab"]["tab_id"]
+        .as_str()
+        .expect("first tab id");
+    let first_pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("first pane id");
+    let screen_text = || {
+        let bytes = output
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bytes
+            .clone();
+        terminal_screen::text(&bytes, 80, 24)
+    };
+    send_pane_shell_command(
+        &api_socket,
+        first_pane,
+        "printf '\\033[2J\\033[HFIRST_%s\\n' READY",
+    );
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(20),
+        || screen_text().contains("FIRST_READY")
+    ));
+
+    let second = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "dirty-second-tab",
+            "method": "tab.create",
+            "params": {"workspace_id": workspace_id, "focus": true},
+        })
+        .to_string(),
+    );
+    let second_tab = second["result"]["tab"]["tab_id"]
+        .as_str()
+        .expect("second tab id");
+    let second_pane = second["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("second pane id");
+    send_pane_shell_command(
+        &api_socket,
+        second_pane,
+        "printf '\\033[2J\\033[HSECOND_%s\\n' READY",
+    );
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(20),
+        || screen_text().contains("SECOND_READY")
+    ));
+
+    // Two writes arrive while this terminal is hidden. Check final state after
+    // switching sources; deterministic writer-contention coverage lives beside
+    // the retained renderer.
+    send_pane_shell_command(
+        &api_socket,
+        first_pane,
+        "printf '\\033[2J\\033[HFIRST_%s\\n' OLD; sleep 0.02; printf '\\033[2J\\033[HFIRST_%s\\n' FINAL",
+    );
+    send_pane_shell_command(
+        &api_socket,
+        second_pane,
+        "printf '\\033[2J\\033[HSECOND_%s\\n' FINAL",
+    );
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(20),
+        || screen_text().contains("SECOND_FINAL")
+    ));
+    assert!(
+        !screen_text().contains("FIRST_FINAL"),
+        "hidden content was presented"
+    );
+
+    for (tab, marker) in [(first_tab, "FIRST_FINAL"), (second_tab, "SECOND_FINAL")] {
+        let focused = send_json_request(
+            &api_socket,
+            &serde_json::json!({
+                "id": "dirty-focus-tab",
+                "method": "tab.focus",
+                "params": {"tab_id": tab},
+            })
+            .to_string(),
+        );
+        assert!(focused.get("error").is_none(), "{focused}");
+        assert!(
+            wait_until(Duration::from_secs(8), Duration::from_millis(20), || {
+                screen_text().contains(marker)
+            }),
+            "source switch lost {marker}: {}",
+            screen_text()
+        );
+    }
+
+    client
+        ._master
+        .as_ref()
+        .expect("client PTY")
+        .resize(PtySize {
+            rows: 28,
+            cols: 92,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("resize client PTY");
+    send_pane_shell_command(
+        &api_socket,
+        second_pane,
+        "printf '\\033[2J\\033[HRESIZED_%s\\n' FINAL",
+    );
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(20), || {
+            let bytes = output
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .bytes
+                .clone();
+            terminal_screen::text(&bytes, 92, 28).contains("RESIZED_FINAL")
+        }),
+        "resize lost terminal output: {:?}",
+        read_output(&output)
+    );
+
+    drop(server);
+    cleanup_spawned_herdr(client, base);
+}
+
+#[test]
 fn unavailable_restored_pane_keeps_saved_cwd_in_server() {
     let _lock = test_lock();
     let base = unique_test_dir();

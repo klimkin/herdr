@@ -579,7 +579,8 @@ impl HeadlessServer {
             {
                 crate::latency_prof::record("render.attempt_eligible", 0, 0);
                 crate::render_prof::event("render.attempt");
-                let render_request = self.app.render_dirty.take();
+                let pending_request = self.app.render_dirty.take_pending();
+                let render_request = &pending_request.request;
                 let pty_dirty = !render_request.pty_sources.is_empty();
                 if pty_dirty {
                     crate::render_prof::event("render.attempt.pty_dirty");
@@ -605,6 +606,7 @@ impl HeadlessServer {
                     // A synchronized-output OSC title can be the only pending work.
                     // Its deferred PTY repaint has its own signal; do not manufacture
                     // a full UI render for this client-local side effect.
+                    pending_request.complete();
                     needs_render = false;
                     continue;
                 }
@@ -655,6 +657,11 @@ impl HeadlessServer {
                     crate::render_prof::event("full_render.invoke");
                     self.render_and_stream();
                 }
+                // Ordinary attempts handle every detached source, including
+                // hidden classification and existing per-client full recovery.
+                // A selective attempt can leave unhandled sources in the guard;
+                // arrivals published after extraction remain in the live signal.
+                pending_request.complete();
                 self.app.record_render_attempt(now, !hidden_only);
                 needs_render = false;
                 needs_full_render = false;
