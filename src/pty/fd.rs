@@ -133,6 +133,11 @@ pub(crate) struct PtyWakeReadiness {
     pub(crate) wake_ready: bool,
 }
 
+#[cfg(all(unix, test))]
+std::thread_local! {
+    pub(crate) static INTERRUPTED_POLL_OBSERVER: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(unix)]
 pub(crate) fn poll_pty_and_wake(
     pty_fd: RawFd,
@@ -180,6 +185,12 @@ pub(crate) fn poll_pty_and_wake(
         if result < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
+                #[cfg(test)]
+                INTERRUPTED_POLL_OBSERVER.with_borrow(|observer| {
+                    if let Some(observer) = observer {
+                        let _ = observer.send(());
+                    }
+                });
                 let Some(deadline) = deadline else {
                     continue;
                 };
@@ -238,4 +249,48 @@ pub(crate) fn resize_pty_fd(
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(all(unix, test))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturated_wake_pipe_preserves_readiness_and_drains() {
+        let pipe = create_wake_pipe().expect("wake pipe");
+        let bytes = [1u8; 4096];
+        loop {
+            let written = unsafe {
+                libc::write(
+                    pipe.writer.fd.as_raw_fd(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if written >= 0 {
+                continue;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+            break;
+        }
+
+        pipe.writer
+            .wake()
+            .expect("a full pipe already carries a wake");
+        assert!(
+            poll_pty_and_wake(-1, pipe.read_fd.as_raw_fd(), false, false, 0)
+                .expect("wake readiness")
+                .wake_ready
+        );
+        drain_wake_fd(pipe.read_fd.as_raw_fd()).expect("wake pipe drains");
+        assert!(
+            !poll_pty_and_wake(-1, pipe.read_fd.as_raw_fd(), false, false, 0)
+                .expect("drained pipe readiness")
+                .wake_ready
+        );
+    }
 }
