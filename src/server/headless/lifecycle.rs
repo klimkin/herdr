@@ -400,3 +400,65 @@ pub(super) fn wait_for_old_public_sockets_to_close(timeout: Duration) -> io::Res
         "old server sockets did not close before handoff import bind",
     ))
 }
+
+#[cfg(all(test, unix))]
+mod client_accept_tests {
+    use super::*;
+    use crate::server::headless::tests::test_headless_server;
+    use interprocess::local_socket::traits::Stream as _;
+
+    fn hello_client(server: &HeadlessServer) -> crate::ipc::LocalStream {
+        let mut stream = crate::ipc::connect_local_stream(&server.client_socket_path).unwrap();
+        stream
+            .set_recv_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        protocol::write_message(
+            &mut stream,
+            &protocol::ClientMessage::TerminalHello {
+                version: protocol::PROTOCOL_VERSION,
+                cols: 120,
+                rows: 40,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                pixel_mouse: false,
+            },
+        )
+        .unwrap();
+        stream
+    }
+
+    fn read_welcome(stream: &mut crate::ipc::LocalStream) {
+        let message: ServerMessage = protocol::read_message(stream, MAX_FRAME_SIZE).unwrap();
+        assert!(matches!(
+            message,
+            ServerMessage::Welcome { error: None, .. }
+        ));
+    }
+
+    #[test]
+    fn handoff_rejects_queued_client_then_rollback_restores_admission() {
+        let mut server = test_headless_server();
+        let mut exported_peer = hello_client(&server);
+        server.handoff_in_progress = true;
+        server
+            .accept_client_connections()
+            .expect("reject during export");
+        assert!(
+            protocol::read_message::<_, ServerMessage>(&mut exported_peer, MAX_FRAME_SIZE).is_err()
+        );
+        assert!(server.server_event_rx.is_empty());
+        assert_eq!(server.next_client_id, 1);
+
+        let handoff_path = server.client_socket_path.with_extension("handoff");
+        server.rollback_handoff_before_commit(&handoff_path, &[]);
+        let mut recovered = hello_client(&server);
+        server
+            .accept_client_connections()
+            .expect("admit after rollback");
+        read_welcome(&mut recovered);
+        assert!(matches!(
+            server.server_event_rx.blocking_recv(),
+            Some(ServerEvent::ClientConnected { client_id: 1, .. })
+        ));
+    }
+}

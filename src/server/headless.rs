@@ -641,6 +641,7 @@ impl HeadlessServer {
             }
 
             // 8. Wait for next event.
+            let accept_poll_deadline = now + CLIENT_ACCEPT_POLL_INTERVAL;
             let next_deadline = self
                 .app
                 .next_headless_loop_deadline_with_git_refresh(
@@ -648,8 +649,8 @@ impl HeadlessServer {
                     needs_render,
                     self.git_refresh_scheduled(),
                 )
-                .map(|deadline| deadline.min(now + CLIENT_ACCEPT_POLL_INTERVAL))
-                .or(Some(now + CLIENT_ACCEPT_POLL_INTERVAL));
+                .map(|deadline| deadline.min(accept_poll_deadline))
+                .or(Some(accept_poll_deadline));
             let next_deadline = self
                 .pending_alt_screen_reads
                 .iter()
@@ -701,7 +702,11 @@ impl HeadlessServer {
             }
 
             match event {
-                LoopEvent::Timer => {}
+                LoopEvent::Timer => {
+                    if Instant::now() >= accept_poll_deadline {
+                        crate::render_prof::event("client.accept.poll_timer");
+                    }
+                }
                 LoopEvent::Internal(ev) => {
                     if self.handle_internal_event_with_forwarding(ev) {
                         needs_render = true;
@@ -1064,7 +1069,7 @@ impl HeadlessServer {
     #[cfg(unix)]
     fn accept_client_connections(&mut self) -> io::Result<()> {
         if self.handoff_in_progress {
-            return reject_pending_client_connections(&self.client_listener);
+            return reject_pending_client_connections(&self.client_listener).map(|_| ());
         }
         accept_pending_client_connections(
             &self.client_listener,
@@ -1072,6 +1077,7 @@ impl HeadlessServer {
             &self.should_quit,
             &self.server_event_tx,
         )
+        .map(|_| ())
     }
 
     /// Windows named-pipe clients can block in connect unless the server has a
