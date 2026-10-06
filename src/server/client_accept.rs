@@ -99,8 +99,20 @@ pub(crate) fn accept_pending_client_connections(
 pub(crate) fn reject_pending_client_connections(
     listener: &LocalListener,
 ) -> io::Result<AcceptStats> {
+    reject_client_connections(listener, None)
+}
+
+/// Bound rejection during runtime turns so other ready work keeps progressing.
+pub(crate) fn reject_client_connection_batch(listener: &LocalListener) -> io::Result<AcceptStats> {
+    reject_client_connections(listener, Some(CLIENT_ACCEPT_BATCH_LIMIT))
+}
+
+fn reject_client_connections(
+    listener: &LocalListener,
+    attempt_limit: Option<usize>,
+) -> io::Result<AcceptStats> {
     let mut stats = AcceptStats::default();
-    for _ in 0..CLIENT_ACCEPT_BATCH_LIMIT {
+    while attempt_limit.is_none_or(|limit| stats.attempted < limit as u64) {
         stats.attempted += 1;
         match listener.accept() {
             Ok(_stream) => {
