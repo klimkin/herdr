@@ -102,3 +102,78 @@ assert summarize(records)['clients'][0]['feedback_unhandled'] == 0
         .expect("writer feedback report executable");
     assert!(status.success());
 }
+
+#[test]
+fn writer_feedback_report_rejects_contradictory_finish_records() {
+    let script = r#"
+import sys
+sys.path.insert(0, 'scripts')
+from writer_feedback_report import summarize
+def record(stage, ns=100):
+    return {'stage':stage, 'pid':1, 'ns':ns, 'id':7, 'scope':11, 'value':0}
+finish = record('process.finish')
+assert summarize([finish], [1])['complete']
+assert not summarize([finish, record('writer.feedback.begin', 101)], [1])['complete']
+assert not summarize([finish, record('writer.feedback.begin', 99)], [1])['complete']
+assert not summarize([record('writer.feedback.begin', 101), finish], [1])['complete']
+assert not summarize([finish, finish], [1])['complete']
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("writer feedback report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn writer_feedback_report_audits_cli_capture_integrity() {
+    let script = r#"
+import json, subprocess, sys, tempfile
+from pathlib import Path
+def record(pid, stage='process.finish', ns=100):
+    return json.dumps({'stage':stage, 'pid':pid, 'ns':ns, 'id':7, 'scope':11, 'value':0})
+with tempfile.TemporaryDirectory() as temporary:
+    base = Path(temporary)
+    path = base/'trace'
+    path.mkdir()
+    def report(*pids):
+        command = [sys.executable, 'scripts/writer_feedback_report.py', str(path)]
+        for pid in pids:
+            command.extend(['--expected-pid', str(pid)])
+        result = subprocess.run(command, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+    def check_incomplete(content, issue):
+        (path/'1.jsonl').write_text(content)
+        result = report(1)
+        assert not result['complete'], issue
+        assert issue in result['trace_audit']['processes'][0]['issues']
+    (path/'1.jsonl').write_text(record(1)+'\n')
+    assert report(1)['complete']
+    assert not report()['complete']
+    assert report(1, 2)['missing_processes'] == [2]
+    assert not report(1, 1)['complete'], 'duplicate expected PID is ambiguous'
+    check_incomplete(record(1)+'\n'+record(1, 'writer.feedback.begin', 101)+'\n', 'records after finish marker')
+    check_incomplete(record(1), 'truncated final record')
+    check_incomplete('{bad json}\n'+record(1)+'\n', 'invalid records')
+    check_incomplete(record(2)+'\n'+record(1)+'\n', 'record PID differs from filename')
+    check_incomplete(record(1)+'\n'+record(1)+'\n', 'multiple finish markers')
+    (path/'1.jsonl').write_text(record(1)+'\n')
+    for name, message in [('server.stderr', 'latency recorder final flush timed out'),
+                          ('client-3.vt', 'latency recorder final flush unavailable')]:
+        diagnostic = base/name
+        diagnostic.write_text(message+'\n')
+        result = report(1)
+        assert not result['complete']
+        assert message in result['trace_audit']['processes'][0]['flush_failures']
+        diagnostic.unlink()
+    assert report(1)['complete']
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("writer feedback report executable");
+    assert!(status.success());
+}

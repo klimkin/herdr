@@ -5,8 +5,10 @@ from collections import Counter, defaultdict, deque
 import json
 from pathlib import Path
 
+from latency_report import process_trace_complete, read_process_traces
 
-def summarize(records, expected_pids=None):
+
+def summarize(records, expected_pids=None, trace_audit=None):
     """Keep per-process queues distinct; a retry request is not delivered output."""
     clients = {}
     begins = defaultdict(deque)
@@ -92,8 +94,13 @@ def summarize(records, expected_pids=None):
 
     pids = {record["pid"] for record in records}
     expected = set(expected_pids or [])
+    metadata_complete = (bool(expected) and len(expected) == len(expected_pids)
+                         and all(type(pid) is int and pid > 0 for pid in expected))
     return {
-        "complete": bool(expected) and expected <= pids and all(finishes[pid] == 1 and drops[pid] == 0 for pid in expected | pids),
+        "complete": metadata_complete and expected <= pids and all(
+            process_trace_complete(records, pid, trace_audit) for pid in expected | pids)
+            and (trace_audit is None or all(item["complete"] for item in trace_audit["processes"])),
+        "trace_audit": trace_audit,
         "expected_processes": sorted(expected),
         "missing_processes": sorted(expected - pids),
         "missing_finish_processes": sorted(pid for pid in expected | pids if finishes[pid] != 1),
@@ -107,6 +114,8 @@ def summarize(records, expected_pids=None):
             "Writer wakes count condition-variable returns; server passes count main-loop iterations.",
             "Render-lane occupancy includes ordered direct items; its maximum is three queued items.",
             "Overlap counts begin-to-handler notification lifetime, including blocked send; record loss can invalidate the count.",
+            "In-memory summaries audit finish order and drops; file integrity and flush diagnostics require the CLI trace audit.",
+            "The CLI PID list carries no process roles; any companion flush failure conservatively invalidates every expected trace.",
             "CPU, memory, observer throughput, latency, and diagnostic overhead require companion benchmark results.",
         ],
     }
@@ -119,11 +128,17 @@ def main():
     parser.add_argument("--expected-pid", type=int, action="append", default=[],
                         help="repeat for server and each client PID from benchmark results")
     args = parser.parse_args()
-    records = []
-    for path in sorted(args.trace_directory.glob("*.jsonl")):
-        with path.open() as source:
-            records.extend(json.loads(line) for line in source if line.strip())
-    output = json.dumps(summarize(records, args.expected_pid), indent=2) + "\n"
+    expected = {pid: ["expected process"] for pid in args.expected_pid}
+    # --expected-pid has no ordering or role contract. A captured companion
+    # flush failure invalidates completeness without inventing PID ownership.
+    companions = [args.trace_directory.parent / "server.stderr",
+                  *sorted(args.trace_directory.parent.glob("client-*.vt"))]
+    records, audit = read_process_traces(
+        args.trace_directory, expected, {pid: companions for pid in expected})
+    if len(expected) != len(args.expected_pid):
+        audit["expected_process_metadata_complete"] = False
+        audit["all_expected_complete"] = False
+    output = json.dumps(summarize(records, args.expected_pid, audit), indent=2) + "\n"
     if args.output:
         args.output.write_text(output)
     else:
