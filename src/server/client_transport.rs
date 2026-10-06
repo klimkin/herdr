@@ -127,6 +127,11 @@ pub(crate) struct ClientWriter {
 }
 
 impl ClientWriter {
+    #[cfg(feature = "latency-prof")]
+    pub(crate) fn diagnostic_scope(&self) -> u64 {
+        self.render.queue.scope()
+    }
+
     /// Drops render-lane work that has not yet been claimed by the writer.
     pub(crate) fn discard_pending_render(&self) {
         self.render.queue.discard_pending_render();
@@ -393,8 +398,11 @@ impl ClientWriterQueue {
         }
         let enqueued_ns = crate::latency_prof::now();
         state.control.push_back(data);
-
+        #[cfg(feature = "latency-prof")]
+        let occupancy = Self::diagnostic_occupancy(&state);
         drop(state);
+        #[cfg(feature = "latency-prof")]
+        self.record_occupancy(occupancy);
         crate::latency_prof::emit_queued_frames(
             "server.enqueue",
             &ids,
@@ -424,8 +432,11 @@ impl ClientWriterQueue {
         }
         let enqueued_ns = crate::latency_prof::now();
         state.render = Some(data);
-
+        #[cfg(feature = "latency-prof")]
+        let occupancy = Self::diagnostic_occupancy(&state);
         drop(state);
+        #[cfg(feature = "latency-prof")]
+        self.record_occupancy(occupancy);
         crate::latency_prof::emit_queued_frames(
             "server.enqueue",
             &ids,
@@ -467,7 +478,11 @@ impl ClientWriterQueue {
         }
         let enqueued_ns = crate::latency_prof::now();
         state.ordered.push_back(data);
+        #[cfg(feature = "latency-prof")]
+        let occupancy = Self::diagnostic_occupancy(&state);
         drop(state);
+        #[cfg(feature = "latency-prof")]
+        self.record_occupancy(occupancy);
         crate::latency_prof::emit_queued_frames(
             "server.enqueue",
             &ids,
@@ -480,11 +495,20 @@ impl ClientWriterQueue {
 
     fn recv(&self) -> Option<ClientWriteItem> {
         let mut state = self.lock_state();
+        #[cfg(feature = "latency-prof")]
+        let mut wakes = 0;
         loop {
             if let Some(data) = state.control.pop_front() {
                 #[cfg(feature = "latency-prof")]
                 self.claimed_ns
                     .store(crate::latency_prof::now(), Ordering::Relaxed);
+                #[cfg(feature = "latency-prof")]
+                let occupancy = Self::diagnostic_occupancy(&state);
+                drop(state);
+                #[cfg(feature = "latency-prof")]
+                self.record_occupancy(occupancy);
+                #[cfg(feature = "latency-prof")]
+                self.record_dequeue("writer.dequeue.control", data.bytes.len(), wakes);
                 return Some(ClientWriteItem::Control(data));
             }
             if let Some(data) = state.ordered.pop_front() {
@@ -492,6 +516,13 @@ impl ClientWriterQueue {
                 #[cfg(feature = "latency-prof")]
                 self.claimed_ns
                     .store(crate::latency_prof::now(), Ordering::Relaxed);
+                #[cfg(feature = "latency-prof")]
+                let occupancy = Self::diagnostic_occupancy(&state);
+                drop(state);
+                #[cfg(feature = "latency-prof")]
+                self.record_occupancy(occupancy);
+                #[cfg(feature = "latency-prof")]
+                self.record_dequeue("writer.dequeue.render", data.bytes.len(), wakes);
                 return Some(ClientWriteItem::Render(data));
             }
             if let Some(data) = state.render.take() {
@@ -499,16 +530,61 @@ impl ClientWriterQueue {
                 #[cfg(feature = "latency-prof")]
                 self.claimed_ns
                     .store(crate::latency_prof::now(), Ordering::Relaxed);
+                #[cfg(feature = "latency-prof")]
+                let occupancy = Self::diagnostic_occupancy(&state);
+                drop(state);
+                #[cfg(feature = "latency-prof")]
+                self.record_occupancy(occupancy);
+                #[cfg(feature = "latency-prof")]
+                self.record_dequeue("writer.dequeue.render", data.bytes.len(), wakes);
                 return Some(ClientWriteItem::Render(data));
             }
             if state.senders == 0 {
+                drop(state);
+                #[cfg(feature = "latency-prof")]
+                crate::latency_prof::record_at(
+                    "writer.wake",
+                    0,
+                    wakes,
+                    self.scope(),
+                    crate::latency_prof::now(),
+                );
                 return None;
             }
             state = self
                 .ready
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            #[cfg(feature = "latency-prof")]
+            {
+                wakes += 1;
+            }
         }
+    }
+
+    #[cfg(feature = "latency-prof")]
+    fn record_dequeue(&self, stage: &'static str, bytes: usize, wakes: u64) {
+        crate::latency_prof::record_at(stage, 0, bytes as u64, self.scope(), self.claim_time());
+        crate::latency_prof::record_at("writer.wake", 0, wakes, self.scope(), self.claim_time());
+    }
+
+    #[cfg(feature = "latency-prof")]
+    fn diagnostic_occupancy(state: &ClientWriterQueueState) -> (u64, u64) {
+        (
+            state.control.len() as u64,
+            (state.ordered.len() + usize::from(state.render.is_some())) as u64,
+        )
+    }
+
+    #[cfg(feature = "latency-prof")]
+    fn record_occupancy(&self, (control, render): (u64, u64)) {
+        crate::latency_prof::record_at(
+            "writer.queue.occupancy",
+            control,
+            render,
+            self.scope(),
+            crate::latency_prof::now(),
+        );
     }
 
     fn close_writer(&self) {
@@ -1092,6 +1168,14 @@ fn client_writer_loop(
     server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
     #[cfg(feature = "latency-prof")]
+    crate::latency_prof::record_at(
+        "writer.client",
+        client_id,
+        0,
+        writer_queue.scope(),
+        crate::latency_prof::now(),
+    );
+    #[cfg(feature = "latency-prof")]
     let mut offset = 0u64;
     while let Some(item) = writer_queue.recv() {
         let (data, scope, render) = match item {
@@ -1112,14 +1196,51 @@ fn client_writer_loop(
             writer_queue.claim_time(),
         );
         if render {
-            let _ = server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::record_at(
+                "writer.feedback.begin",
+                client_id,
+                (server_event_tx.max_capacity() - server_event_tx.capacity()) as u64,
+                writer_queue.scope(),
+                crate::latency_prof::now(),
+            );
+            let _feedback_result =
+                server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::record_at(
+                "writer.feedback.end",
+                client_id,
+                u64::from(_feedback_result.is_ok()),
+                writer_queue.scope(),
+                crate::latency_prof::now(),
+            );
         }
         if !write_scoped_bytes_after_claim(&mut stream, &data.bytes, scope, data.frames()) {
             let _ = server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
             break;
         }
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::record_at(
+            if render {
+                "writer.write_complete.render"
+            } else {
+                "writer.write_complete.control"
+            },
+            0,
+            data.bytes.len() as u64,
+            writer_queue.scope(),
+            crate::latency_prof::now(),
+        );
     }
     writer_queue.close_writer();
+    #[cfg(feature = "latency-prof")]
+    crate::latency_prof::record_at(
+        "writer.exit",
+        client_id,
+        0,
+        writer_queue.scope(),
+        crate::latency_prof::now(),
+    );
     debug!("client writer thread exiting");
 }
 
@@ -1908,6 +2029,189 @@ mod tests {
 
         drop(writer);
         handle.join().expect("writer exits after senders drop");
+    }
+
+    #[test]
+    fn client_writer_feedback_reports_every_render_dequeue_before_handling() {
+        let (mut client, server, _path) = local_stream_pair("writer-feedback-burst");
+        #[cfg(unix)]
+        client
+            .set_recv_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (writer, queue) = test_queue_writer();
+        let title = |name: &str| {
+            frame_server_message(&ServerMessage::WindowTitle {
+                title: Some(name.into()),
+            })
+        };
+        writer.render.try_send(title("older")).unwrap();
+        writer.render.send_ordered(title("direct")).unwrap();
+        writer.render.try_send(title("newer")).unwrap();
+        let (events, mut feedback) = mpsc::channel(4);
+        let worker = std::thread::spawn(move || client_writer_loop(server, 21, queue, events));
+
+        // Reading all frames proves every dequeue has happened while no
+        // feedback has been handled. Ordered direct output shares this lane.
+        for expected in ["older", "direct", "newer"] {
+            assert_eq!(
+                protocol::read_message::<_, ServerMessage>(&mut client, MAX_FRAME_SIZE).unwrap(),
+                ServerMessage::WindowTitle {
+                    title: Some(expected.into())
+                },
+            );
+        }
+        for _ in 0..3 {
+            assert!(matches!(
+                feedback.try_recv(),
+                Ok(ServerEvent::ClientWriterDrained { client_id: 21 })
+            ));
+        }
+        assert!(feedback.try_recv().is_err());
+        drop(writer);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn full_writer_feedback_channel_frees_render_slot_before_socket_write() {
+        let (mut client, server, _path) = local_stream_pair("writer-feedback-full");
+        #[cfg(unix)]
+        client
+            .set_recv_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (writer, queue) = test_queue_writer();
+        let title = |name: &str| {
+            frame_server_message(&ServerMessage::WindowTitle {
+                title: Some(name.into()),
+            })
+        };
+        writer.render.try_send(title("older")).unwrap();
+        writer.render.send_ordered(title("direct")).unwrap();
+        let (events, mut feedback) = mpsc::channel(1);
+        events.try_send(ServerEvent::QuitSignal).unwrap();
+        let peer_events = events.clone();
+        let drain = queue.clone();
+        let worker = std::thread::spawn(move || client_writer_loop(server, 22, drain, events));
+
+        let (mut peer_client, peer_server, _peer_path) = local_stream_pair("writer-feedback-peer");
+        #[cfg(unix)]
+        peer_client
+            .set_recv_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (peer_writer, peer_queue) = test_queue_writer();
+        let peer_worker = std::thread::spawn(move || {
+            client_writer_loop(peer_server, 24, peer_queue, peer_events)
+        });
+
+        // recv notifies this condition when it claims the first ordered item.
+        // The full event channel then prevents the claimed item's socket write.
+        let mut state = queue.lock_state();
+        while state.ordered.len() == 2 {
+            let (next, timeout) = queue
+                .ready
+                .wait_timeout(state, Duration::from_secs(1))
+                .unwrap();
+            state = next;
+            assert!(!timeout.timed_out(), "writer did not claim queued output");
+        }
+        assert_eq!(state.ordered.len(), 1);
+        drop(state);
+        #[cfg(unix)]
+        {
+            use std::io::Read as _;
+            client.set_nonblocking(true).unwrap();
+            let mut byte = [0];
+            assert!(
+                matches!(client.read(&mut byte), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+                "slot availability is reported before any socket bytes are written"
+            );
+            client.set_nonblocking(false).unwrap();
+        }
+        peer_writer
+            .control
+            .send(frame_server_message(&ServerMessage::ReloadSoundConfig))
+            .unwrap();
+        assert_eq!(
+            protocol::read_message::<_, ServerMessage>(&mut peer_client, MAX_FRAME_SIZE).unwrap(),
+            ServerMessage::ReloadSoundConfig
+        );
+        drop(peer_writer);
+        peer_worker.join().unwrap();
+        writer
+            .render
+            .try_send(title("newer"))
+            .expect("dequeue already freed render admission");
+        writer
+            .control
+            .send(frame_server_message(&ServerMessage::ReloadSoundConfig))
+            .unwrap();
+
+        assert!(matches!(
+            feedback.blocking_recv(),
+            Some(ServerEvent::QuitSignal)
+        ));
+        assert!(matches!(
+            feedback.blocking_recv(),
+            Some(ServerEvent::ClientWriterDrained { client_id: 22 })
+        ));
+        assert_eq!(
+            protocol::read_message::<_, ServerMessage>(&mut client, MAX_FRAME_SIZE).unwrap(),
+            ServerMessage::WindowTitle {
+                title: Some("older".into())
+            }
+        );
+        assert_eq!(
+            protocol::read_message::<_, ServerMessage>(&mut client, MAX_FRAME_SIZE).unwrap(),
+            ServerMessage::ReloadSoundConfig
+        );
+        for expected in ["direct", "newer"] {
+            assert!(matches!(
+                feedback.blocking_recv(),
+                Some(ServerEvent::ClientWriterDrained { client_id: 22 })
+            ));
+            assert_eq!(
+                protocol::read_message::<_, ServerMessage>(&mut client, MAX_FRAME_SIZE).unwrap(),
+                ServerMessage::WindowTitle {
+                    title: Some(expected.into())
+                }
+            );
+        }
+        drop(writer);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn writer_feedback_disconnect_releases_pending_output() {
+        let (mut client, server, _path) = local_stream_pair("writer-feedback-disconnect");
+        #[cfg(unix)]
+        client
+            .set_recv_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (writer, queue) = test_queue_writer();
+        writer
+            .render
+            .send_ordered(frame_server_message(&ServerMessage::ReloadSoundConfig))
+            .unwrap();
+        let (events, receiver) = mpsc::channel(1);
+        events.try_send(ServerEvent::QuitSignal).unwrap();
+        let drain = queue.clone();
+        let worker = std::thread::spawn(move || client_writer_loop(server, 23, drain, events));
+        let mut state = queue.lock_state();
+        while !state.ordered.is_empty() {
+            let (next, timeout) = queue
+                .ready
+                .wait_timeout(state, Duration::from_secs(1))
+                .unwrap();
+            state = next;
+            assert!(!timeout.timed_out(), "writer did not claim queued output");
+        }
+        drop(state);
+        drop(receiver);
+        assert_eq!(
+            protocol::read_message::<_, ServerMessage>(&mut client, MAX_FRAME_SIZE).unwrap(),
+            ServerMessage::ReloadSoundConfig
+        );
+        drop(writer);
+        worker.join().unwrap();
     }
 
     #[test]
