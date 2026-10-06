@@ -416,6 +416,8 @@ impl HeadlessServer {
         let mut needs_graphics_render = false;
 
         loop {
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::record("writer.server_pass", 0, 0);
             crate::render_prof::event("loop.tick");
             crate::render_prof::flush_if_due();
             self.app.reap_finished_detached_processes();
@@ -2655,9 +2657,22 @@ impl HeadlessServer {
             }
             ServerEvent::ClientWriterDrained { client_id } => {
                 let Some(client) = self.clients.get_mut(&client_id) else {
+                    #[cfg(feature = "latency-prof")]
+                    crate::latency_prof::record("writer.feedback.orphaned", client_id, 0);
                     return false;
                 };
-                client.take_deferred_render() != DeferredRender::None
+                let retry = client.take_deferred_render() != DeferredRender::None;
+                #[cfg(feature = "latency-prof")]
+                if let Some(writer) = &client.writer {
+                    crate::latency_prof::record_at(
+                        "writer.feedback.handled",
+                        client_id,
+                        u64::from(retry),
+                        writer.diagnostic_scope(),
+                        crate::latency_prof::now(),
+                    );
+                }
+                retry
             }
             ServerEvent::QuitSignal => {
                 // The quit check at the top of the loop handles this.
