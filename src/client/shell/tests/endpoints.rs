@@ -2738,3 +2738,128 @@ fn navigator_foreign_workspace_heading_keeps_the_workspace_target() {
         }] if activated == &endpoint_id && workspace_id == "ws_1"
     ));
 }
+
+#[cfg(feature = "latency-prof")]
+#[test]
+fn composed_frame_keeps_exact_snapshot_transport_provenance() {
+    fn trace(fingerprint: u64, offset: u64) -> crate::latency_prof::FrameIdentity {
+        crate::latency_prof::FrameIdentity {
+            fingerprint,
+            connection: 11,
+            occurrence: 0,
+            offset,
+        }
+    }
+    let (mut state, remote) = state_with_remote();
+    let local = ClientEndpointId::Local;
+    let first = trace(101, 24);
+    crate::latency_prof::set_delivery(first);
+    state.set_endpoint_snapshot_for_generation(&local, 1, Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    let first_frame = state.compose(100, 28).expect("matching first snapshot");
+    assert_eq!(first_frame.snapshot_diagnostic, Some(first));
+
+    let mut next = snapshot();
+    next.revision = 2;
+    next.workspaces[0].label = "A000002".into();
+    let second = trace(102, 64);
+    crate::latency_prof::set_delivery(second);
+    state.set_endpoint_snapshot_for_generation(&local, 1, Box::new(next.clone()));
+    assert!(
+        state.compose(100, 28).is_none(),
+        "snapshot cannot pair with older surface"
+    );
+    let mut next_surface = surface();
+    next_surface.projection_revision = 2;
+    next_surface.surface_revision = 2;
+    state.set_pane_surface(next_surface);
+    let second_frame = state.compose(100, 28).expect("delayed matching surface");
+    assert_eq!(second_frame.snapshot_diagnostic, Some(second));
+    assert_eq!(
+        first_frame.snapshot_diagnostic,
+        Some(first),
+        "prepared frame provenance immutable"
+    );
+
+    crate::latency_prof::set_delivery(trace(103, 128));
+    state.set_endpoint_snapshot_for_generation(&local, 1, Box::new(snapshot()));
+    assert_eq!(
+        state.compose(100, 28).unwrap().snapshot_diagnostic,
+        Some(second),
+        "older snapshot rejected"
+    );
+    crate::latency_prof::set_delivery(trace(104, 256));
+    let mut inactive = snapshot();
+    inactive.boot_id = "remote-boot".into();
+    state.set_endpoint_snapshot_for_generation(&remote, 1, Box::new(inactive));
+    assert_eq!(
+        state.compose(100, 28).unwrap().snapshot_diagnostic,
+        Some(second),
+        "inactive snapshot cannot replace active provenance"
+    );
+
+    crate::latency_prof::set_delivery(trace(105, 512));
+    state.set_endpoint_snapshot_for_generation(&local, 2, Box::new(snapshot()));
+    assert!(
+        state.compose(100, 28).is_none(),
+        "new generation must wait for new surface"
+    );
+    state.set_pane_surface(surface());
+    assert_eq!(
+        state.compose(100, 28).unwrap().snapshot_diagnostic,
+        Some(trace(105, 512))
+    );
+    assert!(state.activate_endpoint_projection(&remote));
+    let mut remote_surface = surface();
+    remote_surface.boot_id = "remote-boot".into();
+    state.set_pane_surface(remote_surface);
+    assert_eq!(
+        state.compose(100, 28).unwrap().snapshot_diagnostic,
+        None,
+        "cached inactive metadata has no active transport provenance"
+    );
+    // A future surface cannot lend its pending snapshot identity to retained output.
+    assert!(state.activate_endpoint_projection(&local));
+    state.set_pane_surface(surface());
+    let mut third = snapshot();
+    third.revision = 3;
+    third.workspaces[0].label = "A000003".into();
+    let third_trace = trace(106, 1024);
+    crate::latency_prof::set_delivery(third_trace);
+    state.set_endpoint_snapshot_for_generation(&local, 2, Box::new(third.clone()));
+    let mut fourth_surface = surface();
+    fourth_surface.projection_revision = 4;
+    fourth_surface.surface_revision = 4;
+    state.set_pane_surface(fourth_surface);
+    assert!(state.compose(100, 28).is_none());
+    third.revision = 4;
+    crate::latency_prof::set_delivery(trace(107, 2048));
+    state.set_endpoint_snapshot_for_generation(&local, 2, Box::new(third.clone()));
+    assert_eq!(
+        state.compose(100, 28).unwrap().snapshot_diagnostic,
+        Some(trace(107, 2048))
+    );
+    // Equal revisions are accepted by the endpoint contract; provenance follows
+    // the actual accepted payload, rather than assuming the old bytes persist.
+    third.workspaces[0].label = "A000004".into();
+    crate::latency_prof::set_delivery(trace(108, 4096));
+    state.set_endpoint_snapshot_for_generation(&local, 2, Box::new(third));
+    let repeated_revision = state.compose(100, 28).unwrap();
+    assert_eq!(
+        repeated_revision.snapshot_diagnostic,
+        Some(trace(108, 4096))
+    );
+    let mut cached = snapshot();
+    cached.revision = 4;
+    cached.workspaces[0].label = "A000005".into();
+    state.cache_endpoint_snapshot_inactive_for_generation(&local, 2, Box::new(cached));
+    assert!(state.activate_endpoint_projection(&local));
+    assert_eq!(
+        state.compose(100, 28).unwrap().snapshot_diagnostic,
+        None,
+        "inactive same-revision cache cannot inherit original payload provenance"
+    );
+    state.select_unavailable_local();
+    assert_eq!(state.compose(100, 28).unwrap().snapshot_diagnostic, None);
+    crate::latency_prof::set_delivery(crate::latency_prof::FrameIdentity::empty());
+}
