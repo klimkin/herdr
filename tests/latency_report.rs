@@ -88,3 +88,56 @@ assert critical_paths(run,records[:1])==[]
         .expect("report executable");
     assert!(status.success());
 }
+
+#[test]
+fn latency_report_keeps_actor_parts_and_missing_queue_boundaries() {
+    let script = r#"
+import sys
+sys.path.insert(0, 'scripts')
+from latency_report import input_actor_path
+records = [
+ {'stage':'input.actor_enqueue','pid':1,'scope':80,'id':1,'value':7,'ns':100},
+ {'stage':'input.actor_claim','pid':1,'scope':80,'id':1,'value':7,'ns':200},
+ {'stage':'input.actor_part','pid':1,'scope':80,'id':1,'value':1,'ns':205},
+ {'stage':'input.actor_fragment','pid':1,'scope':80,'id':7,'value':1,'ns':310},
+ {'stage':'input.pty_pending','pid':1,'scope':80,'id':1,'value':7,'ns':210},
+ {'stage':'input.pty_write_attempt','pid':1,'scope':80,'id':1,'value':7,'ns':220},
+ {'stage':'input.pty_part_complete','pid':1,'scope':80,'id':1,'value':7,'ns':250},
+ {'stage':'input.actor_enqueue','pid':1,'scope':80,'id':2,'value':7,'ns':300},
+ {'stage':'input.actor_claim','pid':1,'scope':80,'id':2,'value':7,'ns':400},
+ {'stage':'input.actor_part','pid':1,'scope':80,'id':2,'value':2,'ns':405},
+ {'stage':'input.actor_fragment','pid':1,'scope':80,'id':7,'value':2,'ns':410},
+ {'stage':'input.pty_pending','pid':1,'scope':80,'id':2,'value':7,'ns':420},
+ {'stage':'input.pty_write_attempt','pid':1,'scope':80,'id':2,'value':7,'ns':430},
+ {'stage':'input.pty_part_complete','pid':1,'scope':80,'id':2,'value':7,'ns':900},
+]
+path=input_actor_path(records,7,1,90,1000)
+assert path['attribution']=='complete contributing accepted parts'
+assert [part['command_queue_ns'] for part in path['parts']]==[100,100]
+assert [part['claim_to_pending_ns'] for part in path['parts']]==[10,20]
+assert [part['pending_to_attempt_ns'] for part in path['parts']]==[10,10]
+assert [part['attempt_to_complete_ns'] for part in path['parts']]==[30,470]
+assert path['first_enqueue_ns']==100
+assert path['final_write_complete_ns']==900
+# No accepted record, no fabricated residence.
+missing=[record for record in records if not (record['stage']=='input.actor_enqueue' and record['id']==2)]
+path=input_actor_path(missing,7,1,90,1000)
+assert path['attribution']=='incomplete contributing parts'
+assert path['parts'][1]['command_queue_ns'] is None
+# Discard is terminal, even when a conflicting complete record appears later.
+records.append({'stage':'input.pty_part_discard','pid':1,'scope':80,'id':2,'value':7,'ns':850})
+path=input_actor_path(records,7,1,90,1000)
+assert path['parts'][1]['attempt_to_complete_ns'] is None
+assert path['final_write_complete_ns'] is None
+# Repeated identity in distinct commands cannot prove one controlled submission.
+records += [dict(record, scope=81, ns=record['ns']+1) for record in records[:7]]
+assert input_actor_path(records,7,1,90,1000)['attribution']=='ambiguous actor identity'
+assert input_actor_path([],7,1,90,1000)['attribution']=='actor records unavailable'
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}

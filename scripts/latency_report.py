@@ -28,6 +28,59 @@ def pair_stages(records):
     return pairs
 
 
+def input_actor_path(records, identity, pid, start, end):
+    """Pair accepted actor input parts without inferring missing boundaries."""
+    selected = [record for record in records
+                if record['pid'] == pid and start <= record['ns'] <= end]
+    fragments = [record for record in selected
+                 if record['stage'] == 'input.actor_fragment' and record['id'] == identity]
+    if not fragments:
+        return {'attribution': 'actor records unavailable', 'parts': []}
+    scopes = {record.get('scope') for record in fragments}
+    if len(scopes) != 1 or not next(iter(scopes)):
+        return {'attribution': 'ambiguous actor identity', 'parts': []}
+    scope = next(iter(scopes))
+    selected = [record for record in selected if record.get('scope') == scope]
+    part_ids = sorted({record['value'] for record in fragments})
+    parts = []
+    def unique(stage, identifier):
+        matches = [record for record in selected
+                   if record['stage'] == stage and record['id'] == identifier]
+        return matches[0] if len(matches) == 1 else None
+    def interval(left, right):
+        return right-left if left is not None and right is not None and right >= left else None
+    for part_id in part_ids:
+        link = unique('input.actor_part', part_id)
+        command_id = link['value'] if link else None
+        enqueue = unique('input.actor_enqueue', command_id)
+        claim = unique('input.actor_claim', command_id)
+        pending = unique('input.pty_pending', part_id)
+        attempt = unique('input.pty_write_attempt', part_id)
+        complete = unique('input.pty_part_complete', part_id)
+        discarded = any(record['stage'] == 'input.pty_part_discard' and record['id'] == part_id
+                        or record['stage'] == 'input.actor_discard' and record['id'] == command_id
+                        for record in selected)
+        timestamps = {name: record['ns'] if record else None
+                      for name, record in [('enqueue_ns', enqueue), ('claim_ns', claim),
+                                           ('pending_ns', pending), ('attempt_ns', attempt),
+                                           ('complete_ns', None if discarded else complete)]}
+        parts.append({'part_id': part_id, 'command_id': command_id, 'scope': scope,
+                      'discarded': discarded, **timestamps,
+                      'command_queue_ns': interval(timestamps['enqueue_ns'], timestamps['claim_ns']),
+                      'claim_to_pending_ns': interval(timestamps['claim_ns'], timestamps['pending_ns']),
+                      'pending_to_attempt_ns': interval(timestamps['pending_ns'], timestamps['attempt_ns']),
+                      'attempt_to_complete_ns': interval(timestamps['attempt_ns'], timestamps['complete_ns'])})
+    complete = all(not part['discarded'] and all(part[name] is not None for name in
+                   ['command_queue_ns', 'claim_to_pending_ns', 'pending_to_attempt_ns', 'attempt_to_complete_ns'])
+                   for part in parts)
+    return {'attribution': 'complete contributing accepted parts' if complete else 'incomplete contributing parts',
+            'parts': parts, 'first_enqueue_ns': min(part['enqueue_ns'] for part in parts) if complete else None,
+            'final_write_complete_ns': max(part['complete_ns'] for part in parts) if complete else None,
+            'limits': ['elapsed boundaries do not establish CPU or off-CPU cause',
+                       'fragment intervals may overlap; do not add them',
+                       'trace loss may omit contributing identity links']}
+
+
 def fingerprint(text):
     value = 0xcbf29ce484222325
     for byte in text.encode():

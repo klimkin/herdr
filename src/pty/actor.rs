@@ -1,6 +1,9 @@
 #[cfg(unix)]
 mod unix;
 
+#[cfg(all(unix, feature = "latency-prof"))]
+mod input_trace;
+
 #[cfg(unix)]
 pub(crate) use unix::*;
 
