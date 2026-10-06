@@ -410,6 +410,7 @@ impl HeadlessServer {
             },
         );
 
+        let mut deadline_waiter = crate::platform::DeadlineWaiter::new();
         let mut needs_render = true;
         let mut needs_full_render = true;
         let mut needs_graphics_render = false;
@@ -668,7 +669,7 @@ impl HeadlessServer {
                         Some(ev) => LoopEvent::ServerEvent(ev),
                         None => LoopEvent::Timer,
                     },
-                    _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
+                    _ = deadline_waiter.wait(next_deadline) => LoopEvent::Timer,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
@@ -3406,14 +3407,6 @@ impl Drop for HeadlessServer {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Sleep until a deadline, or return pending if none.
-async fn sleep_until_or_pending(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
-        None => std::future::pending().await,
-    }
-}
 
 fn sanitize_notification_text(value: &str, max_chars: usize) -> Option<String> {
     let mut sanitized = String::new();

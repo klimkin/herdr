@@ -98,3 +98,10 @@ Keep geometry, seeds, sample counts, load and observers identical; compare
 profiling disabled, enabled without Tracy capture, and active capture. Record
 latency, coverage, event volume, observer cost, CPU and memory. Repeat material
 performance differences with at least 60 seconds of samples.
+
+## Server deadline waiting
+
+Linux server-loop deadlines use a cancellable absolute one-shot `timerfd`.
+The presentation interval remains 16 ms; incoming events cancel pending waits.
+Native timer failures log a warning and fall back to Tokio sleeping.
+macOS and Windows retain Tokio sleeping pending native implementations.
