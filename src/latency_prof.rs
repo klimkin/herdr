@@ -396,6 +396,11 @@ pub(crate) fn set_delivery(frame: FrameIdentity) {
     #[cfg(not(feature = "latency-prof"))]
     let _ = frame;
 }
+#[cfg(feature = "latency-prof")]
+pub(crate) fn delivery_frame() -> FrameIdentity {
+    DELIVERY_FRAME.with(std::cell::Cell::get)
+}
+
 pub(crate) fn delivery(bytes: usize) {
     #[cfg(feature = "latency-prof")]
     record_frame_at(
@@ -407,6 +412,25 @@ pub(crate) fn delivery(bytes: usize) {
     );
     #[cfg(not(feature = "latency-prof"))]
     let _ = bytes;
+}
+
+/// All contributors share the same successful output-flush boundary.
+#[cfg(feature = "latency-prof")]
+pub(crate) fn delivery_with_snapshot(
+    bytes: usize,
+    snapshot: Option<FrameIdentity>,
+    completed_ns: u64,
+) {
+    if bytes == 0 {
+        return;
+    }
+    let current = delivery_frame();
+    record_frame_at("client.delivery", bytes as u64, 0, completed_ns, current);
+    if let Some(snapshot) =
+        snapshot.filter(|snapshot| *snapshot != current && snapshot.connection != 0)
+    {
+        record_frame_at("client.delivery", bytes as u64, 0, completed_ns, snapshot);
+    }
 }
 
 /// Controlled identities are parsed before terminal locks, across PTY batches.

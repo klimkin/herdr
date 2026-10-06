@@ -522,6 +522,7 @@ impl ClientState {
         writer: &mut impl io::Write,
         encoded: &[u8],
         mut graphics: crate::kitty_graphics::GraphicsOutput,
+        #[cfg(feature = "latency-prof")] snapshot: Option<crate::latency_prof::FrameIdentity>,
     ) -> io::Result<()> {
         crate::latency_prof::zone!("client.terminal_write");
         crate::latency_prof::record(
@@ -548,12 +549,28 @@ impl ClientState {
             writer.write_all(encoded)?;
         }
         writer.flush()?;
-        crate::latency_prof::record(
-            "client.output_complete",
-            crate::latency_prof::bytes_id(encoded),
-            encoded.len() as u64,
-        );
-        crate::latency_prof::delivery(encoded.len());
+        #[cfg(feature = "latency-prof")]
+        {
+            let completed_ns = crate::latency_prof::now();
+            crate::latency_prof::record_at(
+                "client.output_complete",
+                crate::latency_prof::bytes_id(encoded),
+                encoded.len() as u64,
+                0,
+                completed_ns,
+            );
+            crate::latency_prof::delivery_with_snapshot(encoded.len(), snapshot, completed_ns);
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        {
+            crate::latency_prof::record(
+                "client.output_complete",
+                crate::latency_prof::bytes_id(encoded),
+                encoded.len() as u64,
+            );
+            crate::latency_prof::delivery(encoded.len());
+        }
+
         if self.kitty_graphics_enabled {
             self.pending_native_cleanup.clear();
         }
@@ -574,6 +591,8 @@ impl ClientState {
         let frame_output::ComposedFrame {
             frame: frame_data,
             graphics,
+            #[cfg(feature = "latency-prof")]
+            snapshot_diagnostic,
         } = frame_data.into();
         let (frame_data, encoded) = {
             crate::latency_prof::zone!("client.encode");
@@ -591,7 +610,14 @@ impl ClientState {
             (frame_data, encoded)
         };
         let mut stdout = io::stdout();
-        if let Err(error) = self.write_composed_output(&mut stdout, &encoded.bytes, graphics) {
+        let result = self.write_composed_output(
+            &mut stdout,
+            &encoded.bytes,
+            graphics,
+            #[cfg(feature = "latency-prof")]
+            snapshot_diagnostic,
+        );
+        if let Err(error) = result {
             tracing::warn!(%error, "failed to present client frame");
             self.repaint_pending = true;
             return false;
@@ -724,6 +750,122 @@ mod native_cleanup_tests {
             .is_empty());
     }
 
+    #[cfg(feature = "latency-prof")]
+    #[test]
+    fn snapshot_output_provenance_requires_successful_nonempty_flush() {
+        const CHILD: &str = "HERDR_SNAPSHOT_OUTPUT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "herdr-snapshot-output-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "client::state::native_cleanup_tests::snapshot_output_provenance_requires_successful_nonempty_flush", "--nocapture"])
+                .env(CHILD, "1").env("HERDR_LATENCY_TRACE_DIR", &root).env_remove("HERDR_TRACY").status().unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            assert!(status.success());
+            return;
+        }
+        let mut state = ClientState::test_new();
+        let surface = crate::latency_prof::FrameIdentity {
+            fingerprint: 202,
+            connection: 9,
+            occurrence: 0,
+            offset: 48,
+        };
+        let snapshot = crate::latency_prof::FrameIdentity {
+            fingerprint: 101,
+            connection: 9,
+            occurrence: 0,
+            offset: 24,
+        };
+        crate::latency_prof::set_delivery(surface);
+        let encoded = b"\x1b[?2026hA000010\x1b[?2026l";
+        let mut output = Vec::new();
+        state
+            .write_composed_output(&mut output, encoded, Default::default(), Some(snapshot))
+            .unwrap();
+        assert_eq!(output, encoded);
+        state
+            .write_composed_output(&mut output, b"", Default::default(), Some(snapshot))
+            .unwrap();
+        let mut no_capacity = &mut [][..];
+        assert!(state
+            .write_composed_output(
+                &mut no_capacity,
+                encoded,
+                Default::default(),
+                Some(snapshot)
+            )
+            .is_err());
+        struct FailingFlush(Vec<u8>);
+        impl std::io::Write for FailingFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush failed"))
+            }
+        }
+        assert!(state
+            .write_composed_output(
+                &mut FailingFlush(Vec::new()),
+                encoded,
+                Default::default(),
+                Some(snapshot)
+            )
+            .is_err());
+        crate::latency_prof::set_delivery(snapshot);
+        state
+            .write_composed_output(&mut output, b"", Default::default(), Some(snapshot))
+            .unwrap();
+        state
+            .write_composed_output(&mut output, encoded, Default::default(), Some(snapshot))
+            .unwrap();
+        crate::latency_prof::shutdown();
+        let root = std::path::PathBuf::from(std::env::var_os("HERDR_LATENCY_TRACE_DIR").unwrap());
+        let records: Vec<serde_json::Value> =
+            std::fs::read_to_string(root.join(format!("{}.jsonl", std::process::id())))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let delivered: Vec<_> = records
+            .iter()
+            .filter(|record| record["stage"] == "client.delivery" && record["id"] == 101)
+            .collect();
+        assert_eq!(
+            delivered.len(),
+            2,
+            "empty/failed outputs and duplicate contributor cannot add snapshot deliveries"
+        );
+        assert_eq!(delivered[0]["connection"], 9);
+        assert_eq!(delivered[0]["offset"], 24);
+        let surface_delivery = records
+            .iter()
+            .find(|record| {
+                record["stage"] == "client.delivery"
+                    && record["id"] == 202
+                    && record["value"].as_u64() == Some(encoded.len() as u64)
+            })
+            .unwrap();
+        let completed = records
+            .iter()
+            .find(|record| {
+                record["stage"] == "client.output_complete"
+                    && record["value"].as_u64() == Some(encoded.len() as u64)
+            })
+            .unwrap();
+        assert_eq!(delivered[0]["ns"], surface_delivery["ns"]);
+        assert_eq!(delivered[0]["ns"], completed["ns"]);
+    }
+
     #[test]
     fn queued_cleanup_is_synchronized_and_respects_graphics_capability() {
         let mut state = ClientState::test_new();
@@ -732,7 +874,13 @@ mod native_cleanup_tests {
         let encoded = b"\x1b[?2026htext\x1b[?2026l";
         let mut output = Vec::new();
         state
-            .write_composed_output(&mut output, encoded, Default::default())
+            .write_composed_output(
+                &mut output,
+                encoded,
+                Default::default(),
+                #[cfg(feature = "latency-prof")]
+                None,
+            )
             .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.find("\x1b[?2026h").unwrap() < text.find("a=d,d=I,i=42").unwrap());
@@ -742,14 +890,26 @@ mod native_cleanup_tests {
         state.queue_native_image_cleanup(43);
         let mut output = Vec::new();
         state
-            .write_composed_output(&mut output, encoded, Default::default())
+            .write_composed_output(
+                &mut output,
+                encoded,
+                Default::default(),
+                #[cfg(feature = "latency-prof")]
+                None,
+            )
             .unwrap();
         assert_eq!(output, encoded);
         assert!(!state.pending_native_cleanup.is_empty());
         state.kitty_graphics_enabled = true;
         let mut no_capacity = &mut [][..];
         assert!(state
-            .write_composed_output(&mut no_capacity, encoded, Default::default())
+            .write_composed_output(
+                &mut no_capacity,
+                encoded,
+                Default::default(),
+                #[cfg(feature = "latency-prof")]
+                None,
+            )
             .is_err());
         assert!(!state.pending_native_cleanup.is_empty());
     }

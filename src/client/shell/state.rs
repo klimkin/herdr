@@ -855,10 +855,21 @@ pub(super) struct ClientCopyModeState {
     pub(super) copy_after_search: bool,
 }
 
+#[cfg(feature = "latency-prof")]
+pub(super) struct SnapshotDiagnostic {
+    pub(super) endpoint_id: ClientEndpointId,
+    pub(super) boot_id: String,
+    pub(super) generation: u64,
+    pub(super) revision: u64,
+    pub(super) frame: crate::latency_prof::FrameIdentity,
+}
+
 pub(crate) struct ClientShellState {
     pub(super) machine_diagnostics: super::machine_diagnostics::MachineDiagnostics,
     pub(super) config: ClientShellConfig,
     pub(super) snapshot: Option<Box<ClientShellSnapshot>>,
+    #[cfg(feature = "latency-prof")]
+    pub(super) snapshot_diagnostic: Option<SnapshotDiagnostic>,
     pub(super) active_snapshot_generation: Option<u64>,
     pub(super) pane_surface_generation: Option<u64>,
     pub(super) pane_surface: Option<PaneSurfaceFrame>,
@@ -1023,6 +1034,8 @@ impl ClientShellState {
             machine_diagnostics: Default::default(),
             config,
             snapshot: None,
+            #[cfg(feature = "latency-prof")]
+            snapshot_diagnostic: None,
             active_snapshot_generation: None,
             pane_surface_generation: None,
             pane_surface: None,
@@ -1224,6 +1237,10 @@ impl ClientShellState {
     }
 
     pub(super) fn reset_endpoint_projection(&mut self) {
+        #[cfg(feature = "latency-prof")]
+        {
+            self.snapshot_diagnostic = None;
+        }
         self.hits = ShellHitMap::default();
         self.pane_surface = None;
         self.pending_pane_surface = None;
@@ -1306,6 +1323,15 @@ impl ClientShellState {
             })
         {
             return;
+        }
+        #[cfg(feature = "latency-prof")]
+        if self.snapshot_diagnostic.as_ref().is_some_and(|diagnostic| {
+            diagnostic.endpoint_id != self.active_endpoint_id
+                || diagnostic.boot_id != snapshot.boot_id
+                || Some(diagnostic.generation) != generation
+                || diagnostic.revision != snapshot.revision
+        }) {
+            self.snapshot_diagnostic = None;
         }
         // Screen revisions restart per connection. Keep the displayed surface for selection
         // content comparisons, but retire speculative frames from the old connection.

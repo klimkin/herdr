@@ -722,7 +722,25 @@ impl ClientShellState {
             self.hits.popup = None;
         }
         let graphics = self.compose_graphics(layout, &occlusion);
-        Some(crate::client::frame_output::ComposedFrame { frame, graphics })
+        #[cfg(feature = "latency-prof")]
+        let snapshot_diagnostic = self
+            .snapshot_diagnostic
+            .as_ref()
+            .filter(|diagnostic| {
+                diagnostic.endpoint_id == self.active_endpoint_id
+                    && self.active_snapshot_generation == Some(diagnostic.generation)
+                    && self.snapshot.as_deref().is_some_and(|snapshot| {
+                        snapshot.boot_id == diagnostic.boot_id
+                            && snapshot.revision == diagnostic.revision
+                    })
+            })
+            .map(|diagnostic| diagnostic.frame);
+        Some(crate::client::frame_output::ComposedFrame {
+            frame,
+            graphics,
+            #[cfg(feature = "latency-prof")]
+            snapshot_diagnostic,
+        })
     }
 }
 

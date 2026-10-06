@@ -11,12 +11,19 @@ use base64::Engine as _;
 pub(crate) struct ComposedFrame {
     pub(crate) frame: FrameData,
     pub(crate) graphics: GraphicsOutput,
+    #[cfg(feature = "latency-prof")]
+    pub(crate) snapshot_diagnostic: Option<crate::latency_prof::FrameIdentity>,
 }
 
 impl From<FrameData> for ComposedFrame {
     fn from(mut frame: FrameData) -> Self {
         let graphics = GraphicsOutput::from_bytes(std::mem::take(&mut frame.graphics));
-        Self { frame, graphics }
+        Self {
+            frame,
+            graphics,
+            #[cfg(feature = "latency-prof")]
+            snapshot_diagnostic: None,
+        }
     }
 }
 

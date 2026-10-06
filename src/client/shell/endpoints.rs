@@ -537,6 +537,12 @@ impl ClientShellState {
         generation: u64,
         snapshot: Box<ClientShellSnapshot>,
     ) {
+        #[cfg(feature = "latency-prof")]
+        if endpoint_id == &self.active_endpoint_id {
+            // An inactive cache can replace equal-revision bytes without
+            // projecting them. Reusing the previous transport link is unsafe.
+            self.snapshot_diagnostic = None;
+        }
         self.cache_endpoint_snapshot_with_surface(endpoint_id, Some(generation), snapshot, false);
     }
 
@@ -692,8 +698,25 @@ impl ClientShellState {
         generation: u64,
         snapshot: Box<ClientShellSnapshot>,
     ) {
+        #[cfg(feature = "latency-prof")]
+        let diagnostic = SnapshotDiagnostic {
+            endpoint_id: endpoint_id.clone(),
+            boot_id: snapshot.boot_id.clone(),
+            generation,
+            revision: snapshot.revision,
+            frame: crate::latency_prof::delivery_frame(),
+        };
         self.cache_endpoint_snapshot_for_generation(endpoint_id, generation, snapshot);
         self.apply_cached_endpoint_snapshot(endpoint_id);
+        #[cfg(feature = "latency-prof")]
+        if endpoint_id == &self.active_endpoint_id
+            && self.active_snapshot_generation == Some(generation)
+            && self.snapshot.as_deref().is_some_and(|accepted| {
+                accepted.boot_id == diagnostic.boot_id && accepted.revision == diagnostic.revision
+            })
+        {
+            self.snapshot_diagnostic = (diagnostic.frame.connection != 0).then_some(diagnostic);
+        }
     }
 
     fn apply_cached_endpoint_snapshot(&mut self, endpoint_id: &ClientEndpointId) {
