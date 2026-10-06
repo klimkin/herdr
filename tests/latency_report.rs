@@ -455,3 +455,118 @@ assert input_actor_path([],7,1,90,1000)['attribution']=='actor records unavailab
         .expect("report executable");
     assert!(status.success());
 }
+
+#[test]
+fn latency_echo_report_joins_actor_acceptance_to_helper_receipt() {
+    let script = r#"
+import sys
+sys.path.insert(0,'scripts')
+from latency_report import critical_paths
+run={'path':'echo','clock':'host monotonic; observer includes scheduling and reconstruction',
+ 'clock_validation_ns':[10,15,20],'client_pids':[2],'samples':[{
+ 'identity':'7','injected_ns':100,'helper_received_ns':205,'observed_ns':[600]}]}
+def event(stage,ns,id=7,scope=80,value=1,pid=1):
+ return dict(stage=stage,ns=ns,id=id,scope=scope,value=value,pid=pid,dropped=0)
+records=[event('input.actor_enqueue',120,id=1),event('input.actor_claim',150,id=1),
+ event('input.actor_part',151,id=1),event('input.actor_fragment',119,value=1),
+ event('input.pty_pending',160,id=1),event('input.pty_write_attempt',170,id=1),
+ event('input.pty_part_complete',190,id=1),event('terminal.stimulus',220,scope=2,value=4),
+ event('surface.content',300,id=2,scope=777,value=6),
+ event('server.enqueue',310,id=777,scope=10),event('server.writer_claim',350,id=777,scope=10),
+ event('server.write_complete',400,id=777,scope=10),event('transport.receive',410,id=777,pid=2),
+ event('client.delivery',500,id=777,pid=2),event('process.finish',650,id=0,scope=0),
+ event('process.finish',650,id=0,scope=0,pid=2)]
+audit={'processes':[{'pid':1,'complete':True},{'pid':2,'complete':True}]}
+path=critical_paths(run,records,audit)[0]
+assert path['actor_input']['attribution']=='complete contributing accepted parts'
+assert path['helper_received_ns']==205
+assert path['actor_input']['write_complete_to_helper_received_ns']==15
+assert 'PTY submission queue residence' not in path['unavailable']
+# Missing trace completion cannot establish all contributing fragments.
+unfinished=[record for record in records if record['stage']!='process.finish']
+path=critical_paths(run,unfinished)[0]
+assert path['actor_input']['attribution']=='incomplete trace for contributing parts'
+assert 'PTY submission queue residence' in path['unavailable']
+# Consumption can precede the observed write return; never clamp to zero.
+run['samples'][0]['helper_received_ns']=180
+path=critical_paths(run,records,audit)[0]
+assert path['actor_input']['write_complete_to_helper_received_ns'] is None
+run['clock_validation_ns']=[10,20]
+path=critical_paths(run,records,audit)[0]
+assert path['actor_input']['helper_clock_verified'] is False
+assert path['helper_received_ns'] is None
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_input_distributions_count_commands_once_and_preserve_gaps() {
+    let script = r#"
+import sys
+sys.path.insert(0,'scripts')
+from latency_report import input_distributions
+run={'path':'echo','samples':[{'identity':'7','observed_ns':[600,700]},
+                            {'identity':'8','observed_ns':[800,900]}]}
+part={'scope':80,'command_id':1,'part_id':1,'command_queue_ns':30,
+      'claim_to_pending_ns':10,'pending_to_attempt_ns':10,'attempt_to_complete_ns':20}
+actor={'attribution':'complete contributing accepted parts','trace_complete':True,
+       'parts':[part,{**part,'part_id':2,'pending_to_attempt_ns':15}],
+       'write_complete_to_helper_received_ns':5}
+paths=[{'identity':'7','server_pid':1,'client_pid':2,'actor_input':actor},
+       {'identity':'7','server_pid':1,'client_pid':3,'actor_input':actor}]
+report=input_distributions(run,paths)
+assert report['coverage']=={'completed_echo_probes':2,'matched_actor_probes':1,'unassigned_echo_probes':1}
+assert report['stages']['command_queue']['sample_count']==1
+assert report['stages']['command_queue']['matched_probes']==1
+assert report['stages']['command_queue']['probe_denominator']==2
+assert report['stages']['command_queue']['p50_ns']==30
+assert report['stages']['pending_to_attempt']['sample_count']==2
+assert report['stages']['pending_to_attempt']['p95_ns']==15
+assert report['stages']['write_complete_to_helper_received']['p50_ns']==5
+# Incomplete captures keep every probe denominator but establish no parts.
+paths[0]['actor_input']={**actor,'trace_complete':False}
+paths[1]['actor_input']=paths[0]['actor_input']
+report=input_distributions(run,paths)
+assert report['coverage']['matched_actor_probes']==0
+assert report['stages']['command_queue']['sample_count']==0
+assert report['stages']['command_queue']['probe_denominator']==2
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_echo_cli_reports_input_units_without_fabricating_missing_stages() {
+    let script = r#"
+import json, subprocess, sys, tempfile
+from pathlib import Path
+run={'path':'echo','load':'quiet','panes':1,'clients':1,'budget_ns':1000,
+     'summary':[{'completed':1,'missing':0,'p50_ns':500,'p95_ns':500,'p99_ns':500}],
+     'samples':[{'identity':'7','injected_ns':100,'observed_ns':[600]}]}
+with tempfile.TemporaryDirectory() as directory:
+    path=Path(directory)
+    (path/'samples.json').write_text(json.dumps(run))
+    subprocess.run([sys.executable,'scripts/latency_report.py',str(path/'samples.json'),
+      '--output',str(path/'report.md')],check=True)
+    report=json.loads((path/'report.json').read_text())
+    assert report['input_report']['coverage']['completed_echo_probes']==1
+    assert report['input_report']['stages']['command_queue']['sample_count']==0
+    assert report['input_report']['stages']['command_queue']['probe_denominator']==1
+    assert 'Input stage | Matched probes / completed' in (path/'report.md').read_text()
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
