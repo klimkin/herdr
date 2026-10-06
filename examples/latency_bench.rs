@@ -3,6 +3,8 @@
 mod observer;
 #[path = "latency/platform.rs"]
 mod platform;
+#[path = "latency/reader_control.rs"]
+mod reader_control;
 #[path = "latency/report.rs"]
 mod report;
 #[path = "latency/transport.rs"]
@@ -30,6 +32,8 @@ struct Client {
     screen: Arc<Mutex<observer::Observer>>,
     completed: mpsc::Receiver<observer::Observation>,
     delay_ms: Arc<AtomicU64>,
+    reader_control: Option<Arc<reader_control::ReaderControl>>,
+    reader_worker: Option<std::thread::JoinHandle<()>>,
     observer_ns: Arc<AtomicU64>,
     observer_bytes: Arc<AtomicU64>,
 }
@@ -44,6 +48,8 @@ struct Session {
     config: PathBuf,
     clients: Vec<Client>,
     server: Option<std::process::Child>,
+    paused_client: Option<usize>,
+    reader_reset_worker: Option<std::thread::JoinHandle<std::io::Result<()>>>,
 }
 
 impl Session {
@@ -185,15 +191,28 @@ impl Session {
         let (sender, completed) = mpsc::channel();
         let delay_ms = Arc::new(AtomicU64::new(0));
         let reader_delay = delay_ms.clone();
+        let reader_control = (self.paused_client == Some(index))
+            .then(|| Arc::new(reader_control::ReaderControl::default()));
+        let reader_pause = reader_control.clone();
         let observer_ns = Arc::new(AtomicU64::new(0));
         let observer_bytes = Arc::new(AtomicU64::new(0));
         let parse_cost = observer_ns.clone();
         let byte_count = observer_bytes.clone();
         let mut raw = std::fs::File::create(self.output.join(format!("client-{index}.vt")))?;
-        std::thread::spawn(move || {
+        let reader_worker = std::thread::spawn(move || {
             let mut buffer = [0u8; 65536];
             loop {
+                if let Some(pause) = &reader_pause {
+                    if !pause.before_read().unwrap_or(false) {
+                        break;
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(reader_delay.load(Ordering::Relaxed)));
+                if let Some(pause) = &reader_pause {
+                    if pause.read_attempt().is_err() {
+                        break;
+                    }
+                }
                 let count = match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(count) => count,
@@ -201,6 +220,9 @@ impl Session {
                 let Ok(received) = platform::monotonic_ns() else {
                     break;
                 };
+                if let Some(pause) = &reader_pause {
+                    pause.received(received);
+                }
                 let Ok(mut screen) = screen_thread.lock() else {
                     break;
                 };
@@ -219,7 +241,15 @@ impl Session {
                     break;
                 }
             }
+            if let Some(pause) = &reader_pause {
+                pause.stop();
+            }
         });
+        let reader_worker = if reader_control.is_some() {
+            Some(reader_worker)
+        } else {
+            None
+        };
         self.clients.push(Client {
             child,
             _master: pair.master,
@@ -227,6 +257,8 @@ impl Session {
             screen,
             completed,
             delay_ms,
+            reader_control,
+            reader_worker,
             observer_ns,
             observer_bytes,
         });
@@ -265,6 +297,14 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        for client in &self.clients {
+            if let Some(control) = &client.reader_control {
+                control.stop();
+            }
+        }
+        if let Some(worker) = self.reader_reset_worker.take() {
+            let _ = worker.join();
+        }
         let _ = self.api("server.stop", json!({}));
         for client in &mut self.clients {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -300,6 +340,19 @@ impl Drop for Session {
                 }
             }
         }
+        for client in &mut self.clients {
+            if let Some(worker) = client.reader_worker.take() {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !worker.is_finished() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if worker.is_finished() {
+                    let _ = worker.join();
+                } else {
+                    eprintln!("controlled outer reader did not finish after owned shutdown");
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.base);
     }
 }
@@ -310,6 +363,8 @@ struct Sample {
     identity: String,
     intended_ns: u64,
     injected_ns: u64,
+    // Successful harness input operation completion, not server/API admission.
+    accepted_ns: Option<u64>,
     process_start_ns: Option<u64>,
     process_end_ns: Option<u64>,
     helper_received_ns: Option<u64>,
@@ -402,6 +457,8 @@ fn main() -> Result<()> {
         config,
         clients: Vec::new(),
         server: None,
+        paused_client: (stall_ms > 0).then_some(clients - 1),
+        reader_reset_worker: None,
     };
     session.start_server()?;
     session.attach(0)?;
@@ -548,16 +605,29 @@ fn main() -> Result<()> {
     let mut samples = Vec::<Sample>::new();
     let mut positions = BTreeMap::new();
     let mut seed = 92341u64;
-    let mut intended = platform::monotonic_ns()?;
-    let started_ns = platform::monotonic_ns()?;
     if stall_ms > 0 {
+        let pause = session.clients[clients - 1]
+            .reader_control
+            .as_ref()
+            .ok_or("reader control absent")?
+            .clone();
+        let pid = session.clients[clients - 1]
+            .child
+            .process_id()
+            .ok_or("paused client PID absent")?;
+        pause.arm(clients - 1, pid, stall_ms)?;
+        // Wake a reader already blocked before arm; this is an unmeasured marker.
+        writeln!(control, "output ffffffffffff")?;
+        pause.wait_paused(Duration::from_secs(2))?;
         let delay = session.clients[clients - 1].delay_ms.clone();
-        delay.store(stall_ms, Ordering::Relaxed);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(stall_ms));
-            delay.store(0, Ordering::Relaxed);
-        });
+        // Initial-stall reset retains the existing restore-to-zero behavior.
+        delay.store(0, Ordering::Relaxed);
+        session.reader_reset_worker = Some(std::thread::spawn(move || {
+            pause.reset_after(Duration::from_millis(stall_ms))
+        }));
     }
+    let started_ns = platform::monotonic_ns()?;
+    let mut intended = started_ns;
     for sequence in 0..count + warmups {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         intended += interval_ms * 1_000_000 + seed % (interval_ms.max(1) * 1_000_000);
@@ -584,6 +654,7 @@ fn main() -> Result<()> {
             identity,
             intended_ns: intended,
             injected_ns: injected,
+            accepted_ns: None,
             process_start_ns: None,
             process_end_ns: None,
             helper_received_ns: None,
@@ -596,7 +667,8 @@ fn main() -> Result<()> {
                 sample.observed_ns.iter().any(Option::is_none) && sample.outcome == "pending"
             })
             .count();
-        let injection = if outstanding >= max_pending {
+        let locally_rejected = outstanding >= max_pending;
+        let injection = if locally_rejected {
             Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "pending probe limit",
@@ -611,13 +683,19 @@ fn main() -> Result<()> {
             }
         };
         let mut sample = sample;
+        // Recovery cutoff uses successful harness operation completion only.
+        if injection.is_ok() && stall_ms > 0 {
+            sample.accepted_ns = Some(platform::monotonic_ns()?);
+        }
         if let Err(error) = injection {
             for client in &session.clients {
                 if let Ok(mut screen) = client.screen.lock() {
                     screen.cancel(&marker);
                 }
             }
-            sample.outcome = if error.kind() == std::io::ErrorKind::TimedOut {
+            sample.outcome = if stall_ms > 0 && !locally_rejected {
+                format!("interrupted: injection completion unknown: {error}")
+            } else if error.kind() == std::io::ErrorKind::TimedOut {
                 format!("interrupted: {error}")
             } else {
                 format!("rejected: {error}")
@@ -632,6 +710,11 @@ fn main() -> Result<()> {
                 }
             }
         }
+    }
+    if let Some(worker) = session.reader_reset_worker.take() {
+        worker
+            .join()
+            .map_err(|_| "reader reset worker panicked")??;
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -725,6 +808,20 @@ fn main() -> Result<()> {
         }
     }
     let finished_ns = platform::monotonic_ns()?;
+    let reader_lifecycle = session
+        .clients
+        .iter()
+        .filter_map(|client| client.reader_control.as_ref())
+        .map(|control| control.snapshot())
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .next();
+    let recovery_warmups = if reader_lifecycle.is_some() {
+        serde_json::to_value(&samples[..warmups])?
+    } else {
+        Value::Null
+    };
     samples.drain(..warmups);
     let summaries = (0..clients)
         .map(|client| {
@@ -806,7 +903,7 @@ fn main() -> Result<()> {
         Value::Null
     };
     let mut report = json!({"run_id":run_id,"path":path,"load":load,"load_hz":load_hz,"panes":panes,"clients":clients,"samples":samples,"summary":summaries});
-    let metadata = json!({"started_ns":started_ns,"finished_ns":finished_ns,"duration_ns":finished_ns-started_ns,"warmups":warmups,"burst":burst,"max_pending":max_pending,"interval_ms":interval_ms,"seed":92341,"layout":layout,"pane_ids":pane_ids,"estimated_pane_areas":areas,"pane_layout":pane_layout,"slow_reader_ms":slow_reader_ms,"stall_ms":stall_ms});
+    let metadata = json!({"started_ns":started_ns,"finished_ns":finished_ns,"duration_ns":finished_ns-started_ns,"warmups":warmups,"burst":burst,"max_pending":max_pending,"interval_ms":interval_ms,"seed":92341,"layout":layout,"pane_ids":pane_ids,"estimated_pane_areas":areas,"pane_layout":pane_layout,"slow_reader_ms":slow_reader_ms,"stall_ms":stall_ms,"reader_lifecycle":reader_lifecycle,"recovery_warmups":recovery_warmups});
     let measurement = json!({"echo_legs":echo_legs,"observer_cost":observer_cost,"binary_sha256":binary_sha256,"server_pid":owned_server_pid,"client_pids":session.clients.iter().map(|client|client.child.process_id()).collect::<Vec<_>>(),"base":session.base,"fanout_spread":report::summarize(&fanout,count,20_000_000),"newest_presented_load_generation":freshness,"load_events":load_events,"presented_load":presented_load,"transport":transport_result});
     let environment = json!({"offered_samples":count,"measurement_first_intended_ns":first_intended_ns,"measurement_last_intended_ns":last_intended_ns,"percentile_method":"nearest rank; p99.9 requires 10000 completions","clock":"host monotonic; observer includes scheduling and reconstruction","platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"profiler":"tracy-client 0.19.0; Tracy 0.14.1","scheduler_evidence":"unavailable in baseline mode","clock_validation_ns":[before,helper,after],"geometry":[120,40],"endpoint":"outer-PTY committed terminal bytes","budget_ns":20_000_000,"budget_kind":"diagnostic, not production SLO","binary":session.binary,"probe":session.probe});
     for fields in [metadata, measurement, environment] {
