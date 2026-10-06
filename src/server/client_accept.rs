@@ -8,23 +8,48 @@ use tracing::{debug, error, warn};
 use crate::ipc::LocalListener;
 use crate::server::client_transport::{self, ServerEvent};
 
+/// Actual accept return codes, also available to the opt-in render profiler.
+#[derive(Default)]
+pub(crate) struct AcceptStats {
+    pub(crate) attempted: u64,
+    pub(crate) accepted: u64,
+    pub(crate) would_block: u64,
+    pub(crate) interrupted: u64,
+    pub(crate) failed: u64,
+}
+
+impl AcceptStats {
+    fn record(&self) {
+        crate::render_prof::event("client.accept.drain");
+        crate::render_prof::counter("client.accept.attempted", self.attempted);
+        crate::render_prof::counter("client.accept.accepted", self.accepted);
+        crate::render_prof::counter("client.accept.would_block", self.would_block);
+        crate::render_prof::counter("client.accept.interrupted", self.interrupted);
+        crate::render_prof::counter("client.accept.failed", self.failed);
+    }
+}
+
 /// Accepts pending thin-client connections and starts their handshake readers.
 pub(crate) fn accept_pending_client_connections(
     listener: &LocalListener,
     next_client_id: &mut u64,
     should_quit: &Arc<AtomicBool>,
     server_event_tx: &mpsc::Sender<ServerEvent>,
-) -> io::Result<()> {
+) -> io::Result<AcceptStats> {
+    let mut stats = AcceptStats::default();
     loop {
         if should_quit.load(Ordering::Acquire) {
             break;
         }
+        stats.attempted += 1;
         match listener.accept() {
             Ok(stream) => {
+                stats.accepted += 1;
                 let client_id = *next_client_id;
                 *next_client_id = next_client_id.saturating_add(1);
 
                 if let Err(err) = stream.set_nonblocking(true) {
+                    crate::render_prof::event("client.accept.stream_setup_failed");
                     warn!(err = %err, "failed to set client stream nonblocking");
                     continue;
                 }
@@ -45,32 +70,55 @@ pub(crate) fn accept_pending_client_connections(
                     warn!(client_id, err = %err, "failed to spawn client connection thread; dropping connection");
                 }
             }
-            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                stats.would_block += 1;
+                break;
+            }
             Err(err) => {
+                if err.kind() == io::ErrorKind::Interrupted {
+                    stats.interrupted += 1;
+                } else {
+                    stats.failed += 1;
+                }
                 error!(err = %err, "client listener accept failed");
                 break;
             }
         }
     }
-
-    Ok(())
+    stats.record();
+    Ok(stats)
 }
 
 /// Drains pending thin-client connections without starting handshakes.
 ///
 /// During live handoff the old server must not let clients sit in the Unix
 /// listener backlog waiting for a welcome frame that will never be sent.
-pub(crate) fn reject_pending_client_connections(listener: &LocalListener) -> io::Result<()> {
+pub(crate) fn reject_pending_client_connections(
+    listener: &LocalListener,
+) -> io::Result<AcceptStats> {
+    let mut stats = AcceptStats::default();
     loop {
+        stats.attempted += 1;
         match listener.accept() {
-            Ok(_stream) => {}
-            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
+            Ok(_stream) => {
+                stats.accepted += 1;
+                crate::render_prof::event("client.accept.rejected");
+            }
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                stats.would_block += 1;
+                break;
+            }
             Err(err) => {
+                if err.kind() == io::ErrorKind::Interrupted {
+                    stats.interrupted += 1;
+                } else {
+                    stats.failed += 1;
+                }
                 error!(err = %err, "client listener reject failed");
                 break;
             }
         }
     }
-
-    Ok(())
+    stats.record();
+    Ok(stats)
 }
