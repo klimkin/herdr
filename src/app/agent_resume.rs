@@ -54,6 +54,11 @@ impl App {
         if self.next_agent_resume_at.is_some_and(|next| now < next) {
             return false;
         }
+        if !self.has_pending_agent_resumes() {
+            self.pending_agent_resume_deadline = None;
+            self.next_agent_resume_at = None;
+            return false;
+        }
         let pending = self.pending_agent_resume_candidates();
         let mut changed = false;
         for PendingAgentResumeCandidate {
@@ -105,6 +110,18 @@ impl App {
         let mut pending = Vec::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
             for (tab_idx, tab) in ws.tabs.iter().enumerate() {
+                if !tab.panes.values().any(|pane| {
+                    self.terminal_runtimes
+                        .get(&pane.attached_terminal_id)
+                        .is_none()
+                        && self
+                            .state
+                            .terminals
+                            .get(&pane.attached_terminal_id)
+                            .is_some_and(|terminal| terminal.pending_agent_resume_plan.is_some())
+                }) {
+                    continue;
+                }
                 for info in
                     self.pending_agent_resume_pane_infos(ws_idx, tab_idx, tab, terminal_area)
                 {
@@ -325,6 +342,9 @@ fn derived_pending_agent_resume_pane_infos(
     pane_gaps: bool,
     pane_outer_borders: bool,
 ) -> Vec<crate::layout::PaneInfo> {
+    #[cfg(test)]
+    tests::GEOMETRY_DERIVATIONS.with(|count| count.set(count.get() + 1));
+
     crate::ui::apply_pane_chrome(
         tab.layout.panes(terminal_area),
         pane_borders,
@@ -384,6 +404,11 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use super::*;
 
+    // Per-thread observer keeps geometry accounting isolated across App tests.
+    thread_local! {
+        pub(super) static GEOMETRY_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     #[cfg(unix)]
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -394,6 +419,212 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settled_agent_resumes_clear_due_timers_without_geometry() {
+        for pane_count in [1, 15] {
+            let mut app = test_app();
+            app.state.workspaces = (0..pane_count)
+                .map(|_| crate::workspace::Workspace::test_new("settled"))
+                .collect();
+            app.state.active = Some(0);
+            app.state.view.terminal_area = Rect::new(0, 0, 120, 40);
+            app.state.ensure_test_terminals();
+            assert_eq!(app.state.terminals.len(), pane_count);
+
+            let now = Instant::now();
+            let next = now + std::time::Duration::from_millis(100);
+            app.pending_agent_resume_deadline = Some(next);
+            app.next_agent_resume_at = Some(next);
+            GEOMETRY_DERIVATIONS.with(|count| count.set(0));
+
+            assert!(!app.start_pending_agent_resumes(now, true));
+            assert_eq!(app.pending_agent_resume_deadline, Some(next));
+            assert_eq!(app.next_agent_resume_at, Some(next));
+
+            for _ in 0..32 {
+                app.pending_agent_resume_deadline = Some(next);
+                app.next_agent_resume_at = Some(next);
+                assert!(!app.start_pending_agent_resumes(next, true));
+                assert!(app.pending_agent_resume_deadline.is_none());
+                assert!(app.next_agent_resume_at.is_none());
+                assert!(app.session_save_deadline.is_none());
+                assert_eq!(app.terminal_runtimes.len(), 0);
+                assert!(app.state.terminals.values().all(|terminal| {
+                    terminal.pending_agent_resume_plan.is_none()
+                        && terminal.restore_error.is_none()
+                        && terminal.revision == 0
+                }));
+            }
+            assert_eq!(GEOMETRY_DERIVATIONS.with(std::cell::Cell::get), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_agent_resumes_skip_unrelated_tabs_and_preserve_restore_outcomes() {
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        let mut workspace = crate::workspace::Workspace::test_new("mixed");
+        let settled_id = workspace
+            .terminal_id(workspace.tabs[0].root_pane)
+            .cloned()
+            .unwrap();
+        let pending_tab = workspace.test_add_tab(Some("pending"));
+        let pending_id = workspace.tabs[pending_tab]
+            .terminal_id(workspace.tabs[pending_tab].root_pane)
+            .cloned()
+            .unwrap();
+        let running_tab = workspace.test_add_tab(Some("running"));
+        let running_id = workspace.tabs[running_tab]
+            .terminal_id(workspace.tabs[running_tab].root_pane)
+            .cloned()
+            .unwrap();
+        let missing_state_tab = workspace.test_add_tab(Some("missing-state"));
+        let missing_state_id = workspace.tabs[missing_state_tab]
+            .terminal_id(workspace.tabs[missing_state_tab].root_pane)
+            .cloned()
+            .unwrap();
+        let missing_pane_tab = workspace.test_add_tab(Some("missing-pane"));
+        let missing_pane_id = workspace.tabs[missing_pane_tab].root_pane;
+        let missing_pane_terminal = workspace.tabs[missing_pane_tab]
+            .terminal_id(missing_pane_id)
+            .cloned()
+            .unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.view.terminal_area = Rect::new(0, 0, 120, 40);
+        app.state.ensure_test_terminals();
+        app.state.terminals.remove(&missing_state_id);
+        app.state.workspaces[0].tabs[missing_pane_tab]
+            .panes
+            .remove(&missing_pane_id);
+
+        let missing_cwd = std::env::current_dir()
+            .unwrap()
+            .join("__missing_resume_cwd__");
+        assert!(!missing_cwd.exists());
+        let session = crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("mixed-resume").unwrap(),
+        };
+        for id in [&pending_id, &running_id, &missing_pane_terminal] {
+            let terminal = app.state.terminals.get_mut(id).unwrap();
+            terminal.cwd = missing_cwd.clone();
+            terminal.persisted_agent_session = Some(session.clone());
+            terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "codex".into(),
+                argv: long_running_test_argv(),
+                dedupe_key: id.to_string(),
+            });
+        }
+        let (runtime, _input) = crate::terminal::TerminalRuntime::test_with_channel(120, 40);
+        app.terminal_runtimes.insert(running_id.clone(), runtime);
+        let now = Instant::now();
+        GEOMETRY_DERIVATIONS.with(|count| count.set(0));
+
+        app.sync_pending_agent_resume_deadline(now);
+        assert_eq!(
+            app.pending_agent_resume_deadline,
+            Some(now + super::super::PENDING_AGENT_RESUME_THEME_WAIT)
+        );
+        assert_eq!(GEOMETRY_DERIVATIONS.with(std::cell::Cell::get), 1);
+        GEOMETRY_DERIVATIONS.with(|count| count.set(0));
+        assert!(!app.start_pending_agent_resumes(now, false));
+        assert!(app.state.terminals[&pending_id]
+            .pending_agent_resume_plan
+            .is_some());
+        assert!(app.session_save_deadline.is_none());
+        assert_eq!(GEOMETRY_DERIVATIONS.with(std::cell::Cell::get), 2);
+        GEOMETRY_DERIVATIONS.with(|count| count.set(0));
+
+        assert!(app.start_pending_agent_resumes(now, true));
+        assert!(app.state.terminals[&pending_id]
+            .pending_agent_resume_plan
+            .is_none());
+        assert!(app.state.terminals[&pending_id].restore_error.is_some());
+        assert_eq!(
+            app.state.terminals[&pending_id]
+                .persisted_agent_session
+                .as_ref(),
+            Some(&session)
+        );
+        assert!(app.terminal_runtimes.get(&pending_id).is_none());
+        assert!(app.session_save_deadline.is_some());
+        assert!(app.pending_agent_resume_deadline.is_none());
+        assert_eq!(
+            app.next_agent_resume_at,
+            Some(now + app.startup_per_agent_delay)
+        );
+        assert_eq!(GEOMETRY_DERIVATIONS.with(std::cell::Cell::get), 1);
+        assert!(app.state.terminals[&settled_id].restore_error.is_none());
+        assert!(app.state.terminals[&running_id]
+            .pending_agent_resume_plan
+            .is_some());
+        assert!(app.state.terminals[&running_id].restore_error.is_none());
+        assert!(app.terminal_runtimes.get(&running_id).is_some());
+        assert!(app.state.terminals[&missing_pane_terminal]
+            .pending_agent_resume_plan
+            .is_some());
+        assert!(app.state.terminals[&missing_pane_terminal]
+            .restore_error
+            .is_none());
+        assert!(!app.state.terminals.contains_key(&missing_state_id));
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_agent_resume_waits_for_nonzero_area_without_changing_plan() {
+        for area in [Rect::new(0, 0, 0, 40), Rect::new(0, 0, 120, 0)] {
+            let mut app = test_app();
+            let workspace = crate::workspace::Workspace::test_new("no-area");
+            let terminal_id = workspace
+                .terminal_id(workspace.tabs[0].root_pane)
+                .cloned()
+                .unwrap();
+            app.state.workspaces = vec![workspace];
+            app.state.active = Some(0);
+            app.state.view.terminal_area = area;
+            app.state.ensure_test_terminals();
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "codex".into(),
+                argv: long_running_test_argv(),
+                dedupe_key: "no-area".into(),
+            });
+            let now = Instant::now();
+            app.pending_agent_resume_deadline = Some(now);
+            app.next_agent_resume_at = Some(now);
+            GEOMETRY_DERIVATIONS.with(|count| count.set(0));
+
+            app.sync_pending_agent_resume_deadline(now);
+            assert!(!app.start_pending_agent_resumes(now, true));
+            assert!(app.pending_agent_resume_deadline.is_none());
+            assert_eq!(app.next_agent_resume_at, Some(now));
+            assert!(app.session_save_deadline.is_none());
+            assert_eq!(app.terminal_runtimes.len(), 0);
+            let terminal = &app.state.terminals[&terminal_id];
+            assert_eq!(
+                terminal
+                    .pending_agent_resume_plan
+                    .as_ref()
+                    .unwrap()
+                    .dedupe_key,
+                "no-area"
+            );
+            assert!(terminal.restore_error.is_none());
+            assert_eq!(terminal.revision, 0);
+            assert_eq!(GEOMETRY_DERIVATIONS.with(std::cell::Cell::get), 0);
+        }
     }
 
     #[tokio::test]
