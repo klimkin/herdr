@@ -17,6 +17,7 @@ use crate::pty::fd;
 // normal responsiveness.
 const ACTOR_IDLE_POLL_MS: i32 = 1000;
 const ACTOR_COMMAND_BUFFER: usize = 1024;
+const ACTOR_READ_BUFFER_SIZE: usize = 8192;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,6 +426,7 @@ impl PtyIoActor {
             diagnostic_input: crate::latency_prof::InputStimuli::default(),
             pane_id: config.pane_id,
             file: master,
+            read_buffer: [0; ACTOR_READ_BUFFER_SIZE],
             data_rx,
             control_rx,
             state: if config.initially_quiesced {
@@ -463,6 +465,8 @@ impl PtyIoActor {
 struct PtyIoActorRunner {
     pane_id: u32,
     file: Arc<std::fs::File>,
+    // Reuse initialized storage across normal reads and pre-handoff draining.
+    read_buffer: [u8; ACTOR_READ_BUFFER_SIZE],
     data_rx: mpsc::Receiver<PtyIoDataCommand>,
     control_rx: std_mpsc::Receiver<PtyIoControlCommand>,
     state: ActorState,
@@ -831,8 +835,7 @@ impl PtyIoActorRunner {
 
     fn read_once(&mut self) -> bool {
         crate::latency_prof::zone!("pty.read_batch");
-        let mut buf = [0u8; 8192];
-        match self.file.as_ref().read(&mut buf) {
+        match self.file.as_ref().read(&mut self.read_buffer) {
             Ok(0) => false,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => true,
@@ -846,7 +849,7 @@ impl PtyIoActorRunner {
                 let _order = response_order
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let result = (self.on_read)(&buf[..n]);
+                let result = (self.on_read)(&self.read_buffer[..n]);
                 self.controls
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1129,6 +1132,7 @@ mod tests {
             diagnostic_input: crate::latency_prof::InputStimuli::default(),
             pane_id: 1,
             file: Arc::new(std::fs::File::from(owned)),
+            read_buffer: [0; ACTOR_READ_BUFFER_SIZE],
             data_rx,
             control_rx,
             state: ActorState::Running,
@@ -1701,6 +1705,145 @@ mod tests {
     }
 
     #[test]
+    fn actor_delivers_only_new_bytes_across_alternating_read_lengths() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer timeout");
+        let (read_tx, read_rx) = std_mpsc::channel();
+        runner.on_read = Box::new(move |bytes| {
+            read_tx
+                .send(Bytes::copy_from_slice(bytes))
+                .expect("read receiver alive");
+            PtyReadResult {
+                terminal_responses: vec![Bytes::copy_from_slice(bytes)],
+            }
+        });
+
+        for payload in [
+            vec![0xA5; 8192],
+            b"x".to_vec(),
+            b"short".to_vec(),
+            vec![0x5A; 8191],
+            b"end".to_vec(),
+        ] {
+            peer.write_all(&payload).expect("peer output");
+            let mut delivered = Vec::new();
+            while delivered.len() < payload.len() {
+                assert!(runner.read_once(), "actor stays readable");
+                delivered.extend(read_rx.try_recv().expect("callback receives pending bytes"));
+                while !runner.pending_writes.is_empty() {
+                    runner
+                        .flush_pending_writes_once()
+                        .expect("terminal response writes");
+                }
+            }
+            assert_eq!(delivered, payload, "callback receives exact output");
+            let mut response = vec![0; payload.len()];
+            peer.read_exact(&mut response).expect("terminal response");
+            assert_eq!(response, payload, "terminal responses preserve byte order");
+
+            assert!(runner.read_once(), "WouldBlock keeps actor alive");
+            assert!(matches!(
+                read_rx.try_recv(),
+                Err(std_mpsc::TryRecvError::Empty)
+            ));
+        }
+
+        peer.shutdown(std::net::Shutdown::Write).expect("peer EOF");
+        assert!(!runner.read_once(), "EOF terminates reading");
+        assert!(matches!(
+            read_rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn actor_stops_after_fatal_read_error_without_delivering_old_bytes() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        let (read_tx, read_rx) = std_mpsc::channel();
+        runner.on_read = Box::new(move |bytes| {
+            read_tx
+                .send(Bytes::copy_from_slice(bytes))
+                .expect("read receiver alive");
+            PtyReadResult::empty()
+        });
+        peer.write_all(b"previous-output").expect("peer output");
+        assert!(runner.read_once());
+        assert_eq!(
+            read_rx.try_recv().expect("callback output"),
+            b"previous-output"[..]
+        );
+
+        runner.file = Arc::new(std::fs::File::open(".").expect("directory descriptor"));
+        assert!(
+            !runner.read_once(),
+            "reading directory is a fatal I/O error"
+        );
+        assert!(matches!(
+            read_rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn handoff_drain_delivers_short_output_after_full_normal_read() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer timeout");
+        let (read_tx, read_rx) = std_mpsc::channel();
+        runner.on_read = Box::new(move |bytes| {
+            read_tx
+                .send(Bytes::copy_from_slice(bytes))
+                .expect("read receiver alive");
+            PtyReadResult::empty()
+        });
+        peer.write_all(&[0xA5; 8192]).expect("normal output");
+        let mut normal = Vec::new();
+        while normal.len() < 8192 {
+            assert!(runner.read_once());
+            normal.extend(read_rx.try_recv().expect("normal callback"));
+        }
+        assert_eq!(normal, vec![0xA5; 8192]);
+
+        let mut prefilled = 0;
+        loop {
+            match runner.file.as_ref().write(&[0xBB; 8192]) {
+                Ok(written) => prefilled += written,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("fill actor write buffer: {err}"),
+            }
+        }
+        assert!(prefilled > 0);
+        runner.enqueue_write(Bytes::from_static(b"drained"));
+        let handoff = std::thread::spawn(move || {
+            runner.begin_handoff().expect("handoff drains writes");
+            runner
+        });
+
+        for payload in [b"x".as_slice(), b"short".as_slice()] {
+            peer.write_all(payload)
+                .expect("output during handoff drain");
+            let mut delivered = Vec::new();
+            while delivered.len() < payload.len() {
+                delivered.extend(
+                    read_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .expect("handoff drains output while input is blocked"),
+                );
+            }
+            assert_eq!(delivered, payload);
+        }
+
+        let mut input = vec![0; prefilled + 7];
+        peer.read_exact(&mut input)
+            .expect("peer drains queued input");
+        assert!(input[..prefilled].iter().all(|byte| *byte == 0xBB));
+        assert_eq!(&input[prefilled..], b"drained");
+        let runner = handoff.join().expect("handoff joins");
+        assert_eq!(runner.state, ActorState::Quiesced);
+    }
+
+    #[test]
     fn begin_handoff_stops_reads_and_rejects_user_writes_until_rollback() {
         let (handle, mut peer, read_rx) = actor_with_socket_pair(false);
 
@@ -1835,6 +1978,7 @@ mod tests {
             diagnostic_input: crate::latency_prof::InputStimuli::default(),
             pane_id: 1,
             file: Arc::new(std::fs::File::from(owned)),
+            read_buffer: [0; ACTOR_READ_BUFFER_SIZE],
             data_rx,
             control_rx,
             state: ActorState::Running,
@@ -1977,6 +2121,7 @@ mod tests {
             file: Arc::new(std::fs::File::from(unsafe {
                 OwnedFd::from_raw_fd(actor_socket.into_raw_fd())
             })),
+            read_buffer: [0; ACTOR_READ_BUFFER_SIZE],
             data_rx,
             control_rx,
             state: ActorState::Running,
