@@ -12,10 +12,8 @@ use tracing::{debug, warn};
 
 use crate::pty::fd;
 
-// Actor handle methods must call wake_actor() after queuing work. The idle
-// timeout is only a fallback for missed wakes; PTY and wake readiness drive
-// normal responsiveness.
-const ACTOR_IDLE_POLL_MS: i32 = 1000;
+// Queue work before waking. Final handle drop closes the wake writer, so HUP
+// also wakes an idle or quiesced actor and exposes disconnected commands.
 const ACTOR_COMMAND_BUFFER: usize = 1024;
 const ACTOR_READ_BUFFER_SIZE: usize = 8192;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -960,13 +958,13 @@ impl PtyIoActorRunner {
             ..
         }) = self.active_submission.as_ref()
         else {
-            return ACTOR_IDLE_POLL_MS;
+            return -1;
         };
         deadline
             .saturating_duration_since(Instant::now())
             .as_millis()
             .max(1)
-            .min(ACTOR_IDLE_POLL_MS as u128) as i32
+            .min(i32::MAX as u128) as i32
     }
 
     fn fail_active_submission(&mut self, err: std::io::Error) {
@@ -1251,6 +1249,29 @@ mod tests {
             );
             assert!(observer.master.upgrade().is_none());
         }
+    }
+
+    #[test]
+    fn idle_running_and_quiesced_actors_have_no_poll_deadline() {
+        for initially_quiesced in [false, true] {
+            let (handle, _peer, _read_rx, events, resume) = paused_actor(initially_quiesced);
+            let timeout_ms = expect_actor_wait(&events);
+            handle.shutdown();
+            drop(resume);
+            assert_eq!(timeout_ms, -1, "idle actor waits for explicit readiness");
+        }
+        let (mut runner, _peer) = actor_runner_for_unit_test();
+        let (reply, _completion) = std_mpsc::channel();
+        runner.active_submission = Some(ActiveSubmission {
+            enter: Bytes::from_static(b"\r"),
+            delay: Duration::from_secs(30),
+            phase: SubmissionPhase::WaitingUntil(Instant::now() + Duration::from_secs(30)),
+            reply,
+        });
+        assert!(
+            runner.poll_timeout_ms() > 1000,
+            "real submission deadline has no idle-poll cap"
+        );
     }
 
     #[test]
