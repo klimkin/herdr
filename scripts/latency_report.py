@@ -94,6 +94,24 @@ def input_actor_path(records, identity, pid, start, end):
                        'trace loss may omit contributing identity links']}
 
 
+def process_trace_complete(records, pid, trace_audit=None):
+    if trace_audit is not None:
+        process = next((item for item in trace_audit.get("processes", []) if item["pid"] == pid), None)
+        return bool(process and process.get("complete"))
+    events = [item for item in records if item["pid"] == pid]
+    finished = [item for item in events if item["stage"] == "process.finish"]
+    return (len(finished) == 1 and not any(item.get("dropped", 0) for item in events)
+            and events[-1]["stage"] == "process.finish"
+            and all(item["ns"] <= finished[0]["ns"] for item in events))
+
+
+def helper_clock_verified(run):
+    bracket = run.get("clock_validation_ns", [])
+    return (run.get("clock", "").startswith("host monotonic") and len(bracket) == 3
+            and all(type(value) is int for value in bracket)
+            and 0 < bracket[0] <= bracket[1] <= bracket[2])
+
+
 def mapped_connection(records, queue, client_pid, trace_audit=None):
     """Native peer PIDs prove only a unique captured connection per PID pair.
 
@@ -244,7 +262,24 @@ def critical_paths(run, records, trace_audit=None):
                     state_ready = stimulus["ns"] if stimulus else action_commit["ns"] if action_commit else start
                     gate = gate_window(queue["pid"], state_ready, surface["ns"])
                     forward = {}
+                    actor_input = None
+                    helper_received = None
                     if run["path"]=="echo":
+                        actor_input = input_actor_path(records, identity, queue["pid"], start, surface["ns"])
+                        trace_complete = process_trace_complete(records, queue["pid"], trace_audit)
+                        actor_input["trace_complete"] = trace_complete
+                        if actor_input["attribution"] == "complete contributing accepted parts" and not trace_complete:
+                            actor_input["attribution"] = "incomplete trace for contributing parts"
+                        clock_verified = helper_clock_verified(run)
+                        actor_input["helper_clock_verified"] = clock_verified
+                        helper_stamp = sample.get("helper_received_ns")
+                        if clock_verified and helper_stamp is not None and start <= helper_stamp <= surface["ns"]:
+                            helper_received = helper_stamp
+                        written_input = actor_input.get("final_write_complete_ns")
+                        actor_input["write_complete_to_helper_received_ns"] = (
+                            helper_received - written_input
+                            if actor_input["attribution"] == "complete contributing accepted parts"
+                            and helper_received is not None and written_input is not None and helper_received >= written_input else None)
                         for stage in ("input.stdin_stimulus","input.client_frame","input.server_frame","input.server_dispatch","input.pty_write_complete"):
                             match = next((item for item in stages[stage] if item["id"]==identity and start<=item["ns"]<=surface["ns"]),None)
                             if match:
@@ -266,11 +301,12 @@ def critical_paths(run, records, trace_audit=None):
                                   "terminal_ready_ns":stimulus["ns"] if stimulus else None,
                                   "terminal_revision":stimulus["value"] if stimulus else None,
                                   "surface_content_revision":surface["value"], "surface_ns":surface["ns"],"presentation_gate":gate,"forward_boundaries":forward,"action_commit_ns":action_commit["ns"] if action_commit else None,
+                                  "actor_input":actor_input,"helper_received_ns":helper_received,
                                   "enqueue_ns":queue["enqueue_ns"],"claim_ns":queue["claim_ns"],
                                   "queue_ns":queue["queue_ns"],"socket_start_ns":write_start,"socket_complete_ns":written,
                                   "client_receive_ns":receive,"client_output_ns":output["ns"],
                                   "outer_observed_ns":observed,
-                                  "unavailable":["CPU versus off-CPU", "PTY submission queue residence"] + ([] if gate else ["per-stimulus selected gate"]) + ([] if client_index is not None else ["client index mapping"])})
+                                  "unavailable":["CPU versus off-CPU"] + ([] if actor_input and actor_input["attribution"] == "complete contributing accepted parts" else ["PTY submission queue residence"]) + ([] if gate else ["per-stimulus selected gate"]) + ([] if client_index is not None else ["client index mapping"])})
     return paths
 
 
@@ -286,6 +322,64 @@ def distribution(values, denominator):
             "p99_ns": percentile(.99),
             "p999_ns": percentile(.999) if len(ordered) >= 10_000 else None,
             "max_ns": ordered[-1] if ordered else None}
+
+
+def input_distributions(run, paths):
+    """Summarize accepted command/part units without weighting client fanout."""
+    if run["path"] != "echo":
+        return None
+    completed = {sample["identity"] for sample in run["samples"] if any(value is not None for value in sample["observed_ns"])}
+    actors = defaultdict(list)
+    for path in paths:
+        actor = path.get("actor_input")
+        if path["identity"] in completed and actor:
+            key = (path["identity"], path["server_pid"])
+            if actor not in actors[key]:
+                actors[key].append(actor)
+    values = defaultdict(list)
+    matched = defaultdict(set)
+    unit_counts = defaultdict(int)
+    complete_probes = set()
+    for key, candidates in actors.items():
+        if len(candidates) != 1:
+            continue
+        actor = candidates[0]
+        if not actor.get("trace_complete") or actor["attribution"] != "complete contributing accepted parts":
+            continue
+        complete_probes.add(key[0])
+        commands, parts = set(), set()
+        for part in actor["parts"]:
+            command = (part["scope"], part["command_id"])
+            if command not in commands:
+                commands.add(command)
+                unit_counts["command_queue"] += 1
+                if part["command_queue_ns"] is not None:
+                    values["command_queue"].append(part["command_queue_ns"])
+                    matched["command_queue"].add(key[0])
+            part_key = (part["scope"], part["part_id"])
+            if part_key in parts:
+                continue
+            parts.add(part_key)
+            for name in ("claim_to_pending", "pending_to_attempt", "attempt_to_complete"):
+                unit_counts[name] += 1
+                if part[name + "_ns"] is not None:
+                    values[name].append(part[name + "_ns"])
+                    matched[name].add(key[0])
+        unit_counts["write_complete_to_helper_received"] += 1
+        elapsed = actor.get("write_complete_to_helper_received_ns")
+        if elapsed is not None:
+            values["write_complete_to_helper_received"].append(elapsed)
+            matched["write_complete_to_helper_received"].add(key[0])
+    stages = {}
+    for name in ("command_queue", "claim_to_pending", "pending_to_attempt", "attempt_to_complete", "write_complete_to_helper_received"):
+        stages[name] = {**distribution(values[name], unit_counts[name]),
+                        "probe_denominator": len(completed), "matched_probes": len(matched[name]),
+                        "unassigned_probes": len(completed) - len(matched[name]),
+                        "unit": "accepted command" if name == "command_queue" else "echo probe" if name == "write_complete_to_helper_received" else "accepted part"}
+    return {"coverage": {"completed_echo_probes": len(completed), "matched_actor_probes": len(complete_probes),
+                         "unassigned_echo_probes": len(completed) - len(complete_probes)},
+            "stages": stages,
+            "semantics": "Command residence counts one command per probe; part stages count contributing accepted parts once. Fanout cannot multiply input samples. Parts may overlap; percentiles are not additive. Write acceptance and helper consumption can overlap; negative intervals remain unavailable."}
 
 
 # Pipeline intervals form a partition only when all boundaries are present and
@@ -549,6 +643,7 @@ def main():
     pairs = pair_stages(records)
     paths = critical_paths(run, records, trace_audit)
     stage_report = stage_distributions(run, paths)
+    input_report = input_distributions(run, paths)
     coverage = stage_report["coverage"]
     lines.extend(["", f"Uniquely attributed effects: {coverage['uniquely_attributed_effects']} / {coverage['completed_effects']} completed; {coverage['offered_effects']} offered.",
                   f"Unassigned completed effects: {coverage['unassigned_completed_effects']}; multiple causal candidates: {coverage['ambiguous_completed_effects']}.",
@@ -560,6 +655,14 @@ def main():
         lines.append(f"| {name} | {summary['sample_count']} / {summary['denominator']} | {' | '.join(rendered)} | {summary['accounting']} |")
     lines.extend(["", "Stage distributions use uniquely matched completed effects; per-stage percentiles are not additive. Socket-write duration overlaps delivery and is excluded from pipeline accounting.",
                   "CPU versus off-CPU remains unassigned; frame-to-surface and client-work intervals include scheduling and nested work."])
+    if input_report is not None:
+        lines.extend(["", "| Input stage | Matched probes / completed | Matched units | Unit | p50 ms | p95 ms | p99 ms |",
+                      "|---|---:|---:|---|---:|---:|---:|"])
+        for name, summary in input_report["stages"].items():
+            rendered = [f"{summary[field] / 1e6:.3f}" if summary[field] is not None else "unavailable"
+                        for field in ("p50_ns", "p95_ns", "p99_ns")]
+            lines.append(f"| {name} | {summary['matched_probes']} / {summary['probe_denominator']} | {summary['sample_count']} | {summary['unit']} | {' | '.join(rendered)} |")
+        lines.extend(["", input_report["semantics"]])
     if paths:
         worst_path = max(paths,key=lambda path:path["client_output_ns"]-path["start_ns"])
         effect = next((effect for effect in stage_report["effects"]
@@ -580,7 +683,7 @@ def main():
         lines.extend(["", trace_audit["semantics"]])
     if args.output:
         args.output.with_suffix(".json").write_text(json.dumps({"queue_pairs": pairs,"critical_paths":paths,
-            "stage_report":stage_report,"trace_audit":trace_audit,"freshness":freshness(run),
+            "stage_report":stage_report,"input_report":input_report,"trace_audit":trace_audit,"freshness":freshness(run),
             "max_consecutive_deadline_misses":miss_bursts(run)}, indent=2)+"\n")
     lines.extend(["", "Queue pairing uses process and queue identity plus content fingerprints. Causal paths require terminal/snapshot links and client write completion. Ambiguous links remain unassigned.",
                   "", "Results include observer and host scheduling. No pixel, GPU, remote one-way, or production-SLO claim.", ""])
