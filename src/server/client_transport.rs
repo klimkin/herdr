@@ -147,7 +147,7 @@ impl ClientWriter {
         let mut frames = state.control.drain(..).collect::<Vec<_>>();
         frames.extend(state.ordered.drain(..));
         frames.extend(state.render.take());
-        frames
+        frames.into_iter().map(|frame| frame.bytes).collect()
     }
 
     #[cfg(test)]
@@ -177,8 +177,8 @@ impl ClientWriter {
         std::thread::spawn(move || {
             while let Some(item) = drain.recv() {
                 let sent = match item {
-                    ClientWriteItem::Control(data) => control.send(data).is_ok(),
-                    ClientWriteItem::Render(data) => render.send(data).is_ok(),
+                    ClientWriteItem::Control(data) => control.send(data.bytes).is_ok(),
+                    ClientWriteItem::Render(data) => render.send(data.bytes).is_ok(),
                 };
                 if !sent {
                     break;
@@ -276,18 +276,66 @@ struct ClientWriterQueue {
 
 #[derive(Debug, Default)]
 struct ClientWriterQueueState {
-    control: VecDeque<Vec<u8>>,
-    ordered: VecDeque<Vec<u8>>,
-    render: Option<Vec<u8>>,
+    control: VecDeque<QueuedClientData>,
+    ordered: VecDeque<QueuedClientData>,
+    render: Option<QueuedClientData>,
     senders: usize,
     writer_alive: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 enum ClientWriteItem {
-    Control(Vec<u8>),
-    Render(Vec<u8>),
+    Control(QueuedClientData),
+    Render(QueuedClientData),
 }
+
+/// Diagnostic metadata follows one accepted item across queue reordering.
+#[derive(Debug)]
+struct QueuedClientData {
+    bytes: Vec<u8>,
+    #[cfg(feature = "latency-prof")]
+    frames: Vec<crate::latency_prof::QueuedFrame>,
+}
+impl QueuedClientData {
+    fn new(bytes: Vec<u8>, connection: u64) -> Self {
+        #[cfg(not(feature = "latency-prof"))]
+        let _ = connection;
+        Self {
+            #[cfg(feature = "latency-prof")]
+            frames: crate::latency_prof::queued_frames(&bytes, connection),
+            bytes,
+        }
+    }
+    fn diagnostics(&self) -> Vec<crate::latency_prof::QueuedFrame> {
+        #[cfg(feature = "latency-prof")]
+        {
+            self.frames.clone()
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        {
+            Vec::new()
+        }
+    }
+    fn frames(&self) -> &[crate::latency_prof::QueuedFrame] {
+        #[cfg(feature = "latency-prof")]
+        {
+            &self.frames
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        {
+            &[]
+        }
+    }
+}
+#[cfg(test)]
+impl PartialEq for QueuedClientData {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+#[cfg(test)]
+impl Eq for QueuedClientData {}
 
 impl ClientWriterQueue {
     fn new() -> Arc<Self> {
@@ -337,41 +385,53 @@ impl ClientWriterQueue {
     }
 
     fn send_control(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
-        let ids = crate::latency_prof::frame_ids(&data);
+        let data = QueuedClientData::new(data, self.scope());
+        let ids = data.diagnostics();
         let mut state = self.lock_state();
         if !state.writer_alive {
-            return Err(SendError(data));
+            return Err(SendError(data.bytes));
         }
         let enqueued_ns = crate::latency_prof::now();
         state.control.push_back(data);
 
         drop(state);
-        crate::latency_prof::emit_frames("server.enqueue", &ids, self.scope() * 2, enqueued_ns);
+        crate::latency_prof::emit_queued_frames(
+            "server.enqueue",
+            &ids,
+            self.scope() * 2,
+            enqueued_ns,
+        );
         self.ready.notify_one();
         Ok(())
     }
 
     fn try_send_render(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
-        let ids = crate::latency_prof::frame_ids(&data);
+        let data = QueuedClientData::new(data, self.scope());
+        let ids = data.diagnostics();
         let mut state = self.lock_state();
         if !state.writer_alive {
-            return Err(TrySendError::Disconnected(data));
+            return Err(TrySendError::Disconnected(data.bytes));
         }
         if state.render.is_some() {
             drop(state);
-            crate::latency_prof::emit_frames(
+            crate::latency_prof::emit_queued_frames(
                 "server.render_deferred",
-                &ids,
+                data.frames(),
                 self.scope() * 2 + 1,
                 crate::latency_prof::now(),
             );
-            return Err(TrySendError::Full(data));
+            return Err(TrySendError::Full(data.bytes));
         }
         let enqueued_ns = crate::latency_prof::now();
         state.render = Some(data);
 
         drop(state);
-        crate::latency_prof::emit_frames("server.enqueue", &ids, self.scope() * 2 + 1, enqueued_ns);
+        crate::latency_prof::emit_queued_frames(
+            "server.enqueue",
+            &ids,
+            self.scope() * 2 + 1,
+            enqueued_ns,
+        );
         self.ready.notify_one();
         Ok(())
     }
@@ -393,13 +453,14 @@ impl ClientWriterQueue {
     }
 
     fn send_ordered(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
-        let ids = crate::latency_prof::frame_ids(&data);
+        let data = QueuedClientData::new(data, self.scope());
+        let ids = data.diagnostics();
         let mut state = self.lock_state();
         if !state.writer_alive {
-            return Err(TrySendError::Disconnected(data));
+            return Err(TrySendError::Disconnected(data.bytes));
         }
         if !state.ordered.is_empty() {
-            return Err(TrySendError::Full(data));
+            return Err(TrySendError::Full(data.bytes));
         }
         if let Some(older) = state.render.take() {
             state.ordered.push_back(older);
@@ -407,7 +468,12 @@ impl ClientWriterQueue {
         let enqueued_ns = crate::latency_prof::now();
         state.ordered.push_back(data);
         drop(state);
-        crate::latency_prof::emit_frames("server.enqueue", &ids, self.scope() * 2 + 1, enqueued_ns);
+        crate::latency_prof::emit_queued_frames(
+            "server.enqueue",
+            &ids,
+            self.scope() * 2 + 1,
+            enqueued_ns,
+        );
         self.ready.notify_one();
         Ok(())
     }
@@ -925,6 +991,8 @@ pub(crate) fn handle_client_handshake(
 
     // Create separate channels for reliable control messages and droppable renders.
     let writer_queue = ClientWriterQueue::new();
+    #[cfg(feature = "latency-prof")]
+    crate::latency_prof::server_connection(&stream, writer_queue.scope(), client_id);
     let writer = ClientWriter {
         control: ClientControlWriter::queue(writer_queue.clone()),
         render: ClientRenderWriter::queue(writer_queue.clone()),
@@ -1023,37 +1091,30 @@ fn client_writer_loop(
     writer_queue: Arc<ClientWriterQueue>,
     server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
+    #[cfg(feature = "latency-prof")]
+    let mut offset = 0u64;
     while let Some(item) = writer_queue.recv() {
-        let written = match item {
-            ClientWriteItem::Control(data) => {
-                let ids = crate::latency_prof::frame_ids(&data);
-                crate::latency_prof::emit_frames(
-                    "server.writer_claim",
-                    &ids,
-                    writer_queue.scope() * 2,
-                    writer_queue.claim_time(),
-                );
-                write_scoped_bytes_after_claim(&mut stream, &data, writer_queue.scope() * 2, &ids)
-            }
-            ClientWriteItem::Render(data) => {
-                let ids = crate::latency_prof::frame_ids(&data);
-                crate::latency_prof::emit_frames(
-                    "server.writer_claim",
-                    &ids,
-                    writer_queue.scope() * 2 + 1,
-                    writer_queue.claim_time(),
-                );
-                let _ =
-                    server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
-                write_scoped_bytes_after_claim(
-                    &mut stream,
-                    &data,
-                    writer_queue.scope() * 2 + 1,
-                    &ids,
-                )
-            }
+        let (data, scope, render) = match item {
+            ClientWriteItem::Control(data) => (data, writer_queue.scope() * 2, false),
+            ClientWriteItem::Render(data) => (data, writer_queue.scope() * 2 + 1, true),
         };
-        if !written {
+        #[cfg(feature = "latency-prof")]
+        let mut data = data;
+        #[cfg(feature = "latency-prof")]
+        for frame in &mut data.frames {
+            frame.identity.offset = offset;
+            offset = offset.saturating_add(frame.len + 4);
+        }
+        crate::latency_prof::emit_queued_frames(
+            "server.writer_claim",
+            data.frames(),
+            scope,
+            writer_queue.claim_time(),
+        );
+        if render {
+            let _ = server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
+        }
+        if !write_scoped_bytes_after_claim(&mut stream, &data.bytes, scope, data.frames()) {
             let _ = server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
             break;
         }
@@ -1068,8 +1129,8 @@ fn write_framed_bytes(stream: &mut LocalStream, data: &[u8]) -> bool {
 }
 #[cfg(test)]
 fn write_scoped_bytes(stream: &mut LocalStream, data: &[u8], scope: u64) -> bool {
-    let ids = crate::latency_prof::frame_ids(data);
-    crate::latency_prof::emit_frames(
+    let ids = crate::latency_prof::queued_frames(data, 0);
+    crate::latency_prof::emit_queued_frames(
         "server.writer_claim",
         &ids,
         scope,
@@ -1081,10 +1142,15 @@ fn write_scoped_bytes_after_claim(
     stream: &mut LocalStream,
     data: &[u8],
     scope: u64,
-    ids: &[(u64, u64)],
+    ids: &[crate::latency_prof::QueuedFrame],
 ) -> bool {
     crate::latency_prof::zone!("server.socket_write");
-    crate::latency_prof::emit_frames("server.write_start", ids, scope, crate::latency_prof::now());
+    crate::latency_prof::emit_queued_frames(
+        "server.write_start",
+        ids,
+        scope,
+        crate::latency_prof::now(),
+    );
     #[cfg(unix)]
     let result = crate::platform::write_client_stream(stream, data);
     #[cfg(windows)]
@@ -1093,7 +1159,7 @@ fn write_scoped_bytes_after_claim(
         debug!(err = %err, "client write failed, closing writer");
         return false;
     }
-    crate::latency_prof::emit_frames(
+    crate::latency_prof::emit_queued_frames(
         "server.write_complete",
         ids,
         scope,
@@ -1660,6 +1726,106 @@ mod tests {
         bytes
     }
 
+    #[cfg(feature = "latency-prof")]
+    #[test]
+    fn client_writer_trace_keeps_repeated_frame_occurrences() {
+        const CHILD: &str = "HERDR_WRITER_OCCURRENCE_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "herdr-writer-occurrences-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "server::client_transport::tests::client_writer_trace_keeps_repeated_frame_occurrences", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HERDR_LATENCY_TRACE_DIR", &root)
+                .env_remove("HERDR_TRACY")
+                .status().unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            assert!(status.success(), "writer occurrence subprocess failed");
+            return;
+        }
+        let (mut client, server, _path) = local_stream_pair("writer-occurrences");
+        let (writer, queue) = test_queue_writer();
+        crate::latency_prof::server_connection(&server, queue.scope(), 1);
+        let repeated = ServerMessage::WindowTitle {
+            title: Some("identical".into()),
+        };
+        let bytes = frame_server_message(&repeated);
+        writer.render.try_send(bytes.clone()).unwrap();
+        writer.render.send_ordered(bytes.clone()).unwrap();
+        writer.render.try_send(bytes.clone()).unwrap();
+        writer.discard_pending_render();
+        writer.control.send(bytes.clone()).unwrap();
+        writer.control.send(bytes.clone()).unwrap();
+        drop(writer);
+        let (event_tx, _events) = mpsc::channel(8);
+        let thread = std::thread::spawn(move || client_writer_loop(server, 1, queue, event_tx));
+        for _ in 0..2 {
+            let actual: ServerMessage =
+                protocol::read_message(&mut client, MAX_FRAME_SIZE).unwrap();
+            assert_eq!(actual, repeated);
+        }
+        assert!(matches!(
+            protocol::read_message::<_, ServerMessage>(&mut client, MAX_FRAME_SIZE),
+            Err(protocol::FramingError::UnexpectedEof)
+        ));
+        thread.join().unwrap();
+        crate::latency_prof::shutdown();
+        let root = std::path::PathBuf::from(std::env::var_os("HERDR_LATENCY_TRACE_DIR").unwrap());
+        let text =
+            std::fs::read_to_string(root.join(format!("{}.jsonl", std::process::id()))).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let writes: Vec<_> = records
+            .iter()
+            .filter(|record| record["stage"] == "server.write_complete")
+            .collect();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0]["offset"].as_u64(), Some(0));
+        assert_eq!(writes[1]["offset"].as_u64(), Some(bytes.len() as u64));
+        assert_ne!(writes[0]["occurrence"], writes[1]["occurrence"]);
+        assert_ne!(writes[0]["occurrence"], 0);
+        let connection = records
+            .iter()
+            .find(|record| record["stage"] == "server.connection")
+            .unwrap();
+        assert_eq!(connection["id"], writes[0]["connection"]);
+        assert_eq!(
+            connection["value"].as_u64(),
+            Some(u64::from(std::process::id()))
+        );
+        for write in writes {
+            let same: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    record["occurrence"] == write["occurrence"]
+                        && record["connection"] == write["connection"]
+                })
+                .collect();
+            for stage in [
+                "server.enqueue",
+                "server.writer_claim",
+                "server.write_start",
+                "server.write_complete",
+            ] {
+                assert_eq!(
+                    same.iter()
+                        .filter(|record| record["stage"] == stage)
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
     #[test]
     fn client_writer_queue_keeps_render_slot_bounded() {
         let (writer, _queue) = test_queue_writer();
@@ -1691,7 +1857,10 @@ mod tests {
         for expected in [b"old".as_slice(), b"direct", b"new"] {
             assert_eq!(
                 queue.recv(),
-                Some(ClientWriteItem::Render(expected.to_vec()))
+                Some(ClientWriteItem::Render(QueuedClientData::new(
+                    expected.to_vec(),
+                    0
+                )))
             );
         }
         queue.close_writer();

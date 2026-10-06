@@ -799,7 +799,7 @@ async fn run_client_loop(
             shell.tick_popup_pending(now);
         }
 
-        crate::latency_prof::set_delivery(0);
+        crate::latency_prof::set_delivery(crate::latency_prof::FrameIdentity::empty());
         match event {
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
             #[cfg(unix)]
@@ -1389,7 +1389,7 @@ async fn run_client_loop(
             }
             ClientLoopEvent::ServerMessage {
                 #[cfg(feature = "latency-prof")]
-                diagnostic_id,
+                diagnostic_frame,
                 endpoint_id,
                 generation,
                 message,
@@ -1398,7 +1398,7 @@ async fn run_client_loop(
                     continue;
                 }
                 #[cfg(feature = "latency-prof")]
-                crate::latency_prof::set_delivery(diagnostic_id);
+                crate::latency_prof::set_delivery(diagnostic_frame);
                 write_stream.received(&endpoint_id, generation, now);
                 // Retirements belong to the exact live connection, even after deactivation.
                 // They must not be dropped with frozen/inactive presentation effects.
