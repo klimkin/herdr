@@ -1,5 +1,7 @@
 use super::*;
 
+#[cfg(unix)]
+mod client_accept;
 mod event_fairness;
 mod native_graphics;
 #[path = "pane_move.rs"]
@@ -12,6 +14,8 @@ mod surface_delta_tests;
 mod surface_interest_tests;
 #[path = "surface_scroll.rs"]
 mod surface_scroll_tests;
+#[cfg(unix)]
+mod writer_feedback;
 
 fn client_shell_projection(
     receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
@@ -55,7 +59,7 @@ fn client_agent_view_projection(
     serde_json::from_str(&data).expect("decode client agent view projection")
 }
 
-fn test_headless_server() -> HeadlessServer {
+pub(super) fn test_headless_server() -> HeadlessServer {
     test_headless_server_with_event_hub(api::EventHub::default())
 }
 

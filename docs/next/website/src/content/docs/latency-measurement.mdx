@@ -74,8 +74,14 @@ callstacks, GPU zones, allocation events, and frame images.
 
 Diagnostics use static synchronous zones and host-monotonic numeric anchors.
 JSONL records carry PID, thread, stage, correlation identity, scope, timestamp,
-and dropped count. Per-client queue scopes prevent identical frame payloads
-from cross-pairing. Shutdown attempts a bounded flush; absent `process.finish`
+and dropped count. Queue records retain occurrence identities; transport records
+retain connection scopes and framed-byte positions. Native peer PIDs prove a
+fanout destination only when complete, lossless captures contain one connection
+per PID pair and that client has a completed outer-PTY observation. Identical
+payloads then pair by byte position rather than receipt order. Reconnects,
+multiple sockets from the same PID, missing records, Windows peer mapping, and
+SSH bridge destinations remain unassigned. Published wire bytes stay unchanged.
+Shutdown attempts a bounded flush; absent `process.finish`
 records or nonzero dropped counts invalidate complete-trace claims.
 
 Controlled output identities link terminal revisions to serialized surfaces,

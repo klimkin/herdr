@@ -10,6 +10,8 @@ pub(super) struct C1XtgettcapQueryTracker {
     native_dcs_pending: bool,
     body: Vec<u8>,
     pending: Vec<C1XtgettcapResponse>,
+    #[cfg(test)]
+    state_machine_dispatches: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,8 +40,25 @@ enum C1XtgettcapTrackerState {
 
 impl C1XtgettcapQueryTracker {
     pub(super) fn observe(&mut self, bytes: &[u8]) {
+        self.observe_impl::<true>(bytes);
+    }
+
+    fn observe_impl<const SKIP_GROUND_ASCII: bool>(&mut self, bytes: &[u8]) {
         let mut index = 0;
         while index < bytes.len() {
+            if SKIP_GROUND_ASCII && self.state == C1XtgettcapTrackerState::Ground {
+                // ASCII cannot enter a query/string here. Pending native-DCS
+                // dispatches still need their cancellation byte's exact offset.
+                let next = bytes[index..].iter().position(|&byte| {
+                    byte == 0x1b
+                        || !byte.is_ascii()
+                        || (self.native_dcs_pending && matches!(byte, 0x18 | 0x1a))
+                });
+                match next {
+                    Some(offset) => index += offset,
+                    None => break,
+                }
+            }
             if self.state == C1XtgettcapTrackerState::IgnoreString {
                 // Payload cannot affect this state. CAN/SUB still need the
                 // global native-DCS bookkeeping when a dispatch is pending.
@@ -53,6 +72,10 @@ impl C1XtgettcapQueryTracker {
                 }
             }
             let byte = bytes[index];
+            #[cfg(test)]
+            {
+                self.state_machine_dispatches += 1;
+            }
             // With a 7-bit intro and raw ST, the native parser still holds the
             // DCS open. At its eventual unhook it can answer earlier keys in a
             // multi-key request again. Discard only that dispatch's XTGETTCAP
@@ -198,6 +221,11 @@ impl C1XtgettcapQueryTracker {
     pub(super) fn drain_pending(&mut self) -> Vec<C1XtgettcapResponse> {
         std::mem::take(&mut self.pending)
     }
+
+    #[cfg(test)]
+    pub(super) fn state_machine_dispatches(&self) -> usize {
+        self.state_machine_dispatches
+    }
 }
 
 fn xtgettcap_response(cap_hex: &[u8]) -> Option<Bytes> {
@@ -260,11 +288,17 @@ mod tests {
     use super::*;
 
     fn observe_chunks(chunks: &[&[u8]]) -> (C1XtgettcapQueryTracker, Vec<C1XtgettcapResponse>) {
+        observe_chunks_with_ground_scan::<true>(chunks)
+    }
+
+    fn observe_chunks_with_ground_scan<const SKIP_GROUND_ASCII: bool>(
+        chunks: &[&[u8]],
+    ) -> (C1XtgettcapQueryTracker, Vec<C1XtgettcapResponse>) {
         let mut tracker = C1XtgettcapQueryTracker::default();
         let mut pending = Vec::new();
         let mut offset = 0;
         for chunk in chunks {
-            tracker.observe(chunk);
+            tracker.observe_impl::<SKIP_GROUND_ASCII>(chunk);
             pending.extend(tracker.drain_pending().into_iter().map(|mut response| {
                 response.end_offset += offset;
                 response
@@ -272,6 +306,133 @@ mod tests {
             offset += chunk.len();
         }
         (tracker, pending)
+    }
+
+    fn assert_ground_scan_equivalence(chunks: &[&[u8]]) {
+        // The reference runs the unchanged pre-fast-path state dispatch. It
+        // remains byte-oriented in Ground regardless of the caller's chunks.
+        let (reference, reference_pending) = observe_chunks_with_ground_scan::<false>(chunks);
+        let (actual, actual_pending) = observe_chunks(chunks);
+        assert_eq!(actual_pending, reference_pending, "chunks: {chunks:?}");
+        assert_eq!(actual.state, reference.state);
+        assert_eq!(actual.raw_c1_intro, reference.raw_c1_intro);
+        assert_eq!(actual.native_dcs_pending, reference.native_dcs_pending);
+        assert_eq!(actual.body, reference.body);
+        assert_eq!(actual.pending, reference.pending);
+    }
+
+    fn assert_ground_scan_partitions(bytes: &[u8]) {
+        for split in 0..=bytes.len() {
+            assert_ground_scan_equivalence(&[&bytes[..split], &bytes[split..]]);
+        }
+        let one_byte_chunks: Vec<_> = bytes.chunks(1).collect();
+        assert_ground_scan_equivalence(&one_byte_chunks);
+        for mut seed in [1u64, 0x51c1, 0xd15ca7c4] {
+            let mut chunks = Vec::new();
+            let mut remaining = bytes;
+            while !remaining.is_empty() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let len = (1 + ((seed >> 32) as usize % 17)).min(remaining.len());
+                chunks.push(&remaining[..len]);
+                remaining = &remaining[len..];
+            }
+            assert_ground_scan_equivalence(&chunks);
+        }
+    }
+
+    #[test]
+    fn ground_scan_matches_reference_for_all_bytes_and_fragmented_continuations() {
+        let prefixes: &[&[u8]] = &[
+            b"",
+            b"\x1b",
+            b"\x90",
+            b"\x90+",
+            b"\x90+q5463",
+            b"\x90+q5463\x1b",
+            b"\x9dordinary OSC",
+            b"\x9dordinary OSC\x1b",
+            b"\x9fordinary string",
+            b"\x9fordinary string\x1b",
+            b"\x1bP+q5463;524742\x9c",
+        ];
+        let continuation =
+            b"ordinary\r\n\x07\x9c\x1b\\\x90+q5463;524742\x9c\x90+q5375\x1b\\\x90+q5247";
+        for &prefix in prefixes {
+            for byte in 0..=u8::MAX {
+                let mut bytes = prefix.to_vec();
+                bytes.push(byte);
+                bytes.extend_from_slice(continuation);
+                assert_ground_scan_partitions(&bytes);
+            }
+        }
+
+        // A pending native dispatch can coexist with any ignored string.
+        for intro in [b"\x1b_".as_slice(), b"\x98", b"\x9e", b"\x9f", b"\x9d"] {
+            let mut bytes = b"\x1bP+q5463;524742\x9c".to_vec();
+            bytes.extend_from_slice(intro);
+            bytes.extend(0..=u8::MAX);
+            bytes.extend_from_slice(continuation);
+            assert_ground_scan_partitions(&bytes);
+        }
+    }
+
+    #[test]
+    fn ground_scan_preserves_native_dispatch_offsets_after_ascii() {
+        for cancel in [0x18, 0x1a, 0x1b] {
+            let mut bytes = b"\x1bP+q5463\x9cordinary output\r\n".to_vec();
+            bytes.push(cancel);
+            let cancel_end = bytes.len();
+            bytes.extend_from_slice(b"\x1b\\\x90+q524742\x9c");
+            let (_, pending) = observe_chunks(&[&bytes]);
+            assert_eq!(
+                pending,
+                vec![
+                    C1XtgettcapResponse {
+                        end_offset: 9,
+                        bytes: Bytes::from_static(b"\x1bP1+r5463\x1b\\"),
+                        suppress_native: false,
+                    },
+                    C1XtgettcapResponse {
+                        end_offset: cancel_end,
+                        bytes: Bytes::new(),
+                        suppress_native: true,
+                    },
+                    C1XtgettcapResponse {
+                        end_offset: bytes.len(),
+                        bytes: Bytes::from_static(b"\x1bP1+r524742=38\x1b\\"),
+                        suppress_native: false,
+                    },
+                ],
+            );
+            assert_ground_scan_partitions(&bytes);
+        }
+    }
+
+    #[test]
+    fn ground_scan_preserves_body_limits_and_non_ascii_output() {
+        let continuation = b"\x9c\x1b\\ordinary\r\x90+q524742\x9c\x90+q5463\x1b\\";
+        for escaped in [false, true] {
+            let mut prefix = b"\x90+q".to_vec();
+            prefix.extend(std::iter::repeat_n(b'A', 1025));
+            if escaped {
+                prefix.push(0x1b);
+            }
+            for byte in 0..=u8::MAX {
+                let mut suffix = vec![byte];
+                suffix.extend_from_slice(continuation);
+                // Isolate every suffix split after an already oversized body.
+                for split in 0..=suffix.len() {
+                    assert_ground_scan_equivalence(&[&prefix, &suffix[..split], &suffix[split..]]);
+                }
+            }
+            let mut bytes = prefix;
+            bytes.extend(0..=u8::MAX);
+            bytes.extend_from_slice(continuation);
+            assert_ground_scan_partitions(&bytes);
+        }
+        assert_ground_scan_partitions(
+            b"ASCII\r\nUTF-8:\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80\x90+q5463\x9c",
+        );
     }
 
     fn assert_chunk_equivalence(bytes: &[u8]) {

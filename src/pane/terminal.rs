@@ -6621,6 +6621,78 @@ mod tests {
     }
 
     #[test]
+    fn process_pty_bytes_skips_inert_ascii_query_dispatch_and_preserves_followup_reply() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let mut ordinary_output = [b'x'; 8192];
+        for line in ordinary_output.chunks_mut(80) {
+            *line.last_mut().unwrap() = b'\r';
+        }
+
+        let result = pane.process_pty_bytes(pane_id, 0, &ordinary_output, &tx);
+        assert!(result.terminal_responses.is_empty());
+        assert_eq!(
+            pane.core
+                .lock()
+                .unwrap()
+                .c1_xtgettcap_tracker
+                .state_machine_dispatches(),
+            0,
+            "ordinary ASCII/CR cannot change capability-query state"
+        );
+
+        let query = b"\x90+q5463\x9c";
+        let result = pane.process_pty_bytes(pane_id, 0, query, &tx);
+        assert_eq!(
+            result.terminal_responses,
+            vec![expected_xtgettcap_response("5463", None)]
+        );
+        assert_eq!(
+            pane.core
+                .lock()
+                .unwrap()
+                .c1_xtgettcap_tracker
+                .state_machine_dispatches(),
+            query.len(),
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn process_pty_bytes_preserves_native_cancellation_after_inert_output() {
+        for cancellation in [b"\x18".as_slice(), b"\x1a", b"\x1b"] {
+            for chunk_size in [1, 7, 128] {
+                let (tx, mut rx) = mpsc::channel(4);
+                let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+                let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+                let pane_id = PaneId::from_raw(1);
+                let mut bytes = b"\x1bP+q5463;524742\x9cordinary output\r\n".to_vec();
+                bytes.extend_from_slice(cancellation);
+                bytes.extend_from_slice(b"\x1bP+q5375\x1b\\");
+                let mut replies = Vec::new();
+                for chunk in bytes.chunks(chunk_size) {
+                    replies.extend(
+                        pane.process_pty_bytes(pane_id, 0, chunk, &tx)
+                            .terminal_responses,
+                    );
+                }
+                assert_eq!(
+                    replies,
+                    vec![
+                        expected_xtgettcap_response("5463", None),
+                        expected_xtgettcap_response("524742", Some(b"8")),
+                        expected_xtgettcap_response("5375", None),
+                    ],
+                    "cancellation={cancellation:?}, chunk_size={chunk_size}"
+                );
+                assert!(rx.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
     fn process_pty_bytes_returns_fragmented_c1_xtgettcap_once_in_order() {
         for query in [
             b"\x90+q5463;524742\x9c".as_slice(),
