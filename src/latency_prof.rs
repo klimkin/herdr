@@ -22,6 +22,9 @@ mod enabled {
         scope: u64,
         value: u64,
         dropped: u64,
+        connection: u64,
+        occurrence: u64,
+        offset: u64,
     }
 
     struct Profiler {
@@ -83,6 +86,17 @@ mod enabled {
     }
 
     pub(super) fn record_at(stage: &'static str, id: u64, value: u64, scope: u64, ns: u64) {
+        record_frame_at(stage, id, value, scope, ns, super::FrameIdentity::default());
+    }
+
+    pub(super) fn record_frame_at(
+        stage: &'static str,
+        id: u64,
+        value: u64,
+        scope: u64,
+        ns: u64,
+        frame: super::FrameIdentity,
+    ) {
         let Some(profiler) = profiler() else {
             return;
         };
@@ -101,6 +115,9 @@ mod enabled {
             scope,
             value,
             dropped: profiler.dropped.load(Ordering::Relaxed),
+            connection: frame.connection,
+            occurrence: frame.occurrence,
+            offset: frame.offset,
         };
         if profiler.sender.try_send(Command::Record(record)).is_err() {
             profiler.dropped.fetch_add(1, Ordering::Relaxed);
@@ -318,67 +335,75 @@ pub(crate) fn next_scope() -> u64 {
 }
 
 /// Hash outside queue locks; emission can retain the precise enqueue timestamp.
+#[cfg(feature = "latency-prof")]
 pub(crate) fn frame_ids(bytes: &[u8]) -> Vec<(u64, u64)> {
-    #[cfg(feature = "latency-prof")]
-    {
-        if !enabled::active() {
-            return Vec::new();
-        }
-        let mut ids = Vec::new();
-        let mut remaining = bytes;
-        while let Some(prefix) = remaining.get(..4) {
-            let len = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
-            let Some(payload) = remaining.get(4..4 + len) else {
-                break;
-            };
-            ids.push((bytes_id(payload), len as u64));
-            remaining = &remaining[4 + len..];
-        }
-        ids
+    if !enabled::active() {
+        return Vec::new();
     }
-    #[cfg(not(feature = "latency-prof"))]
-    {
-        let _ = bytes;
-        Vec::new()
+    let mut ids = Vec::new();
+    let mut remaining = bytes;
+    while let Some(prefix) = remaining.get(..4) {
+        let len = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
+        let Some(payload) = remaining.get(4..4 + len) else {
+            break;
+        };
+        ids.push((bytes_id(payload), len as u64));
+        remaining = &remaining[4 + len..];
     }
-}
-pub(crate) fn emit_frames(stage: &'static str, ids: &[(u64, u64)], scope: u64, ns: u64) {
-    for &(id, value) in ids {
-        record_at(stage, id, value, scope, ns);
-    }
+    ids
 }
 
 #[cfg(feature = "latency-prof")]
 thread_local! {
-    static WIRE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static DELIVERY_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static WIRE_FRAME: std::cell::Cell<FrameIdentity> = const { std::cell::Cell::new(FrameIdentity::empty()) };
+    static READ_POSITION: std::cell::Cell<(u64,u64)> = const { std::cell::Cell::new((0,0)) };
+    static DELIVERY_FRAME: std::cell::Cell<FrameIdentity> = const { std::cell::Cell::new(FrameIdentity::empty()) };
 }
 pub(crate) fn wire_received(bytes: &[u8]) {
     #[cfg(feature = "latency-prof")]
     {
+        if !enabled::active() {
+            return;
+        }
         let id = bytes_id(bytes);
-        WIRE_ID.with(|value| value.set(id));
-        record("transport.receive", id, bytes.len() as u64);
+        let frame = READ_POSITION.with(|position| {
+            let (connection, offset) = position.get();
+            position.set((connection, offset.saturating_add(bytes.len() as u64 + 4)));
+            FrameIdentity {
+                fingerprint: id,
+                connection,
+                occurrence: 0,
+                offset,
+            }
+        });
+        WIRE_FRAME.with(|value| value.set(frame));
+        record_frame_at("transport.receive", bytes.len() as u64, 0, now(), frame);
     }
     #[cfg(not(feature = "latency-prof"))]
     let _ = bytes;
 }
 #[cfg(feature = "latency-prof")]
 pub(crate) fn wire_id() -> u64 {
-    WIRE_ID.with(std::cell::Cell::get)
+    wire_frame().fingerprint
 }
-pub(crate) fn set_delivery(id: u64) {
+#[cfg(feature = "latency-prof")]
+pub(crate) fn wire_frame() -> FrameIdentity {
+    WIRE_FRAME.with(std::cell::Cell::get)
+}
+pub(crate) fn set_delivery(frame: FrameIdentity) {
     #[cfg(feature = "latency-prof")]
-    DELIVERY_ID.with(|value| value.set(id));
+    DELIVERY_FRAME.with(|value| value.set(frame));
     #[cfg(not(feature = "latency-prof"))]
-    let _ = id;
+    let _ = frame;
 }
 pub(crate) fn delivery(bytes: usize) {
     #[cfg(feature = "latency-prof")]
-    record(
+    record_frame_at(
         "client.delivery",
-        DELIVERY_ID.with(std::cell::Cell::get),
         bytes as u64,
+        0,
+        now(),
+        DELIVERY_FRAME.with(std::cell::Cell::get),
     );
     #[cfg(not(feature = "latency-prof"))]
     let _ = bytes;
@@ -560,4 +585,110 @@ pub(crate) fn input_dispatch(
     }
     #[cfg(not(feature = "latency-prof"))]
     let _ = (events, stage, scope);
+}
+
+/// Diagnostic identities stay outside every published wire codec.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameIdentity {
+    #[cfg(feature = "latency-prof")]
+    pub(crate) fingerprint: u64,
+    #[cfg(feature = "latency-prof")]
+    pub(crate) connection: u64,
+    #[cfg(feature = "latency-prof")]
+    pub(crate) occurrence: u64,
+    #[cfg(feature = "latency-prof")]
+    pub(crate) offset: u64,
+}
+impl FrameIdentity {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            #[cfg(feature = "latency-prof")]
+            fingerprint: 0,
+            #[cfg(feature = "latency-prof")]
+            connection: 0,
+            #[cfg(feature = "latency-prof")]
+            occurrence: 0,
+            #[cfg(feature = "latency-prof")]
+            offset: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueuedFrame {
+    pub(crate) identity: FrameIdentity,
+    pub(crate) len: u64,
+}
+
+#[cfg(any(feature = "latency-prof", test))]
+pub(crate) fn queued_frames(bytes: &[u8], connection: u64) -> Vec<QueuedFrame> {
+    #[cfg(feature = "latency-prof")]
+    {
+        frame_ids(bytes)
+            .into_iter()
+            .map(|(fingerprint, len)| QueuedFrame {
+                identity: FrameIdentity {
+                    fingerprint,
+                    connection,
+                    occurrence: next_scope(),
+                    offset: 0,
+                },
+                len,
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "latency-prof"))]
+    {
+        let _ = (bytes, connection);
+        Vec::new()
+    }
+}
+
+pub(crate) fn record_frame_at(
+    stage: &'static str,
+    value: u64,
+    scope: u64,
+    ns: u64,
+    frame: FrameIdentity,
+) {
+    #[cfg(feature = "latency-prof")]
+    enabled::record_frame_at(stage, frame.fingerprint, value, scope, ns, frame);
+    #[cfg(not(feature = "latency-prof"))]
+    let _ = (stage, value, scope, ns, frame);
+}
+
+pub(crate) fn emit_queued_frames(stage: &'static str, frames: &[QueuedFrame], scope: u64, ns: u64) {
+    for frame in frames {
+        record_frame_at(stage, frame.len, scope, ns, frame.identity);
+    }
+}
+
+/// Track framed-byte positions from immediately after the welcome. A lost record
+/// cannot shift subsequent repeated payloads onto an earlier queue occurrence.
+#[cfg(feature = "latency-prof")]
+pub(crate) fn begin_connection_receive(stream: &crate::ipc::LocalStream) {
+    if !enabled::active() {
+        return;
+    }
+    let connection = next_scope();
+    record(
+        "client.connection",
+        connection,
+        u64::from(crate::platform::local_stream_peer_pid(stream).unwrap_or(0)),
+    );
+    READ_POSITION.with(|value| value.set((connection, 0)));
+}
+
+#[cfg(feature = "latency-prof")]
+pub(crate) fn server_connection(stream: &crate::ipc::LocalStream, connection: u64, client_id: u64) {
+    if !enabled::active() {
+        return;
+    }
+    record_at(
+        "server.connection",
+        connection,
+        u64::from(crate::platform::local_stream_peer_pid(stream).unwrap_or(0)),
+        client_id,
+        now(),
+    );
 }

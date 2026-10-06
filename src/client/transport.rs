@@ -41,6 +41,8 @@ pub(super) fn server_reader_thread(
     generation: u64,
     mut surface_decoder: Option<protocol::surface_reuse::Decoder>,
 ) {
+    #[cfg(feature = "latency-prof")]
+    crate::latency_prof::begin_connection_receive(&stream);
     if stream.set_nonblocking(true).is_err() {
         let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
             endpoint_id,
@@ -72,7 +74,7 @@ pub(super) fn server_reader_thread(
                 if event_tx
                     .blocking_send(ClientLoopEvent::ServerMessage {
                         #[cfg(feature = "latency-prof")]
-                        diagnostic_id: crate::latency_prof::wire_id(),
+                        diagnostic_frame: crate::latency_prof::wire_frame(),
                         endpoint_id: endpoint_id.clone(),
                         generation,
                         message: Box::new(msg),
@@ -166,6 +168,95 @@ mod tests {
     use interprocess::local_socket::traits::Listener as _;
     use std::io::{Read as _, Write as _};
     use std::time::Instant;
+
+    #[cfg(feature = "latency-prof")]
+    #[test]
+    fn endpoint_reader_retains_repeated_frame_wire_positions() {
+        const CHILD: &str = "HERDR_READER_POSITION_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!(
+                "herdr-reader-positions-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "client::transport::tests::endpoint_reader_retains_repeated_frame_wire_positions", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HERDR_LATENCY_TRACE_DIR", &root)
+                .env_remove("HERDR_TRACY")
+                .status().unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            assert!(status.success(), "reader position subprocess failed");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("hrp-{}.sock", std::process::id()));
+        let listener = crate::ipc::bind_private_local_listener(&path).unwrap();
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        let mut server = listener.accept().unwrap();
+        std::fs::remove_file(path).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::channel(8);
+        let quit = Arc::new(AtomicBool::new(false));
+        let thread = std::thread::spawn(move || {
+            server_reader_thread(
+                client,
+                events,
+                &quit,
+                protocol::MAX_FRAME_SIZE,
+                endpoint::ClientEndpointId::Local,
+                1,
+                None,
+            )
+        });
+        let message = ServerMessage::WindowTitle {
+            title: Some("same".into()),
+        };
+        let mut bytes = Vec::new();
+        protocol::write_message(&mut bytes, &message).unwrap();
+        server.write_all(&bytes).unwrap();
+        server.write_all(&bytes).unwrap();
+        drop(server);
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            match received.blocking_recv().unwrap() {
+                ClientLoopEvent::ServerMessage {
+                    diagnostic_frame,
+                    message: actual,
+                    ..
+                } => {
+                    assert_eq!(*actual, message);
+                    frames.push(diagnostic_frame);
+                }
+                _ => panic!("expected repeated endpoint message"),
+            }
+        }
+        assert_eq!(frames[0].fingerprint, frames[1].fingerprint);
+        assert_eq!(frames[0].connection, frames[1].connection);
+        assert_ne!(frames[0].connection, 0);
+        assert_eq!(frames[0].offset, 0);
+        assert_eq!(frames[1].offset, bytes.len() as u64);
+        thread.join().unwrap();
+        crate::latency_prof::shutdown();
+        let root = std::path::PathBuf::from(std::env::var_os("HERDR_LATENCY_TRACE_DIR").unwrap());
+        let text =
+            std::fs::read_to_string(root.join(format!("{}.jsonl", std::process::id()))).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let connection = records
+            .iter()
+            .find(|record| record["stage"] == "client.connection")
+            .unwrap();
+        assert_eq!(connection["id"].as_u64(), Some(frames[0].connection));
+        assert_eq!(
+            connection["value"].as_u64(),
+            Some(u64::from(std::process::id()))
+        );
+    }
 
     #[test]
     fn upload_cancellation_preserves_pending_endpoint_download() {
