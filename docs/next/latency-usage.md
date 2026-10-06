@@ -183,6 +183,16 @@ separate from application response. Missing or ambiguous causal stages stay
 unavailable. Off-CPU attribution and PTY submission queue residence are unassigned;
 overlapping intervals must not be summed.
 
+For local fanout, diagnostics retain each queued occurrence and framed-byte
+position through socket write, receipt, and client output. Native peer PIDs link
+one captured server connection to one captured client connection, allowing
+identical payloads to reach distinct clients without relying on hash uniqueness
+or receipt order. This requires complete, lossless records for both processes
+and that client's completed outer-PTY observation. Reconnects, multiple sockets
+between the same PID pair, missing records, and unavailable peer credentials
+remain unassigned. Windows currently lacks this native mapping; SSH bridge peer
+PIDs do not prove a remote destination. Published wire bytes stay unchanged.
+
 Detailed background: [latency measurement documentation](website/src/content/docs/latency-measurement.mdx).
 
 ## Server deadline waiting

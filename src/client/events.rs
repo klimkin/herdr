@@ -16,7 +16,7 @@ pub(super) enum ClientLoopEvent {
     TerminalUnavailable(io::Error),
     ServerMessage {
         #[cfg(feature = "latency-prof")]
-        diagnostic_id: u64,
+        diagnostic_frame: crate::latency_prof::FrameIdentity,
         endpoint_id: endpoint::ClientEndpointId,
         generation: u64,
         message: Box<ServerMessage>,

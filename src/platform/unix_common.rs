@@ -730,3 +730,10 @@ mod shared_ssh_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(feature = "latency-prof")]
+pub(crate) fn local_stream_peer_pid(stream: &crate::ipc::LocalStream) -> Option<u32> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    super::socket_peer_pid(socket.as_fd().as_raw_fd())
+}

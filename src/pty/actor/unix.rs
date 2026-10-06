@@ -12,11 +12,10 @@ use tracing::{debug, warn};
 
 use crate::pty::fd;
 
-// Actor handle methods must call wake_actor() after queuing work. The idle
-// timeout is only a fallback for missed wakes; PTY and wake readiness drive
-// normal responsiveness.
-const ACTOR_IDLE_POLL_MS: i32 = 1000;
+// Queue work before waking. Final handle drop closes the wake writer, so HUP
+// also wakes an idle or quiesced actor and exposes disconnected commands.
 const ACTOR_COMMAND_BUFFER: usize = 1024;
+const ACTOR_READ_BUFFER_SIZE: usize = 8192;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,6 +449,28 @@ impl PtyIoActorHandle {
 
 pub(crate) struct PtyIoActor;
 
+#[cfg(test)]
+#[derive(Debug)]
+enum ActorPollEvent {
+    Waiting {
+        timeout_ms: i32,
+    },
+    Returned {
+        pty_read_ready: bool,
+        pty_write_ready: bool,
+        wake_ready: bool,
+    },
+}
+
+#[cfg(test)]
+struct ActorPollObserver {
+    events: std_mpsc::Sender<ActorPollEvent>,
+    resume: Option<std_mpsc::Receiver<()>>,
+}
+
+#[cfg(not(test))]
+type ActorPollObserver = ();
+
 impl PtyIoActor {
     pub(crate) fn spawn(config: PtyIoActorConfig) -> std::io::Result<PtyIoActorHandle> {
         Self::spawn_inner(config, None)
@@ -457,7 +478,7 @@ impl PtyIoActor {
 
     fn spawn_inner(
         config: PtyIoActorConfig,
-        poll_observer: Option<std_mpsc::Sender<()>>,
+        poll_observer: Option<ActorPollObserver>,
     ) -> std::io::Result<PtyIoActorHandle> {
         fd::set_cloexec(config.master_fd.as_raw_fd())?;
         fd::set_nonblocking(config.master_fd.as_raw_fd())?;
@@ -489,6 +510,7 @@ impl PtyIoActor {
             diagnostic_input: crate::latency_prof::InputStimuli::default(),
             pane_id: config.pane_id,
             file: master,
+            read_buffer: [0; ACTOR_READ_BUFFER_SIZE],
             data_rx,
             control_rx,
             state: if config.initially_quiesced {
@@ -518,7 +540,7 @@ impl PtyIoActor {
     #[cfg(test)]
     fn spawn_with_poll_observer(
         config: PtyIoActorConfig,
-        poll_observer: std_mpsc::Sender<()>,
+        poll_observer: ActorPollObserver,
     ) -> std::io::Result<PtyIoActorHandle> {
         Self::spawn_inner(config, Some(poll_observer))
     }
@@ -527,6 +549,8 @@ impl PtyIoActor {
 struct PtyIoActorRunner {
     pane_id: u32,
     file: Arc<std::fs::File>,
+    // Reuse initialized storage across normal reads and pre-handoff draining.
+    read_buffer: [u8; ACTOR_READ_BUFFER_SIZE],
     data_rx: mpsc::Receiver<QueuedDataCommand>,
     control_rx: std_mpsc::Receiver<PtyIoControlCommand>,
     state: ActorState,
@@ -540,7 +564,8 @@ struct PtyIoActorRunner {
     response_order: Arc<Mutex<()>>,
     on_read: ReadCallback,
     on_reader_exit: Option<ReaderExitCallback>,
-    poll_observer: Option<std_mpsc::Sender<()>>,
+    #[cfg_attr(not(test), allow(dead_code))] // Observer exists only in test runners.
+    poll_observer: Option<ActorPollObserver>,
 }
 
 struct ActiveSubmission {
@@ -647,8 +672,13 @@ impl PtyIoActorRunner {
                 continue;
             }
 
-            if let Some(poll_observer) = &self.poll_observer {
-                let _ = poll_observer.send(());
+            let timeout_ms = self.poll_timeout_ms();
+            #[cfg(test)]
+            if let Some(observer) = &self.poll_observer {
+                let _ = observer.events.send(ActorPollEvent::Waiting { timeout_ms });
+                if let Some(resume) = &observer.resume {
+                    let _ = resume.recv();
+                }
             }
 
             match fd::poll_pty_and_wake(
@@ -656,9 +686,17 @@ impl PtyIoActorRunner {
                 self.wake_read_fd.as_raw_fd(),
                 self.state == ActorState::Running,
                 !self.pending_writes.is_empty(),
-                self.poll_timeout_ms(),
+                timeout_ms,
             ) {
                 Ok(readiness) => {
+                    #[cfg(test)]
+                    if let Some(observer) = &self.poll_observer {
+                        let _ = observer.events.send(ActorPollEvent::Returned {
+                            pty_read_ready: readiness.pty_read_ready,
+                            pty_write_ready: readiness.pty_write_ready,
+                            wake_ready: readiness.wake_ready,
+                        });
+                    }
                     if readiness.wake_ready {
                         if let Err(err) = fd::drain_wake_fd(self.wake_read_fd.as_raw_fd()) {
                             debug!(pane = self.pane_id, err = %err, "PTY actor wake drain failed");
@@ -943,8 +981,7 @@ impl PtyIoActorRunner {
 
     fn read_once(&mut self) -> bool {
         crate::latency_prof::zone!("pty.read_batch");
-        let mut buf = [0u8; 8192];
-        match self.file.as_ref().read(&mut buf) {
+        match self.file.as_ref().read(&mut self.read_buffer) {
             Ok(0) => false,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => true,
@@ -958,7 +995,7 @@ impl PtyIoActorRunner {
                 let _order = response_order
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let result = (self.on_read)(&buf[..n]);
+                let result = (self.on_read)(&self.read_buffer[..n]);
                 self.controls
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1041,13 +1078,13 @@ impl PtyIoActorRunner {
             ..
         }) = self.active_submission.as_ref()
         else {
-            return ACTOR_IDLE_POLL_MS;
+            return -1;
         };
         deadline
             .saturating_duration_since(Instant::now())
             .as_millis()
             .max(1)
-            .min(ACTOR_IDLE_POLL_MS as u128) as i32
+            .min(i32::MAX as u128) as i32
     }
 
     fn fail_active_submission(&mut self, err: std::io::Error) {
@@ -1217,7 +1254,7 @@ mod tests {
 
     fn actor_with_socket_pair_and_poll_observer(
         initially_quiesced: bool,
-        poll_observer: Option<std_mpsc::Sender<()>>,
+        poll_observer: Option<ActorPollObserver>,
     ) -> (PtyIoActorHandle, UnixStream, std_mpsc::Receiver<Bytes>) {
         let (actor_socket, peer) = UnixStream::pair().expect("socket pair");
         actor_socket
@@ -1261,6 +1298,7 @@ mod tests {
             diagnostic_input: crate::latency_prof::InputStimuli::default(),
             pane_id: 1,
             file: Arc::new(std::fs::File::from(owned)),
+            read_buffer: [0; ACTOR_READ_BUFFER_SIZE],
             data_rx,
             control_rx,
             state: ActorState::Running,
@@ -1276,6 +1314,482 @@ mod tests {
             poll_observer: None,
         };
         (runner, peer)
+    }
+
+    fn paused_actor(
+        initially_quiesced: bool,
+    ) -> (
+        PtyIoActorHandle,
+        UnixStream,
+        std_mpsc::Receiver<Bytes>,
+        std_mpsc::Receiver<ActorPollEvent>,
+        std_mpsc::Sender<()>,
+    ) {
+        let (event_tx, event_rx) = std_mpsc::channel();
+        let (resume_tx, resume_rx) = std_mpsc::channel();
+        let (handle, peer, read_rx) = actor_with_socket_pair_and_poll_observer(
+            initially_quiesced,
+            Some(ActorPollObserver {
+                events: event_tx,
+                resume: Some(resume_rx),
+            }),
+        );
+        (handle, peer, read_rx, event_rx, resume_tx)
+    }
+
+    fn expect_actor_wait(events: &std_mpsc::Receiver<ActorPollEvent>) -> i32 {
+        match events
+            .recv_timeout(Duration::from_secs(3))
+            .expect("actor reaches poll boundary")
+        {
+            ActorPollEvent::Waiting { timeout_ms } => timeout_ms,
+            event => panic!("expected poll boundary, received {event:?}"),
+        }
+    }
+
+    fn expect_actor_wake(events: &std_mpsc::Receiver<ActorPollEvent>) {
+        match events
+            .recv_timeout(Duration::from_secs(3))
+            .expect("actor returns from poll")
+        {
+            ActorPollEvent::Returned {
+                wake_ready: true, ..
+            } => {}
+            event => panic!("expected explicit wake readiness, received {event:?}"),
+        }
+    }
+
+    #[test]
+    fn final_handle_drop_wakes_running_and_quiesced_actors() {
+        for initially_quiesced in [false, true] {
+            let (handle, mut peer, _read_rx, events, resume) = paused_actor(initially_quiesced);
+            let observer = handle.foreground_observer();
+            let clone = handle.clone();
+            expect_actor_wait(&events);
+            drop(handle);
+            assert!(observer.master.upgrade().is_some());
+            drop(clone);
+            resume.send(()).expect("release actor poll boundary");
+            expect_actor_wake(&events);
+            assert!(matches!(
+                events.recv_timeout(Duration::from_secs(3)),
+                Err(std_mpsc::RecvTimeoutError::Disconnected)
+            ));
+            assert_eq!(
+                peer.read(&mut [0; 1]).expect("actor closes its descriptor"),
+                0
+            );
+            assert!(observer.master.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn idle_running_and_quiesced_actors_have_no_poll_deadline() {
+        for initially_quiesced in [false, true] {
+            let (handle, _peer, _read_rx, events, resume) = paused_actor(initially_quiesced);
+            let timeout_ms = expect_actor_wait(&events);
+            handle.shutdown();
+            drop(resume);
+            assert_eq!(timeout_ms, -1, "idle actor waits for explicit readiness");
+        }
+        let (mut runner, _peer) = actor_runner_for_unit_test();
+        let (reply, _completion) = std_mpsc::channel();
+        runner.active_submission = Some(ActiveSubmission {
+            enter: Bytes::from_static(b"\r"),
+            delay: Duration::from_secs(30),
+            phase: SubmissionPhase::WaitingUntil(Instant::now() + Duration::from_secs(30)),
+            #[cfg(feature = "latency-prof")]
+            enter_trace: Default::default(),
+            reply,
+        });
+        assert!(
+            runner.poll_timeout_ms() > 1000,
+            "real submission deadline has no idle-poll cap"
+        );
+    }
+
+    #[test]
+    fn queued_input_and_response_wake_before_actor_enters_poll() {
+        let (handle, mut peer, _read_rx, events, resume) = paused_actor(false);
+        expect_actor_wait(&events);
+        handle
+            .try_write_user_input(Bytes::from_static(b"input"))
+            .expect("input accepted");
+        handle.write_terminal_response(|| Some(Bytes::from_static(b"reply")));
+        resume.send(()).expect("release actor poll boundary");
+        expect_actor_wake(&events);
+        expect_actor_wait(&events);
+        let mut received = [0; 10];
+        peer.read_exact(&mut received)
+            .expect("peer receives queued writes");
+        assert_eq!(&received, b"inputreply");
+        handle.shutdown();
+        drop(resume);
+    }
+
+    #[test]
+    fn resize_and_nudge_wake_before_actor_enters_poll() {
+        let (handle, mut peer, _read_rx, events, resume) = paused_actor(false);
+        expect_actor_wait(&events);
+        handle.resize(20, 80, 8, 16, vec![Bytes::from_static(b"resize")]);
+        handle.nudge_child_redraw_after_handoff(20, 80, 8, 16);
+        resume.send(()).expect("release actor poll boundary");
+        expect_actor_wake(&events);
+        expect_actor_wait(&events);
+        let mut received = [0; 6];
+        peer.read_exact(&mut received)
+            .expect("peer receives resize response");
+        assert_eq!(&received, b"resize");
+        handle.shutdown();
+        drop(resume);
+    }
+
+    #[test]
+    fn shutdown_wakes_running_and_quiesced_actors() {
+        for initially_quiesced in [false, true] {
+            let (handle, mut peer, _read_rx, events, resume) = paused_actor(initially_quiesced);
+            expect_actor_wait(&events);
+            handle.shutdown();
+            resume.send(()).expect("release actor poll boundary");
+            expect_actor_wake(&events);
+            assert!(matches!(
+                events.recv_timeout(Duration::from_secs(3)),
+                Err(std_mpsc::RecvTimeoutError::Disconnected)
+            ));
+            assert_eq!(peer.read(&mut [0; 1]).expect("actor closes master"), 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_input_and_nonfinal_drop_preserve_delivery() {
+        let (handle, mut peer, _read_rx, events, resume) = paused_actor(false);
+        expect_actor_wait(&events);
+        let writer = handle.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let worker = std::thread::spawn(move || {
+            worker_barrier.wait();
+            writer
+                .try_write_user_input(Bytes::from_static(b"concurrent"))
+                .expect("live clone accepts input");
+            writer
+        });
+        barrier.wait();
+        drop(handle);
+        let writer = worker.join().expect("input worker joins");
+        resume.send(()).expect("release actor poll boundary");
+        expect_actor_wake(&events);
+        expect_actor_wait(&events);
+        let mut received = [0; 10];
+        peer.read_exact(&mut received)
+            .expect("peer receives concurrent input");
+        assert_eq!(&received, b"concurrent");
+        drop(writer);
+        resume.send(()).expect("release final poll boundary");
+        expect_actor_wake(&events);
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(3)),
+            Err(std_mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert_eq!(peer.read(&mut [0; 1]).expect("final drop closes master"), 0);
+    }
+
+    #[test]
+    fn rollback_and_release_wake_quiesced_actor() {
+        let (handle, mut peer, read_rx, events, resume) = paused_actor(true);
+        expect_actor_wait(&events);
+        peer.write_all(b"held")
+            .expect("peer queues output while quiesced");
+        let rollback_handle = handle.clone();
+        let rollback = std::thread::spawn(move || rollback_handle.rollback_handoff());
+        resume.send(()).expect("release rollback poll boundary");
+        expect_actor_wake(&events);
+        rollback
+            .join()
+            .expect("rollback worker joins")
+            .expect("rollback resumes actor");
+        expect_actor_wait(&events);
+        resume.send(()).expect("allow actor to read held output");
+        match events
+            .recv_timeout(Duration::from_secs(3))
+            .expect("PTY readiness")
+        {
+            ActorPollEvent::Returned {
+                pty_read_ready: true,
+                pty_write_ready: false,
+                wake_ready: false,
+            } => {}
+            event => panic!("expected held PTY output readiness, received {event:?}"),
+        }
+        assert_eq!(
+            read_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("held output delivered"),
+            Bytes::from_static(b"held")
+        );
+        expect_actor_wait(&events);
+        let handoff_handle = handle.clone();
+        let handoff =
+            std::thread::spawn(move || handoff_handle.begin_handoff(Duration::from_secs(1)));
+        resume.send(()).expect("release handoff poll boundary");
+        expect_actor_wake(&events);
+        handoff
+            .join()
+            .expect("handoff worker joins")
+            .expect("actor quiesces");
+        expect_actor_wait(&events);
+        let release_handle = handle.clone();
+        let release = std::thread::spawn(move || release_handle.release_after_commit());
+        resume.send(()).expect("release commit poll boundary");
+        expect_actor_wake(&events);
+        release
+            .join()
+            .expect("release worker joins")
+            .expect("actor releases");
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(3)),
+            Err(std_mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert_eq!(peer.read(&mut [0; 1]).expect("release closes master"), 0);
+    }
+
+    #[test]
+    fn handoff_duplicate_wakes_quiesced_actor_and_remains_owned() {
+        let (handle, mut peer, _read_rx, events, resume) = paused_actor(true);
+        expect_actor_wait(&events);
+        let duplicate_handle = handle.clone();
+        let worker = std::thread::spawn(move || duplicate_handle.duplicate_for_handoff());
+        resume.send(()).expect("release duplicate poll boundary");
+        expect_actor_wake(&events);
+        let duplicate = worker
+            .join()
+            .expect("duplicate worker joins")
+            .expect("handoff descriptor duplicated");
+        let mut duplicate = unsafe { std::fs::File::from_raw_fd(duplicate) };
+        duplicate
+            .write_all(b"duplicate")
+            .expect("duplicated descriptor stays usable");
+        let mut received = [0; 9];
+        peer.read_exact(&mut received)
+            .expect("peer receives duplicate output");
+        assert_eq!(&received, b"duplicate");
+        handle.shutdown();
+        drop(resume);
+        drop(duplicate);
+    }
+
+    #[test]
+    fn full_input_queue_does_not_block_control_wakes_or_handoff() {
+        let (handle, mut peer, _read_rx, events, resume) = paused_actor(false);
+        expect_actor_wait(&events);
+        for _ in 0..ACTOR_COMMAND_BUFFER {
+            handle
+                .try_write_user_input(Bytes::from_static(b"x"))
+                .expect("queue accepts input");
+        }
+        assert!(matches!(
+            handle.try_write_user_input(Bytes::from_static(b"overflow")),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        handle.resize(20, 80, 8, 16, vec![Bytes::from_static(b"resize")]);
+        handle.nudge_child_redraw_after_handoff(20, 80, 8, 16);
+        handle.write_terminal_response(|| Some(Bytes::from_static(b"reply")));
+        let handoff_handle = handle.clone();
+        let handoff =
+            std::thread::spawn(move || handoff_handle.begin_handoff(Duration::from_secs(1)));
+        resume.send(()).expect("release full-queue poll boundary");
+        expect_actor_wake(&events);
+        drop(resume);
+        let mut received = vec![0; ACTOR_COMMAND_BUFFER + 11];
+        peer.read_exact(&mut received)
+            .expect("pre-handoff bytes reach peer");
+        assert!(received[..ACTOR_COMMAND_BUFFER]
+            .iter()
+            .all(|byte| *byte == b'x'));
+        assert_eq!(&received[ACTOR_COMMAND_BUFFER..], b"resizereply");
+        handoff
+            .join()
+            .expect("handoff worker joins")
+            .expect("full queue handoff quiesces");
+        handle.shutdown();
+    }
+
+    #[test]
+    fn delayed_enter_uses_deadline_readiness_without_another_command() {
+        let (handle, mut peer, _read_rx, events, resume) = paused_actor(false);
+        expect_actor_wait(&events);
+        let completion = handle
+            .queue_user_input_submission(
+                Bytes::from_static(b"prompt"),
+                Bytes::from_static(b"\r"),
+                Duration::from_millis(40),
+            )
+            .expect("delayed submission accepted");
+        resume.send(()).expect("release submission poll boundary");
+        expect_actor_wake(&events);
+        let deadline_timeout = expect_actor_wait(&events);
+        assert!((1..=40).contains(&deadline_timeout));
+        let mut prompt = [0; 6];
+        peer.read_exact(&mut prompt)
+            .expect("peer receives completed prompt");
+        assert_eq!(&prompt, b"prompt");
+        resume.send(()).expect("allow finite deadline poll");
+        match events
+            .recv_timeout(Duration::from_secs(3))
+            .expect("deadline expires")
+        {
+            ActorPollEvent::Returned {
+                pty_read_ready: false,
+                pty_write_ready: false,
+                wake_ready: false,
+            } => {}
+            event => panic!("expected deadline return without I/O, received {event:?}"),
+        }
+        drop(resume);
+        let mut enter = [0; 1];
+        peer.read_exact(&mut enter)
+            .expect("deadline sends delayed Enter");
+        assert_eq!(&enter, b"\r");
+        completion
+            .recv_timeout(Duration::from_secs(3))
+            .expect("submission completes")
+            .expect("submission succeeds");
+        handle.shutdown();
+    }
+
+    #[test]
+    fn final_drop_cancels_delayed_submission_through_wake_hup() {
+        let (handle, mut peer, _read_rx, events, resume) = paused_actor(false);
+        expect_actor_wait(&events);
+        let completion = handle
+            .queue_user_input_submission(
+                Bytes::from_static(b"prompt"),
+                Bytes::from_static(b"\r"),
+                Duration::from_secs(5),
+            )
+            .expect("submission accepted");
+        resume.send(()).expect("release submission poll boundary");
+        expect_actor_wake(&events);
+        expect_actor_wait(&events);
+        let mut prompt = [0; 6];
+        peer.read_exact(&mut prompt).expect("prompt reaches peer");
+        assert_eq!(&prompt, b"prompt");
+        drop(handle);
+        resume
+            .send(())
+            .expect("allow HUP to wake delayed submission");
+        expect_actor_wake(&events);
+        let err = completion
+            .recv_timeout(Duration::from_secs(3))
+            .expect("actor reports canceled submission")
+            .expect_err("final drop cancels pending Enter");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            peer.read(&mut [0; 1]).expect("actor closes without Enter"),
+            0
+        );
+    }
+
+    #[test]
+    fn interrupted_indefinite_poll_waits_for_explicit_wake() {
+        // Signal disposition is process-wide; isolate even under cargo test's
+        // parallel runner, rather than changing another test's signal behavior.
+        if std::env::var_os("HERDR_TEST_POLL_EINTR").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "pty::actor::unix::tests::interrupted_indefinite_poll_waits_for_explicit_wake",
+                    "--nocapture",
+                ])
+                .env("HERDR_TEST_POLL_EINTR", "1")
+                .status()
+                .expect("isolated signal test starts");
+            assert!(status.success());
+            return;
+        }
+        unsafe extern "C" fn ignore_signal(_: libc::c_int) {}
+
+        struct RestoreSignal(libc::sigaction);
+        impl Drop for RestoreSignal {
+            fn drop(&mut self) {
+                unsafe { libc::sigaction(libc::SIGUSR1, &self.0, std::ptr::null_mut()) };
+            }
+        }
+
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = ignore_signal as *const () as libc::sighandler_t;
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGUSR1, &action, &mut previous) },
+            0
+        );
+        let _restore_signal = RestoreSignal(previous);
+
+        let (thread_tx, thread_rx) = std_mpsc::channel();
+        let (interrupt_tx, interrupt_rx) = std_mpsc::channel();
+        let (done_tx, done_rx) = std_mpsc::channel();
+        let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
+        let worker = std::thread::spawn(move || {
+            fd::INTERRUPTED_POLL_OBSERVER
+                .with_borrow_mut(|observer| *observer = Some(interrupt_tx));
+            thread_tx
+                .send(unsafe { libc::pthread_self() })
+                .expect("report poll thread");
+            let readiness =
+                fd::poll_pty_and_wake(-1, wake_pipe.read_fd.as_raw_fd(), false, false, -1)
+                    .expect("interrupted indefinite poll succeeds");
+            done_tx
+                .send(readiness.wake_ready)
+                .expect("report poll readiness");
+        });
+        let thread_id = thread_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("poll thread starts");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert_eq!(unsafe { libc::pthread_kill(thread_id, libc::SIGUSR1) }, 0);
+            match interrupt_rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(()) => break,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(Instant::now() < deadline, "signal interrupts blocking poll");
+                }
+                Err(err) => panic!("interrupt observer closes unexpectedly: {err}"),
+            }
+        }
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+        wake_pipe.writer.wake().expect("explicit wake succeeds");
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("poll returns for wake"));
+        worker.join().expect("poll thread exits");
+    }
+
+    #[test]
+    fn handoff_drain_rejects_peer_backpressure_at_its_deadline() {
+        let (mut runner, _peer) = actor_runner_for_unit_test();
+        let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
+        runner.wake_read_fd = wake_pipe.read_fd;
+        let _wake_writer = wake_pipe.writer;
+        let bytes = [b'x'; 8192];
+        loop {
+            match runner.file.as_ref().write(&bytes) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("socket prefill fails unexpectedly: {err}"),
+            }
+        }
+        runner.enqueue_write(Bytes::from_static(b"pending"));
+
+        let err = runner
+            .begin_handoff()
+            .expect_err("backpressured handoff cannot quiesce");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(runner.state, ActorState::Running);
     }
 
     #[test]
@@ -1939,33 +2453,6 @@ mod tests {
     }
 
     #[test]
-    fn actor_wakes_idle_poll_for_user_input() {
-        let (poll_tx, poll_rx) = std_mpsc::channel();
-        let (handle, mut peer, _read_rx) =
-            actor_with_socket_pair_and_poll_observer(false, Some(poll_tx));
-        peer.set_read_timeout(Some(Duration::from_millis(500)))
-            .expect("peer timeout");
-        poll_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("actor entered idle poll");
-
-        let start = Instant::now();
-        handle
-            .try_write_user_input(Bytes::from_static(b"x"))
-            .expect("write command accepted");
-
-        let mut buf = [0u8; 1];
-        peer.read_exact(&mut buf)
-            .expect("peer receives write without waiting for actor poll timeout");
-        assert_eq!(&buf, b"x");
-        assert!(
-            start.elapsed() < Duration::from_millis(500),
-            "actor write should be driven by wake fd, not the idle poll timeout"
-        );
-        handle.shutdown();
-    }
-
-    #[test]
     fn actor_reads_output_while_input_is_backpressured() {
         let (mut actor_socket, mut peer) = UnixStream::pair().expect("socket pair");
         actor_socket
@@ -2055,31 +2542,6 @@ mod tests {
     }
 
     #[test]
-    fn actor_wakes_idle_poll_for_handoff_control() {
-        let (poll_tx, poll_rx) = std_mpsc::channel();
-        let (handle, _peer, _read_rx) =
-            actor_with_socket_pair_and_poll_observer(false, Some(poll_tx));
-        poll_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("actor entered idle poll");
-
-        let start = Instant::now();
-        let handoff_handle = handle.clone();
-        let handoff =
-            std::thread::spawn(move || handoff_handle.begin_handoff(Duration::from_secs(1)));
-
-        handoff
-            .join()
-            .expect("handoff thread joins")
-            .expect("handoff control should wake idle actor");
-        assert!(
-            start.elapsed() < Duration::from_millis(500),
-            "handoff control should be driven by wake fd, not the idle poll timeout"
-        );
-        handle.shutdown();
-    }
-
-    #[test]
     fn poll_ignores_pty_hup_without_pty_interest() {
         let (actor_socket, peer) = UnixStream::pair().expect("socket pair");
         actor_socket
@@ -2113,6 +2575,145 @@ mod tests {
             .expect("actor read callback");
         assert_eq!(read, Bytes::from_static(b"from-peer"));
         handle.shutdown();
+    }
+
+    #[test]
+    fn actor_delivers_only_new_bytes_across_alternating_read_lengths() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer timeout");
+        let (read_tx, read_rx) = std_mpsc::channel();
+        runner.on_read = Box::new(move |bytes| {
+            read_tx
+                .send(Bytes::copy_from_slice(bytes))
+                .expect("read receiver alive");
+            PtyReadResult {
+                terminal_responses: vec![Bytes::copy_from_slice(bytes)],
+            }
+        });
+
+        for payload in [
+            vec![0xA5; 8192],
+            b"x".to_vec(),
+            b"short".to_vec(),
+            vec![0x5A; 8191],
+            b"end".to_vec(),
+        ] {
+            peer.write_all(&payload).expect("peer output");
+            let mut delivered = Vec::new();
+            while delivered.len() < payload.len() {
+                assert!(runner.read_once(), "actor stays readable");
+                delivered.extend(read_rx.try_recv().expect("callback receives pending bytes"));
+                while !runner.pending_writes.is_empty() {
+                    runner
+                        .flush_pending_writes_once()
+                        .expect("terminal response writes");
+                }
+            }
+            assert_eq!(delivered, payload, "callback receives exact output");
+            let mut response = vec![0; payload.len()];
+            peer.read_exact(&mut response).expect("terminal response");
+            assert_eq!(response, payload, "terminal responses preserve byte order");
+
+            assert!(runner.read_once(), "WouldBlock keeps actor alive");
+            assert!(matches!(
+                read_rx.try_recv(),
+                Err(std_mpsc::TryRecvError::Empty)
+            ));
+        }
+
+        peer.shutdown(std::net::Shutdown::Write).expect("peer EOF");
+        assert!(!runner.read_once(), "EOF terminates reading");
+        assert!(matches!(
+            read_rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn actor_stops_after_fatal_read_error_without_delivering_old_bytes() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        let (read_tx, read_rx) = std_mpsc::channel();
+        runner.on_read = Box::new(move |bytes| {
+            read_tx
+                .send(Bytes::copy_from_slice(bytes))
+                .expect("read receiver alive");
+            PtyReadResult::empty()
+        });
+        peer.write_all(b"previous-output").expect("peer output");
+        assert!(runner.read_once());
+        assert_eq!(
+            read_rx.try_recv().expect("callback output"),
+            b"previous-output"[..]
+        );
+
+        runner.file = Arc::new(std::fs::File::open(".").expect("directory descriptor"));
+        assert!(
+            !runner.read_once(),
+            "reading directory is a fatal I/O error"
+        );
+        assert!(matches!(
+            read_rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn handoff_drain_delivers_short_output_after_full_normal_read() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer timeout");
+        let (read_tx, read_rx) = std_mpsc::channel();
+        runner.on_read = Box::new(move |bytes| {
+            read_tx
+                .send(Bytes::copy_from_slice(bytes))
+                .expect("read receiver alive");
+            PtyReadResult::empty()
+        });
+        peer.write_all(&[0xA5; 8192]).expect("normal output");
+        let mut normal = Vec::new();
+        while normal.len() < 8192 {
+            assert!(runner.read_once());
+            normal.extend(read_rx.try_recv().expect("normal callback"));
+        }
+        assert_eq!(normal, vec![0xA5; 8192]);
+
+        let mut prefilled = 0;
+        loop {
+            match runner.file.as_ref().write(&[0xBB; 8192]) {
+                Ok(written) => prefilled += written,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("fill actor write buffer: {err}"),
+            }
+        }
+        assert!(prefilled > 0);
+        runner.enqueue_write(Bytes::from_static(b"drained"));
+        let handoff = std::thread::spawn(move || {
+            runner.begin_handoff().expect("handoff drains writes");
+            runner
+        });
+
+        for payload in [b"x".as_slice(), b"short".as_slice()] {
+            peer.write_all(payload)
+                .expect("output during handoff drain");
+            let mut delivered = Vec::new();
+            while delivered.len() < payload.len() {
+                delivered.extend(
+                    read_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .expect("handoff drains output while input is blocked"),
+                );
+            }
+            assert_eq!(delivered, payload);
+        }
+
+        let mut input = vec![0; prefilled + 7];
+        peer.read_exact(&mut input)
+            .expect("peer drains queued input");
+        assert!(input[..prefilled].iter().all(|byte| *byte == 0xBB));
+        assert_eq!(&input[prefilled..], b"drained");
+        let runner = handoff.join().expect("handoff joins");
+        assert_eq!(runner.state, ActorState::Quiesced);
     }
 
     #[test]
@@ -2252,6 +2853,7 @@ mod tests {
             diagnostic_input: crate::latency_prof::InputStimuli::default(),
             pane_id: 1,
             file: Arc::new(std::fs::File::from(owned)),
+            read_buffer: [0; ACTOR_READ_BUFFER_SIZE],
             data_rx,
             control_rx,
             state: ActorState::Running,
@@ -2408,6 +3010,7 @@ mod tests {
             file: Arc::new(std::fs::File::from(unsafe {
                 OwnedFd::from_raw_fd(actor_socket.into_raw_fd())
             })),
+            read_buffer: [0; ACTOR_READ_BUFFER_SIZE],
             data_rx,
             control_rx,
             state: ActorState::Running,
