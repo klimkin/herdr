@@ -8,6 +8,9 @@ use tracing::{debug, error, warn};
 use crate::ipc::LocalListener;
 use crate::server::client_transport::{self, ServerEvent};
 
+/// Bounded admission keeps connection bursts from monopolizing runtime work.
+pub(crate) const CLIENT_ACCEPT_BATCH_LIMIT: usize = 32;
+
 /// Actual accept return codes, also available to the opt-in render profiler.
 #[derive(Default)]
 pub(crate) struct AcceptStats {
@@ -37,7 +40,7 @@ pub(crate) fn accept_pending_client_connections(
     server_event_tx: &mpsc::Sender<ServerEvent>,
 ) -> io::Result<AcceptStats> {
     let mut stats = AcceptStats::default();
-    loop {
+    for _ in 0..CLIENT_ACCEPT_BATCH_LIMIT {
         if should_quit.load(Ordering::Acquire) {
             break;
         }
@@ -77,9 +80,9 @@ pub(crate) fn accept_pending_client_connections(
             Err(err) => {
                 if err.kind() == io::ErrorKind::Interrupted {
                     stats.interrupted += 1;
-                } else {
-                    stats.failed += 1;
+                    continue;
                 }
+                stats.failed += 1;
                 error!(err = %err, "client listener accept failed");
                 break;
             }
@@ -97,7 +100,7 @@ pub(crate) fn reject_pending_client_connections(
     listener: &LocalListener,
 ) -> io::Result<AcceptStats> {
     let mut stats = AcceptStats::default();
-    loop {
+    for _ in 0..CLIENT_ACCEPT_BATCH_LIMIT {
         stats.attempted += 1;
         match listener.accept() {
             Ok(_stream) => {
@@ -111,9 +114,9 @@ pub(crate) fn reject_pending_client_connections(
             Err(err) => {
                 if err.kind() == io::ErrorKind::Interrupted {
                     stats.interrupted += 1;
-                } else {
-                    stats.failed += 1;
+                    continue;
                 }
+                stats.failed += 1;
                 error!(err = %err, "client listener reject failed");
                 break;
             }

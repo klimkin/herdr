@@ -256,8 +256,16 @@ impl HeadlessServer {
         restrict_socket_permissions(&client_path)?;
         let client_socket_identity = socket_file_identity(&client_path)?;
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+        // Registration must succeed before either socket owner is replaced.
+        let listener_ready = if self.client_listener_ready.is_some() {
+            Some(crate::platform::LocalListenerReady::new(&listener)?)
+        } else {
+            None
+        };
 
         self.api_server = Some(api_server);
+        self.client_listener_ready = listener_ready;
+        self.client_accept_retry_at = None;
         self.client_listener = listener;
         self.client_socket_path = client_path;
         self.client_socket_identity = client_socket_identity;
@@ -432,6 +440,54 @@ mod client_accept_tests {
         assert!(matches!(
             message,
             ServerMessage::Welcome { error: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_accept_handoff_rebind_replaces_readiness_owner() {
+        let mut server = test_headless_server();
+        server.client_listener_ready =
+            Some(crate::platform::LocalListenerReady::new(&server.client_listener).unwrap());
+        let mut exported = hello_client(&server);
+        server
+            .client_listener_ready
+            .as_ref()
+            .unwrap()
+            .ready()
+            .await
+            .unwrap();
+        server.handoff_in_progress = true;
+        server.accept_client_connections().unwrap();
+        assert!(protocol::read_message::<_, ServerMessage>(&mut exported, MAX_FRAME_SIZE).is_err());
+
+        // Failed replacement has released the public path; original descriptors
+        // remain alive until both listener and readiness owner are replaced.
+        remove_socket_file_if_owned(&server.client_socket_path, &server.client_socket_identity)
+            .unwrap();
+        let listener = bind_local_listener(&server.client_socket_path).unwrap();
+        listener
+            .set_nonblocking(ListenerNonblockingMode::Accept)
+            .unwrap();
+        let identity = socket_file_identity(&server.client_socket_path).unwrap();
+        let ready = crate::platform::LocalListenerReady::new(&listener).unwrap();
+        server.client_listener_ready = Some(ready);
+        server.client_listener = listener;
+        server.client_socket_identity = identity;
+        let handoff_path = server.client_socket_path.with_extension("handoff");
+        server.rollback_handoff_before_commit(&handoff_path, &[]);
+        let mut recovered = hello_client(&server);
+        server
+            .client_listener_ready
+            .as_ref()
+            .unwrap()
+            .ready()
+            .await
+            .unwrap();
+        server.accept_client_connections().unwrap();
+        read_welcome(&mut recovered);
+        assert!(matches!(
+            server.server_event_rx.recv().await,
+            Some(ServerEvent::ClientConnected { client_id: 1, .. })
         ));
     }
 
