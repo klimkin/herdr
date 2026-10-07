@@ -31,6 +31,11 @@ pub(crate) use super::unix_common::{
 mod bootstrap;
 pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_process};
 
+/// Native macOS responsiveness experiments remain outside this implementation.
+pub(crate) fn latency_experiments_supported() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod config_file_tests;
 

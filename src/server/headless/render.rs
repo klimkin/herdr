@@ -1,5 +1,11 @@
 use super::*;
 
+/// Whether every detached ordinary source was handled or transferred to an
+/// existing recipient recovery owner. Target receipts are separate evidence.
+pub(super) struct FullRenderOutcome {
+    pub(super) ordinary_work_handled: bool,
+}
+
 impl HeadlessServer {
     fn shell_focused_runtime(
         &self,
@@ -377,8 +383,11 @@ impl HeadlessServer {
         self.render_and_stream_with_graphics_limit(MAX_GRAPHICS_FRAME_SIZE);
     }
 
-    pub(super) fn render_and_stream_traced(&mut self, context: crate::latency_prof::TraceContext) {
-        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context);
+    pub(super) fn render_and_stream_traced(
+        &mut self,
+        context: crate::latency_prof::TraceContext,
+    ) -> FullRenderOutcome {
+        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context)
     }
 
     #[cfg(all(test, unix))]
@@ -398,7 +407,10 @@ impl HeadlessServer {
         &mut self,
         graphics_frame_limit: usize,
         context: crate::latency_prof::TraceContext,
-    ) {
+    ) -> FullRenderOutcome {
+        let mut outcome = FullRenderOutcome {
+            ordinary_work_handled: true,
+        };
         let attempt = crate::latency_prof::AttemptTrace::begin(context, false, self.clients.len());
         crate::latency_prof::zone!("server.full_render");
         let full_started = crate::render_prof::timer();
@@ -427,7 +439,7 @@ impl HeadlessServer {
                 cols,
                 rows, resize_panes, "updated geometry with no attached clients"
             );
-            return;
+            return outcome;
         }
 
         // Resize from the controlling client's geometry before drawing any observer.
@@ -556,6 +568,7 @@ impl HeadlessServer {
                 match result {
                     Ok(surface) => Some(surface),
                     Err(reason) => {
+                        outcome.ordinary_work_handled = false;
                         if let Some(client) = self.clients.get_mut(&client_id) {
                             client.render_state.request_recompute();
                         }
@@ -734,6 +747,7 @@ impl HeadlessServer {
                     };
                     let (synchronized, epoch) = runtime.synchronized_output_state();
                     if synchronized {
+                        outcome.ordinary_work_handled = false;
                         if let Some(client) = self.clients.get_mut(&client_id) {
                             client.render_state.request_recompute();
                         }
@@ -754,6 +768,7 @@ impl HeadlessServer {
                     );
                     let (synchronized, after_epoch) = runtime.synchronized_output_state();
                     if synchronized || after_epoch != epoch {
+                        outcome.ordinary_work_handled = false;
                         if let Some(client) = self.clients.get_mut(&client_id) {
                             client.render_state.request_recompute();
                         }
@@ -792,6 +807,7 @@ impl HeadlessServer {
             };
             let Some(writer) = client.writer.as_ref().cloned() else {
                 crate::render_prof::event("full_render.writer_missing");
+                outcome.ordinary_work_handled = false;
                 continue;
             };
             let has_graphics = surface_parts
@@ -867,6 +883,7 @@ impl HeadlessServer {
                         }
                     };
                     let Some(framed) = framed else {
+                        outcome.ordinary_work_handled = false;
                         if stripped_assets.is_empty() && prepared.has_queued_surface_assets() {
                             // Delta/reuse owns an encoded payload that cannot be trimmed in
                             // place. Drop its baseline so the bounded full-surface path runs next.
@@ -908,6 +925,7 @@ impl HeadlessServer {
                         claimed, max, "skipping oversized frame for client"
                     );
                     crate::render_prof::event("full_render.serialize_oversized");
+                    outcome.ordinary_work_handled = false;
                     continue;
                 }
                 Err(err) => {
@@ -956,6 +974,19 @@ impl HeadlessServer {
                         client.shell_graphics_delivery = delivery;
                     }
                     client.render_state.commit_sent_frame(prepared);
+                    if self.app.early_presentation.actions_enabled() {
+                        if let (Some(snapshot), Some(surface)) = (
+                            client.shell_snapshot.as_ref(),
+                            client.render_state.last_pane_surface(),
+                        ) {
+                            self.app.early_presentation.acknowledge_action(
+                                snapshot,
+                                surface.projection_revision,
+                                client_id,
+                                attempt.context(),
+                            );
+                        }
+                    }
                     if shell_graphics_pending || shell_assets_deferred {
                         client.defer_full_render();
                     } else {
@@ -985,5 +1016,6 @@ impl HeadlessServer {
         self.app.full_redraw_pending = false;
         crate::render_prof::duration_since("full_render.total", full_started);
         debug!(cols, rows, foreground_client_id = ?self.foreground_client_id, "rendered virtual frame(s)");
+        outcome
     }
 }

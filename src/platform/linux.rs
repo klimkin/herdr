@@ -23,6 +23,11 @@ pub(crate) use super::unix_common::{
     ClientStreamReader, StatusCommandGuard,
 };
 
+/// Local Linux experiment implementation.
+pub(crate) fn latency_experiments_supported() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod config_file_tests;
 

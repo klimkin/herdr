@@ -924,7 +924,17 @@ impl HeadlessServer {
         self.set_default_shell_target_from_client(client_id);
         let popup_before = self.app.state.popup_pane.is_some();
         let popup_owner = self.shell_tab_id_for_client(client_id);
+        let previous_origin = self.app.early_presentation.origin;
+        if self.app.early_presentation.actions_enabled() {
+            self.app.early_presentation.origin = self.clients.get(&client_id).map(|client| {
+                crate::app::early_presentation::OriginLease {
+                    client_id,
+                    projection_revision: client.shell_projection_revision,
+                }
+            });
+        }
         let changed = self.handle_api_request_with_shutdown_check_inner(msg, false, true);
+        self.app.early_presentation.origin = previous_origin;
         self.focus_shell_client_on_default_target(client_id);
         if !popup_before && self.app.state.popup_pane.is_some() {
             self.popup_owner_tab_id = popup_owner;

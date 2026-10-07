@@ -11,6 +11,8 @@ impl HeadlessServer {
         client_id: u64,
         active: bool,
     ) -> Option<(bool, u64)> {
+        // Source activation always creates a new lease, including active→active.
+        self.app.early_presentation.cancel_client(client_id);
         let focus_before = self.shell_focus_targets();
         let focused_tabs_before = self.focused_shell_tabs();
         let (changed, projection_revision) = {

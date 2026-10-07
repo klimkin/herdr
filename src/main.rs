@@ -29,6 +29,7 @@ mod input;
 mod integration;
 mod ipc;
 mod kitty_graphics;
+mod latency_experiments;
 mod latency_prof;
 mod layout;
 mod logging;

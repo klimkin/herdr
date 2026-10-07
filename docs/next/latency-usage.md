@@ -234,3 +234,60 @@ it does not guarantee an end-to-end maximum latency.
 If the native timer cannot initialize or fails, the server logs a warning
 and uses Tokio deadline sleeping. macOS and Windows retain Tokio sleeping;
 native high-resolution implementations remain out of scope.
+
+## Early-action presentation experiment
+
+Linux supports an opt-in `action-full` policy for committed workspace renames.
+An eligible action can request a coherent full frame before ordinary cadence.
+The experiment allows at most one extra attempt per 16 ms, expires unused
+opportunities after 16 ms, and creates no refill or expiry timer. Ordinary
+presentation clocks remain unchanged. Renames that change no state receive no
+opportunity; unrelated terminal output alone cannot grant one.
+
+The default remains `ordinary`. Screening found active-output action p95
+54–70% lower, but quiet latency, CPU, and one output-freshness result exceeded
+the experiment's gates. Keep `action-full` experimental; these results do not
+justify enabling it by default or claiming an idle CPU benefit.
+
+Build once with selectors enabled and recording disabled, then compare both
+policies using the same binary, geometry, workload, and seed:
+
+```sh
+just latency-build latency-experiments
+latency_artifacts="${CARGO_TARGET_DIR:-target}/release"
+
+for latency_policy in ordinary action-full; do
+  env -u HERDR_LATENCY_TRACE_DIR \
+    HERDR_LATENCY_PRESENTATION="$latency_policy" \
+    HERDR_LATENCY_QUEUE_ORDER=current HERDR_LATENCY_QUEUE_COUNT=64 \
+    "$latency_artifacts/examples/latency_bench" \
+    --binary "$latency_artifacts/herdr" \
+    --probe "$latency_artifacts/examples/latency_probe" \
+    --path action --clients 3 --samples 1100 --warmups 10 --interval-ms 40 \
+    --load visible --layout active --panes 15 \
+    --output ".local/latency/action-$latency_policy"
+done
+```
+
+The benchmark records its fixed seed. Repeat pairs in reversed order.
+Capture required outcomes and CPU coverage;
+successful-response percentiles alone cannot establish acceptance. The default
+build rejects `action-full`; macOS and Windows reject this experiment. Queue
+selectors currently accept only `current` and `64`.
+
+For causal diagnostics, build with `just latency-build` and set
+`HERDR_LATENCY_TRACE_DIR=1` for the benchmark. After the run finishes, use the
+printed run directory and place derived reports outside its raw artifacts:
+
+```sh
+latency_run=.local/latency/action-diagnostic/REPLACE_WITH_PRINTED_RUN_ID
+mkdir -p .local/latency/reports
+python3 scripts/latency_action_report.py "$latency_run/samples.json" \
+  --traces "$latency_run/traces" \
+  --output .local/latency/reports/action.json
+```
+
+The action report separates an opportunity's grant, admission, and coherent
+enqueue from client output completion. `critical_paths` carries completed
+server/client paths; an `early_enqueued` opportunity alone does not prove a
+committed client presentation. Missing identities remain unassigned.

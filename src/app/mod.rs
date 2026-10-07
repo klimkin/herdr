@@ -17,6 +17,7 @@ mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod creation;
 mod custom_commands;
+pub(crate) mod early_presentation;
 mod git_refresh;
 mod ids;
 mod popup;
@@ -156,6 +157,8 @@ pub struct App {
     pub(crate) persist_pane_history: bool,
     /// Last render-loop attempt, including a throttled hidden-only PTY skip.
     pub(crate) last_render_at: Option<Instant>,
+    pub(crate) experiments: crate::latency_experiments::ExperimentConfig,
+    pub(crate) early_presentation: early_presentation::EarlyPresentation,
     /// Last attempt that could update a connected presentation surface.
     pub(crate) last_presentation_at: Option<Instant>,
     pub render_notify: Arc<Notify>,
@@ -392,6 +395,9 @@ impl App {
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
     ) -> std::io::Result<Self> {
+        let experiments = crate::latency_experiments::ExperimentConfig::from_environment()?;
+        let early_presentation =
+            early_presentation::EarlyPresentation::new(experiments.presentation);
         let prefix_keys = config.prefix_keys();
         crate::kitty_graphics::set_enabled(config.kitty_graphics_enabled());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
@@ -666,6 +672,8 @@ impl App {
             next_tab_bar_datetime_refresh: None,
             window_title_template: None,
             persist_pane_history: config.experimental.pane_history,
+            experiments,
+            early_presentation,
             last_render_at: None,
             last_presentation_at: None,
             api_rx,
