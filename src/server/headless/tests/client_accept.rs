@@ -321,6 +321,8 @@ async fn client_accept_loop_wakes_from_idle_and_survives_output_signals() {
             peer_reached.await.unwrap();
             let (respond_to, _) = std::sync::mpsc::channel();
             api_tx.send(api::ApiRequestMessage {
+            #[cfg(feature = "latency-prof")]
+            diagnostic_trace: crate::latency_prof::event::EventTrace::default(),
             request: api::schema::Request {
                 id: "listener-stop".into(),
                 method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
@@ -408,6 +410,8 @@ async fn client_accept_error_retry_yields_without_stopping_api_progress() {
     let (respond_to, response) = std::sync::mpsc::channel();
     api_tx
         .send(api::ApiRequestMessage {
+            #[cfg(feature = "latency-prof")]
+            diagnostic_trace: crate::latency_prof::event::EventTrace::default(),
             request: api::schema::Request {
                 id: "unaffected-api".into(),
                 method: api::schema::Method::WorkspaceList(api::schema::EmptyParams::default()),

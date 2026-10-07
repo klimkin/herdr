@@ -1454,6 +1454,119 @@ fn send_pane_shell_command(socket_path: &PathBuf, pane_id: &str, command: &str) 
     assert_eq!(response["result"]["type"], "ok", "{response}");
 }
 
+#[cfg(feature = "latency-prof")]
+#[test]
+fn synchronized_title_notification_reports_the_actual_wake_request() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let trace_dir = base.join("traces");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(
+        config_home.join(app_dir_name()).join("config.toml"),
+        "onboarding = false\n[ui]\nwindow_title = \"{terminal_title}\"\n",
+    )
+    .unwrap();
+    let trace_env = trace_dir.to_string_lossy();
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &[("HERDR_LATENCY_TRACE_DIR", trace_env.as_ref())],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &runtime_dir.join("herdr-client.sock"),
+        Duration::from_secs(10),
+    );
+    let client = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("HERDR_LATENCY_TRACE_DIR", trace_env.as_ref())],
+    );
+    let output = spawn_pty_drain(
+        client
+            ._master
+            .as_ref()
+            .expect("owned client PTY")
+            .try_clone_reader()
+            .unwrap(),
+    );
+    let created = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "notification-workspace",
+            "method": "workspace.create",
+            "params": {"cwd": base, "focus": true},
+        })
+        .to_string(),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("created pane");
+    send_pane_shell_command(
+        &api_socket,
+        pane_id,
+        "stty -echo; printf '\\033[2J\\033[HNOTIFICATION_READY'; sleep 0.2; printf '\\033[?2026h'; sleep 0.2; printf '\\033]0;SYNC_TITLE_WAKE\\007'; sleep 0.2; printf '\\033[?2026l\\r\\nNOTIFICATION_FINAL\\r\\n'",
+    );
+    wait_for_window_title(&output, "SYNC_TITLE_WAKE");
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(20),
+        || {
+            let bytes = output.lock().unwrap().bytes.clone();
+            terminal_screen::text(&bytes, 80, 24).contains("NOTIFICATION_FINAL")
+        }
+    ));
+    let server_pid = server.child.process_id().expect("server PID");
+    let client_pid = client.child.process_id().expect("client PID");
+    drop(server);
+    drop(client);
+    let trace_file = trace_dir.join(format!("{server_pid}.jsonl"));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || fs::read_to_string(&trace_file).is_ok_and(|trace| trace.contains("process.finish"))
+    ));
+    let records: Vec<Value> = fs::read_to_string(&trace_file)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("public diagnostic record"))
+        .collect();
+    let title_causes: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["stage"] == "render.notification_causes" && record["value"] == 1)
+        .collect();
+    let cause = title_causes
+        .last()
+        .expect("title-only synchronized write must retain its notification cause");
+    let wake = records.iter().find(|record| {
+        record["stage"] == "render.notify_requested"
+            && record["id"] == cause["id"]
+            && record["runtime_instance"] == cause["runtime_instance"]
+            && record["value"] == cause["scope"]
+    });
+    assert!(
+        wake.is_some(),
+        "the visible title's actual notify request must not be suppressed"
+    );
+    assert!(!records.iter().any(|record| {
+        record["stage"] == "render.notify_suppressed"
+            && record["id"] == cause["id"]
+            && record["runtime_instance"] == cause["runtime_instance"]
+            && record["value"] == cause["scope"]
+    }));
+    let client_trace = fs::read_to_string(trace_dir.join(format!("{client_pid}.jsonl")))
+        .expect("client output trace");
+    assert!(client_trace.contains("client.output_complete"));
+    cleanup_test_base(&base);
+}
+
 #[test]
 fn configured_window_title_tracks_all_tokens_and_focused_osc_only() {
     let _lock = test_lock();

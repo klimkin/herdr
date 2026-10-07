@@ -26,7 +26,21 @@ impl TerminalRuntimeRegistry {
         terminal_id: TerminalId,
         runtime: TerminalRuntime,
     ) -> Option<TerminalRuntime> {
+        Self::record_identity(&terminal_id, &runtime);
         self.runtimes.insert(terminal_id, runtime)
+    }
+
+    fn record_identity(terminal_id: &TerminalId, runtime: &TerminalRuntime) {
+        if crate::latency_prof::active() {
+            crate::latency_prof::record_runtime_at(
+                "terminal.identity",
+                crate::latency_prof::bytes_id(terminal_id.as_str().as_bytes()),
+                0,
+                0,
+                crate::latency_prof::now(),
+                runtime.runtime_instance(),
+            );
+        }
     }
 
     pub(crate) fn remove(&mut self, terminal_id: &TerminalId) -> Option<TerminalRuntime> {
@@ -82,6 +96,11 @@ impl TerminalRuntimeRegistry {
 
 impl From<HashMap<TerminalId, TerminalRuntime>> for TerminalRuntimeRegistry {
     fn from(runtimes: HashMap<TerminalId, TerminalRuntime>) -> Self {
+        if crate::latency_prof::active() {
+            for (terminal_id, runtime) in &runtimes {
+                Self::record_identity(terminal_id, runtime);
+            }
+        }
         Self { runtimes }
     }
 }

@@ -84,6 +84,39 @@ pub struct ApiRequestMessage {
     pub request: Request,
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    #[cfg(feature = "latency-prof")]
+    pub(crate) diagnostic_trace: crate::latency_prof::event::EventTrace,
+}
+
+impl ApiRequestMessage {
+    pub(crate) fn selected_wait(&mut self, wait: &crate::latency_prof::wait::WaitTrace) {
+        #[cfg(feature = "latency-prof")]
+        {
+            self.diagnostic_trace = self.diagnostic_trace.with_selected_wait(wait);
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        let _ = wait;
+    }
+
+    pub(crate) fn deferred(self) -> Self {
+        #[cfg(feature = "latency-prof")]
+        {
+            let mut message = self;
+            message.diagnostic_trace = message.diagnostic_trace.deferred();
+            message
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        {
+            self
+        }
+    }
+
+    pub(crate) fn received(&self, remaining: usize) {
+        #[cfg(feature = "latency-prof")]
+        self.diagnostic_trace.received(2, remaining);
+        #[cfg(not(feature = "latency-prof"))]
+        let _ = remaining;
+    }
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;

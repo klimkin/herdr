@@ -438,6 +438,7 @@ impl HeadlessServer {
         let mut needs_graphics_render = false;
 
         loop {
+            let _turn = crate::latency_prof::event::TurnTrace::begin();
             #[cfg(feature = "latency-prof")]
             crate::latency_prof::record("writer.server_pass", 0, 0);
             crate::render_prof::event("loop.tick");
@@ -577,6 +578,13 @@ impl HeadlessServer {
                             needs_graphics_render,
                         )))
             {
+                #[cfg(feature = "latency-prof")]
+                let presentation = crate::latency_prof::PresentationTrace::selected(
+                    now,
+                    self.app.presentation_deadline(now),
+                );
+                #[cfg(not(feature = "latency-prof"))]
+                let presentation = crate::latency_prof::PresentationTrace::selected(now, now);
                 crate::latency_prof::record("render.attempt_eligible", 0, 0);
                 crate::render_prof::event("render.attempt");
                 let pending_request = self.app.render_dirty.take_pending();
@@ -650,12 +658,15 @@ impl HeadlessServer {
                     crate::render_prof::event("render.skipped.hidden_sources");
                 } else if !needs_full_render
                     && !needs_graphics_render
-                    && self.render_retained_pane_surface_and_stream(&render_request.pty_sources)
+                    && self.render_retained_pane_surface_traced(
+                        &render_request.pty_sources,
+                        presentation.context(),
+                    )
                 {
                     crate::render_prof::event("retained_surface.invoke");
                 } else {
                     crate::render_prof::event("full_render.invoke");
-                    self.render_and_stream();
+                    self.render_and_stream_traced(presentation.context());
                 }
                 // Ordinary attempts handle every detached source, including
                 // hidden classification and existing per-client full recovery.
@@ -676,22 +687,17 @@ impl HeadlessServer {
             }
 
             // 8. Wait for next event.
-            let next_deadline = self.app.next_headless_loop_deadline_with_git_refresh(
+            let mut deadline = self.app.next_headless_deadline_selection(
                 now,
                 needs_render,
                 self.git_refresh_scheduled(),
             );
-            let next_deadline = self
-                .pending_alt_screen_reads
-                .iter()
-                .map(|pending| pending.next_deadline())
-                .fold(next_deadline, |deadline, pending| {
-                    Some(deadline.map_or(pending, |current| current.min(pending)))
-                });
+            for pending in &self.pending_alt_screen_reads {
+                deadline.include(Some(pending.next_deadline()), 1 << 13);
+            }
             #[cfg(unix)]
-            let next_deadline = self.client_accept_retry_at.map_or(next_deadline, |retry| {
-                Some(next_deadline.map_or(retry, |deadline| deadline.min(retry)))
-            });
+            deadline.include(self.client_accept_retry_at, 1 << 14);
+            let wait = crate::latency_prof::wait::WaitTrace::begin(deadline);
             let event = {
                 #[cfg(unix)]
                 let listener_ready = wait_for_client_listener(
@@ -701,23 +707,24 @@ impl HeadlessServer {
                 #[cfg(windows)]
                 let listener_ready = std::future::pending::<io::Result<()>>();
                 tokio::select! {
-                    _ = self.server_stop.wait_requested() => LoopEvent::Timer,
+                    _ = self.server_stop.wait_requested() => { wait.returned("loop.wait_end.stop"); LoopEvent::Timer },
                     maybe_api = self.app.api_rx.recv() => match maybe_api {
-                        Some(msg) => LoopEvent::Api(Box::new(msg)),
-                        None => LoopEvent::Timer,
+                        Some(mut msg) => { wait.returned("loop.wait_end.api"); msg.selected_wait(&wait); msg.received(self.app.api_rx.len()); LoopEvent::Api(Box::new(msg)) },
+                        None => { wait.returned("loop.wait_end.api_closed"); LoopEvent::Timer },
                     },
                     maybe_ev = self.app.event_rx.recv() => match maybe_ev {
-                        Some(ev) => LoopEvent::Internal(ev),
-                        None => LoopEvent::Timer,
+                        Some(mut ev) => { wait.returned("loop.wait_end.internal"); ev.selected_wait(&wait); ev.received(self.app.event_rx.len()); LoopEvent::Internal(ev) },
+                        None => { wait.returned("loop.wait_end.internal_closed"); LoopEvent::Timer },
                     },
                     maybe_server_ev = self.server_event_rx.recv() => match maybe_server_ev {
-                        Some(ev) => LoopEvent::ServerEvent(ev),
-                        None => LoopEvent::Timer,
+                        Some(mut ev) => { wait.returned("loop.wait_end.server_event"); ev.selected_wait(&wait); ev.received(self.server_event_rx.len()); LoopEvent::ServerEvent(ev) },
+                        None => { wait.returned("loop.wait_end.server_closed"); LoopEvent::Timer },
                     },
-                    _ = deadline_waiter.wait(next_deadline) => LoopEvent::Timer,
-                    _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
+                    _ = deadline_waiter.wait(deadline.deadline) => { wait.returned("loop.wait_end.deadline"); LoopEvent::Timer },
+                    _ = self.app.render_notify.notified() => { wait.returned("loop.wait_end.render"); LoopEvent::RenderRequested },
                     result = listener_ready => {
                         result?;
+                        wait.returned("loop.wait_end.listener_ready");
                         LoopEvent::ClientListenerReady
                     },
                 }
@@ -730,16 +737,19 @@ impl HeadlessServer {
                     LoopEvent::Internal(ev) => {
                         self.handle_internal_event_with_forwarding(ev);
                     }
-                    LoopEvent::ServerEvent(
-                        ServerEvent::ClientConnected { writer, .. }
-                        | ServerEvent::ClientShellConnected { writer, .. },
-                    ) => {
-                        if let Ok(message) =
-                            Self::frame_server_message(&ServerMessage::ServerShutdown {
-                                reason: Some("server is shutting down".to_owned()),
-                            })
+                    LoopEvent::ServerEvent(ev) => {
+                        let (ev, trace) = ev.into_trace();
+                        let _handler = trace.handler_in(1);
+                        if let ServerEvent::ClientConnected { writer, .. }
+                        | ServerEvent::ClientShellConnected { writer, .. } = ev
                         {
-                            let _ = writer.control.send(message);
+                            if let Ok(message) =
+                                Self::frame_server_message(&ServerMessage::ServerShutdown {
+                                    reason: Some("server is shutting down".to_owned()),
+                                })
+                            {
+                                let _ = writer.control.send(message);
+                            }
                         }
                     }
                     _ => {}
@@ -1164,6 +1174,10 @@ impl HeadlessServer {
 
     /// Drains server events from the dedicated channel.
     fn drain_server_events(&mut self) -> bool {
+        let mut batch = crate::latency_prof::work::BatchTrace::begin(
+            "batch.begin.server",
+            EXTERNAL_EVENT_DRAIN_LIMIT,
+        );
         crate::latency_prof::zone!("server.dispatch_batch");
         let mut changed = false;
         for _ in 0..EXTERNAL_EVENT_DRAIN_LIMIT {
@@ -1173,6 +1187,8 @@ impl HeadlessServer {
             let Ok(ev) = self.server_event_rx.try_recv() else {
                 break;
             };
+            ev.received(self.server_event_rx.len());
+            batch.handled();
             changed |= self.handle_server_event_with_render_impact(ev) == RenderImpact::Full;
         }
         changed
@@ -1181,6 +1197,9 @@ impl HeadlessServer {
     async fn reject_late_client_connections(&mut self) {
         self.server_event_rx.close();
         while let Some(event) = self.server_event_rx.recv().await {
+            event.received(self.server_event_rx.len());
+            let (event, trace) = event.into_trace();
+            let _handler = trace.handler_in(1);
             if let ServerEvent::ClientConnected { writer, .. }
             | ServerEvent::ClientShellConnected { writer, .. } = event
             {
@@ -1675,14 +1694,18 @@ impl HeadlessServer {
         msg: &ServerMessage,
         max_frame_size: usize,
     ) -> Result<Vec<u8>, protocol::FramingError> {
+        Self::frame_server_message_impl(msg, max_frame_size, true)
+    }
+
+    fn frame_server_message_impl(
+        msg: &ServerMessage,
+        max_frame_size: usize,
+        legacy_links: bool,
+    ) -> Result<Vec<u8>, protocol::FramingError> {
         crate::latency_prof::zone!("server.serialize");
         crate::latency_prof::message(msg, "server.surface");
         let mut framed = Vec::new();
         protocol::write_message(&mut framed, msg)?;
-        crate::latency_prof::surface_links(
-            msg,
-            crate::latency_prof::bytes_id(framed.get(4..).unwrap_or_default()),
-        );
         let payload_len = framed.len().saturating_sub(4);
         if payload_len > max_frame_size {
             return Err(protocol::FramingError::Oversized {
@@ -1690,7 +1713,42 @@ impl HeadlessServer {
                 max: max_frame_size,
             });
         }
+        if legacy_links {
+            crate::latency_prof::surface_links(
+                msg,
+                crate::latency_prof::bytes_id(framed.get(4..).unwrap_or_default()),
+            );
+        }
         Ok(framed)
+    }
+
+    fn frame_server_message_traced(
+        msg: &ServerMessage,
+        max: usize,
+        context: crate::latency_prof::TraceContext,
+        sources: &crate::latency_prof::runtime::PaneSources,
+    ) -> Result<(Vec<u8>, Vec<crate::latency_prof::SerializedFrame>), protocol::FramingError> {
+        let framed = Self::frame_server_message_impl(msg, max, false)?;
+        let trace =
+            crate::latency_prof::presentation::serialized(msg, &framed, context, sources, None);
+        Ok((framed, trace))
+    }
+
+    fn frame_prepared_render_traced(
+        prepared: &crate::server::render_stream::PreparedRender,
+        max: usize,
+        context: crate::latency_prof::TraceContext,
+        sources: &crate::latency_prof::runtime::PaneSources,
+    ) -> Result<(Vec<u8>, Vec<crate::latency_prof::SerializedFrame>), protocol::FramingError> {
+        let framed = Self::frame_server_message_impl(prepared.message(), max, false)?;
+        let trace = crate::latency_prof::presentation::serialized(
+            prepared.message(),
+            &framed,
+            context,
+            sources,
+            prepared.diagnostic_panes(),
+        );
+        Ok((framed, trace))
     }
 
     /// Sends a message to all connected clients.
@@ -1955,12 +2013,17 @@ impl HeadlessServer {
 
     /// Handles a server event. Returns true if the event requires a re-render.
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
+        let (ev, trace) = ev.into_trace();
+        let _handler = trace.handler_in(1);
         crate::latency_prof::zone!("server.dispatch");
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
+            crate::latency_prof::event::outcome(3);
             return false;
         }
 
         match ev {
+            #[cfg(feature = "latency-prof")]
+            ServerEvent::Diagnostic { .. } => false,
             ServerEvent::ClientConnected {
                 client_id,
                 cols,
@@ -2664,6 +2727,8 @@ impl HeadlessServer {
                 final_chunk,
                 data,
             } => {
+                #[cfg(feature = "latency-prof")]
+                crate::latency_prof::event::current().record("event.dispatch", 0);
                 let command_surface_revision = self.clients.get(&client_id).and_then(|client| {
                     (matches!(client.mode, ClientConnectionMode::ClientShell)
                         && client.shell_endpoint_command_in_flight
@@ -2672,6 +2737,7 @@ impl HeadlessServer {
                         .flatten()
                 });
                 let Some(command_surface_revision) = command_surface_revision else {
+                    crate::latency_prof::event::outcome(3);
                     return false;
                 };
                 let completed_deferred_response =
@@ -2959,7 +3025,7 @@ impl HeadlessServer {
                     changed |= self.handle_api_request_with_shutdown_check(msg);
                 }
                 AltScreenReadConflict::Frozen(_) | AltScreenReadConflict::Defer => {
-                    self.deferred_alt_screen_reads.push(msg);
+                    self.deferred_alt_screen_reads.push(msg.deferred());
                 }
             }
         }
@@ -2970,6 +3036,10 @@ impl HeadlessServer {
     ///
     /// During shutdown, remaining requests get a `server_unavailable` error.
     fn drain_api_requests_with_shutdown_check(&mut self) -> bool {
+        let mut batch = crate::latency_prof::work::BatchTrace::begin(
+            "batch.begin.api",
+            EXTERNAL_EVENT_DRAIN_LIMIT,
+        );
         let mut changed = false;
         for _ in 0..EXTERNAL_EVENT_DRAIN_LIMIT {
             if self.should_quit.load(Ordering::Acquire) {
@@ -2978,6 +3048,8 @@ impl HeadlessServer {
             let Ok(msg) = self.app.api_rx.try_recv() else {
                 break;
             };
+            msg.received(self.app.api_rx.len());
+            batch.handled();
             changed |= self.handle_api_request_with_shutdown_check(msg);
         }
         changed
@@ -2988,6 +3060,7 @@ impl HeadlessServer {
             let Ok(msg) = self.app.api_rx.try_recv() else {
                 break;
             };
+            msg.received(self.app.api_rx.len());
             self.handle_api_request_with_shutdown_check(msg);
         }
     }
@@ -2998,7 +3071,10 @@ impl HeadlessServer {
         skip_default_workspace_for_request: bool,
         client_local: bool,
     ) -> bool {
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::event::current().record("event.dispatch", 0);
         if self.shutting_down {
+            crate::latency_prof::event::outcome(3);
             // During shutdown, respond with server_unavailable.
             let response = serde_json::to_string(&api::schema::ErrorResponse {
                 id: msg.request.id,
@@ -3011,6 +3087,8 @@ impl HeadlessServer {
                 r#"{"id":"","error":{"code":"server_unavailable","message":"server is shutting down"}}"#
                     .to_string()
             });
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::event::current().response(&response);
             let _ = msg.respond_to.send(response);
             return false;
         }
@@ -3019,7 +3097,8 @@ impl HeadlessServer {
             AltScreenReadConflict::None => None,
             AltScreenReadConflict::Frozen(snapshot) => Some(snapshot),
             AltScreenReadConflict::Defer => {
-                self.deferred_alt_screen_reads.push(msg);
+                crate::latency_prof::event::outcome(2);
+                self.deferred_alt_screen_reads.push(msg.deferred());
                 return false;
             }
         };
@@ -3042,6 +3121,9 @@ impl HeadlessServer {
                 }),
             }
             .unwrap_or_else(|_| "{}".to_string());
+            crate::latency_prof::event::outcome(if handoff_succeeded { 1 } else { 3 });
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::event::current().response(&response);
             let _ = msg.respond_to.send(response);
             if handoff_succeeded {
                 wait_for_live_handoff_response_write(msg.response_write_complete);
@@ -3053,6 +3135,9 @@ impl HeadlessServer {
         if let api::schema::Method::NotificationShow(params) = &msg.request.method {
             let response =
                 self.handle_notification_show_api(msg.request.id.clone(), params.clone());
+            crate::latency_prof::event::outcome(1);
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::event::current().response(&response);
             let _ = msg.respond_to.send(response);
             return true;
         }
@@ -3063,11 +3148,17 @@ impl HeadlessServer {
                     msg.request.id.clone(),
                     Some(params.title.clone()),
                 );
+                crate::latency_prof::event::outcome(1);
+                #[cfg(feature = "latency-prof")]
+                crate::latency_prof::event::current().response(&response);
                 let _ = msg.respond_to.send(response);
                 return true;
             }
             api::schema::Method::ClientWindowTitleClear(_) => {
                 let response = self.handle_client_window_title_api(msg.request.id.clone(), None);
+                crate::latency_prof::event::outcome(1);
+                #[cfg(feature = "latency-prof")]
+                crate::latency_prof::event::current().response(&response);
                 let _ = msg.respond_to.send(response);
                 return true;
             }
@@ -3119,16 +3210,20 @@ impl HeadlessServer {
 
         self.sync_foreground_client_state();
         if let Some(error) = self.agent_read_not_idle_error(&msg.request) {
+            crate::latency_prof::event::outcome(3);
             let response = serde_json::to_string(&api::schema::ErrorResponse {
                 id: msg.request.id.clone(),
                 error,
             })
             .unwrap_or_else(|_| "{}".to_owned());
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::event::current().response(&response);
             let _ = msg.respond_to.send(response);
             return changed;
         }
         let alt_screen_read_spec = self.alt_screen_read_spec(&msg.request);
         if matches!(&msg.request.method, api::schema::Method::AgentPrompt(_)) {
+            crate::latency_prof::event::outcome(2);
             let deferred_changed = self
                 .app
                 .handle_deferred_agent_api_request(msg.request, msg.respond_to);
@@ -3141,6 +3236,7 @@ impl HeadlessServer {
                 | api::schema::Method::WorktreeList(_)
                 | api::schema::Method::WorktreeOpen(_)
         ) {
+            crate::latency_prof::event::outcome(2);
             let read_only = matches!(&msg.request.method, api::schema::Method::WorktreeList(_));
             let deferred_changed = self.app.handle_deferred_worktree_api_request(
                 msg.request,
@@ -3210,11 +3306,15 @@ impl HeadlessServer {
                         spec.content_seq,
                         Instant::now(),
                     );
+                    crate::latency_prof::event::outcome(2);
                     self.pending_alt_screen_reads.push(pending);
                     return changed;
                 }
             }
         }
+        crate::latency_prof::event::outcome(1);
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::event::current().response(&response);
         let _ = msg.respond_to.send(response);
 
         // Forward new toast state only when a client-local delivery mode is selected.
@@ -3366,6 +3466,7 @@ impl HeadlessServer {
     ///
     /// Similar to the former App scheduler but without terminal resize polling.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
+        let _batch = crate::latency_prof::work::BatchTrace::begin("batch.begin.scheduled", 0);
         let mut changed = false;
 
         // No resize polling needed — server has no terminal.

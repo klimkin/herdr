@@ -133,6 +133,8 @@ impl HeadlessServer {
             | self.handle_client_shell_api_request(
                 client_id,
                 api::ApiRequestMessage {
+                    #[cfg(feature = "latency-prof")]
+                    diagnostic_trace: crate::latency_prof::event::current(),
                     request: *request,
                     respond_to,
                     response_write_complete: None,

@@ -597,6 +597,10 @@ impl TerminalRuntime {
     pub(crate) fn content_seq(&self) -> u64 {
         self.0.content_seq()
     }
+
+    pub(crate) fn runtime_instance(&self) -> u64 {
+        self.0.runtime_instance()
+    }
 }
 
 #[cfg(test)]

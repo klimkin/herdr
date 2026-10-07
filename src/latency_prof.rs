@@ -1,5 +1,12 @@
 //! Opt-in batch diagnostics. No runtime state or published codec is changed.
 
+pub(crate) mod event;
+pub(crate) mod presentation;
+pub(crate) mod runtime;
+pub(crate) mod wait;
+pub(crate) mod work;
+pub(crate) use presentation::{AttemptTrace, PresentationTrace, SerializedFrame, TraceContext};
+
 #[cfg(feature = "latency-prof")]
 mod enabled {
     use std::fs::File;
@@ -25,6 +32,11 @@ mod enabled {
         connection: u64,
         occurrence: u64,
         offset: u64,
+        presentation: u64,
+        attempt: u64,
+        serialization: u64,
+        runtime_instance: u64,
+        service: u64,
     }
 
     struct Profiler {
@@ -46,11 +58,15 @@ mod enabled {
                 let path = PathBuf::from(std::env::var_os("HERDR_LATENCY_TRACE_DIR")?);
                 std::fs::create_dir_all(&path).ok()?;
                 let file = File::create(path.join(format!("{}.jsonl", std::process::id()))).ok()?;
+                let started_ns = crate::platform::latency::monotonic_ns().unwrap_or(0);
                 let (sender, receiver) = mpsc::sync_channel::<Command>(65536);
                 let worker = std::thread::Builder::new()
                     .name("latency-records".into())
                     .spawn(move || {
                         let mut file = BufWriter::new(file);
+                        if writeln!(file, "{{\"stage\":\"diagnostics.schema\",\"pid\":{},\"ns\":{started_ns},\"id\":0,\"scope\":0,\"value\":2,\"dropped\":0}}", std::process::id()).is_err() {
+                            return;
+                        }
                         loop {
                             match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
                                 Ok(Command::Record(record)) => {
@@ -97,6 +113,24 @@ mod enabled {
         ns: u64,
         frame: super::FrameIdentity,
     ) {
+        record_context_at(
+            stage,
+            id,
+            value,
+            scope,
+            ns,
+            (frame, super::TraceContext::default()),
+        );
+    }
+
+    pub(super) fn record_context_at(
+        stage: &'static str,
+        id: u64,
+        value: u64,
+        scope: u64,
+        ns: u64,
+        (frame, context): (super::FrameIdentity, super::TraceContext),
+    ) {
         let Some(profiler) = profiler() else {
             return;
         };
@@ -118,6 +152,11 @@ mod enabled {
             connection: frame.connection,
             occurrence: frame.occurrence,
             offset: frame.offset,
+            presentation: context.presentation,
+            attempt: context.attempt,
+            serialization: context.serialization,
+            runtime_instance: context.runtime_instance,
+            service: context.service,
         };
         if profiler.sender.try_send(Command::Record(record)).is_err() {
             profiler.dropped.fetch_add(1, Ordering::Relaxed);
@@ -321,6 +360,49 @@ pub(crate) fn record_at(stage: &'static str, id: u64, value: u64, scope: u64, ns
     #[cfg(not(feature = "latency-prof"))]
     let _ = (stage, id, value, scope, ns);
 }
+
+#[cfg(feature = "latency-prof")]
+pub(crate) fn mark(stage: &'static str) {
+    #[cfg(feature = "latency-prof")]
+    enabled::mark(stage);
+    #[cfg(not(feature = "latency-prof"))]
+    let _ = stage;
+}
+
+pub(crate) fn record_runtime_at(
+    stage: &'static str,
+    id: u64,
+    value: u64,
+    scope: u64,
+    ns: u64,
+    runtime_instance: u64,
+) {
+    #[cfg(feature = "latency-prof")]
+    record_context_at(
+        stage,
+        id,
+        value,
+        scope,
+        ns,
+        TraceContext {
+            runtime_instance,
+            ..TraceContext::default()
+        },
+    );
+    #[cfg(not(feature = "latency-prof"))]
+    let _ = (stage, id, value, scope, ns, runtime_instance);
+}
+
+pub(crate) fn active() -> bool {
+    #[cfg(feature = "latency-prof")]
+    {
+        enabled::active()
+    }
+    #[cfg(not(feature = "latency-prof"))]
+    {
+        false
+    }
+}
 #[cfg(feature = "latency-prof")]
 pub(crate) fn next_scope() -> u64 {
     #[cfg(feature = "latency-prof")]
@@ -355,10 +437,16 @@ pub(crate) fn frame_ids(bytes: &[u8]) -> Vec<(u64, u64)> {
 
 #[cfg(feature = "latency-prof")]
 thread_local! {
+    static WIRE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WIRE_FRAME: std::cell::Cell<FrameIdentity> = const { std::cell::Cell::new(FrameIdentity::empty()) };
     static READ_POSITION: std::cell::Cell<(u64,u64)> = const { std::cell::Cell::new((0,0)) };
     static DELIVERY_FRAME: std::cell::Cell<FrameIdentity> = const { std::cell::Cell::new(FrameIdentity::empty()) };
 }
+#[cfg(feature = "latency-prof")]
+pub(crate) fn received_payload_bytes() -> u64 {
+    WIRE_BYTES.with(std::cell::Cell::get)
+}
+
 pub(crate) fn wire_received(bytes: &[u8]) {
     #[cfg(feature = "latency-prof")]
     {
@@ -376,6 +464,7 @@ pub(crate) fn wire_received(bytes: &[u8]) {
                 offset,
             }
         });
+        WIRE_BYTES.with(|value| value.set(bytes.len() as u64));
         WIRE_FRAME.with(|value| value.set(frame));
         record_frame_at("transport.receive", bytes.len() as u64, 0, now(), frame);
     }
@@ -507,27 +596,6 @@ pub(crate) fn surface_links(msg: &crate::protocol::ServerMessage, fingerprint: u
     #[cfg(not(feature = "latency-prof"))]
     let _ = (msg, fingerprint);
 }
-pub(crate) fn snapshot_links(snapshot: &crate::protocol::ClientShellSnapshot, framed: &[u8]) {
-    #[cfg(feature = "latency-prof")]
-    {
-        if !enabled::active() {
-            return;
-        }
-        let fingerprint = framed.get(4..).map(bytes_id).unwrap_or(0);
-        for workspace in &snapshot.workspaces {
-            record_at(
-                "snapshot.label",
-                bytes_id(workspace.label.as_bytes()),
-                snapshot.revision,
-                fingerprint,
-                now(),
-            );
-        }
-    }
-    #[cfg(not(feature = "latency-prof"))]
-    let _ = (snapshot, framed);
-}
-
 /// Raw input identity recognition is diagnostic-only; arbitrary input is unassigned.
 #[derive(Default)]
 pub(crate) struct InputStimuli {
@@ -640,8 +708,12 @@ impl FrameIdentity {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QueuedFrame {
+    #[cfg(feature = "latency-prof")]
     pub(crate) identity: FrameIdentity,
+    #[cfg(feature = "latency-prof")]
     pub(crate) len: u64,
+    #[cfg(feature = "latency-prof")]
+    pub(crate) context: TraceContext,
 }
 
 #[cfg(any(feature = "latency-prof", test))]
@@ -658,6 +730,7 @@ pub(crate) fn queued_frames(bytes: &[u8], connection: u64) -> Vec<QueuedFrame> {
                     offset: 0,
                 },
                 len,
+                context: TraceContext::default(),
             })
             .collect()
     }
@@ -668,6 +741,7 @@ pub(crate) fn queued_frames(bytes: &[u8], connection: u64) -> Vec<QueuedFrame> {
     }
 }
 
+#[cfg(feature = "latency-prof")]
 pub(crate) fn record_frame_at(
     stage: &'static str,
     value: u64,
@@ -682,9 +756,41 @@ pub(crate) fn record_frame_at(
 }
 
 pub(crate) fn emit_queued_frames(stage: &'static str, frames: &[QueuedFrame], scope: u64, ns: u64) {
+    #[cfg(not(feature = "latency-prof"))]
+    let _ = (stage, frames, scope, ns);
+    #[cfg(feature = "latency-prof")]
     for frame in frames {
-        record_frame_at(stage, frame.len, scope, ns, frame.identity);
+        enabled::record_context_at(
+            stage,
+            frame.identity.fingerprint,
+            frame.len,
+            scope,
+            ns,
+            (frame.identity, frame.context),
+        );
     }
+}
+
+#[cfg(feature = "latency-prof")]
+pub(crate) fn record_context_at(
+    stage: &'static str,
+    id: u64,
+    value: u64,
+    scope: u64,
+    ns: u64,
+    context: TraceContext,
+) {
+    #[cfg(feature = "latency-prof")]
+    enabled::record_context_at(
+        stage,
+        id,
+        value,
+        scope,
+        ns,
+        (FrameIdentity::default(), context),
+    );
+    #[cfg(not(feature = "latency-prof"))]
+    let _ = (stage, id, value, scope, ns, context);
 }
 
 /// Track framed-byte positions from immediately after the welcome. A lost record

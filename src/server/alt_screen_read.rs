@@ -25,6 +25,8 @@ enum Phase {
 }
 
 pub(crate) struct PendingAltScreenRead {
+    #[cfg(feature = "latency-prof")]
+    diagnostic_trace: crate::latency_prof::event::EventTrace,
     pub(crate) terminal_id: TerminalId,
     request_id: String,
     respond_to: mpsc::Sender<String>,
@@ -63,6 +65,8 @@ impl PendingAltScreenRead {
         now: Instant,
     ) -> Self {
         Self {
+            #[cfg(feature = "latency-prof")]
+            diagnostic_trace: crate::latency_prof::event::current().deferred(),
             terminal_id,
             request_id,
             respond_to,
@@ -417,6 +421,8 @@ impl PendingAltScreenRead {
             result: ResponseResult::PaneRead { read: self.read },
         })
         .unwrap_or(self.fallback_response);
+        #[cfg(feature = "latency-prof")]
+        self.diagnostic_trace.response(&response);
         let _ = self.respond_to.send(response);
         None
     }
@@ -430,6 +436,8 @@ impl PendingAltScreenRead {
             valid = self.valid,
             "alternate-screen read fell back to passive snapshot"
         );
+        #[cfg(feature = "latency-prof")]
+        self.diagnostic_trace.response(&self.fallback_response);
         let _ = self.respond_to.send(self.fallback_response);
         None
     }

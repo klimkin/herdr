@@ -376,6 +376,20 @@ fn handle_connection_with_stop(
         }
     };
 
+    #[cfg(feature = "latency-prof")]
+    let diagnostic_trace = if crate::latency_prof::active() {
+        let trace =
+            crate::latency_prof::event::EventTrace::ingress(2, "event.class.api", line.len());
+        trace.record("event.origin", crate::latency_prof::next_scope());
+        trace.record(
+            "event.peer_pid",
+            crate::platform::local_stream_peer_pid(&stream).map_or(0, u64::from),
+        );
+        trace.record("event.payload.bytes", line.len() as u64);
+        trace
+    } else {
+        crate::latency_prof::event::EventTrace::default()
+    };
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
@@ -500,6 +514,8 @@ fn handle_connection_with_stop(
                 server_stop,
                 stop_caller,
                 Some(response_write_rx),
+                #[cfg(feature = "latency-prof")]
+                diagnostic_trace,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             let _ = response_write_tx.send(());
@@ -555,6 +571,7 @@ fn handle_request(
     server_stop: Option<&ServerStop>,
     stop_caller: Option<String>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    #[cfg(feature = "latency-prof")] diagnostic_trace: crate::latency_prof::event::EventTrace,
 ) -> String {
     if matches!(&request.method, Method::Ping(_)) {
         return serde_json::to_string(&SuccessResponse {
@@ -598,7 +615,15 @@ fn handle_request(
         );
     }
 
-    dispatch_to_app(request, api_tx, None, response_write_complete, None)
+    dispatch_to_app(
+        request,
+        api_tx,
+        None,
+        response_write_complete,
+        None,
+        #[cfg(feature = "latency-prof")]
+        diagnostic_trace,
+    )
 }
 
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
@@ -1040,7 +1065,15 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, None, None)
+    dispatch_to_app(
+        request,
+        api_tx,
+        timeout,
+        None,
+        None,
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::event::EventTrace::default(),
+    )
 }
 
 pub(super) fn dispatch_to_app_with_caller_timeout(
@@ -1054,6 +1087,8 @@ pub(super) fn dispatch_to_app_with_caller_timeout(
         timeout,
         None,
         Some(("timeout", "timed out waiting for agent status")),
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::event::EventTrace::default(),
     )
 }
 
@@ -1063,14 +1098,34 @@ fn dispatch_to_app(
     timeout: Option<Duration>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     timeout_response: Option<(&str, &str)>,
+    #[cfg(feature = "latency-prof")] diagnostic_trace: crate::latency_prof::event::EventTrace,
 ) -> String {
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
-    if let Err(err) = api_tx.send(ApiRequestMessage {
+    #[cfg(feature = "latency-prof")]
+    let trace = if diagnostic_trace.is_active() {
+        diagnostic_trace
+    } else {
+        crate::latency_prof::event::EventTrace::ingress(2, "event.class.api", 0)
+    };
+    #[cfg(not(feature = "latency-prof"))]
+    let trace = crate::latency_prof::event::EventTrace::default();
+    if crate::latency_prof::active() {
+        trace.record(
+            "event.method",
+            crate::latency_prof::bytes_id(api_method_name(&request.method).as_bytes()),
+        );
+    }
+    trace.record("event.send_begin", 0);
+    let sent = api_tx.send(ApiRequestMessage {
+        #[cfg(feature = "latency-prof")]
+        diagnostic_trace: trace,
         request,
         respond_to,
         response_write_complete,
-    }) {
+    });
+    trace.record("event.send_end", u64::from(sent.is_ok()));
+    if let Err(err) = sent {
         return error_response_json(
             request_id,
             "server_unavailable",
@@ -1504,6 +1559,8 @@ mod tests {
             None,
             None,
             None,
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::event::EventTrace::default(),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1525,6 +1582,8 @@ mod tests {
             Some(&stop),
             Some("pid 42 (herdr)".into()),
             None,
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::event::EventTrace::default(),
         );
 
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1548,6 +1607,8 @@ mod tests {
             Some(&stop),
             None,
             None,
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::event::EventTrace::default(),
         );
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
@@ -1564,7 +1625,16 @@ mod tests {
 
         let request_for_thread = request.clone();
         let thread = std::thread::spawn(move || {
-            handle_request(request_for_thread, &tx, None, None, None, None)
+            handle_request(
+                request_for_thread,
+                &tx,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "latency-prof")]
+                crate::latency_prof::event::EventTrace::default(),
+            )
         });
 
         let msg = rx.blocking_recv().unwrap();

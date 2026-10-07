@@ -224,16 +224,29 @@ fn has_synchronized_pane(app: &app::App, surface: &protocol::PaneSurfaceFrame) -
 impl HeadlessServer {
     /// Applies terminal dirty rows to the committed origin-relative pane surface.
     /// Any presentation or geometry uncertainty falls back to the complete renderer.
+    #[cfg(test)]
     pub(super) fn render_retained_pane_surface_and_stream(
         &mut self,
         pty_sources: &HashSet<crate::layout::PaneId>,
     ) -> bool {
+        self.render_retained_pane_surface_traced(
+            pty_sources,
+            crate::latency_prof::TraceContext::default(),
+        )
+    }
+
+    pub(super) fn render_retained_pane_surface_traced(
+        &mut self,
+        pty_sources: &HashSet<crate::layout::PaneId>,
+        context: crate::latency_prof::TraceContext,
+    ) -> bool {
+        let attempt = crate::latency_prof::AttemptTrace::begin(context, true, self.clients.len());
         crate::latency_prof::zone!("server.retained_render");
-        crate::latency_prof::record("server.frame_start", 0, self.clients.len() as u64);
         crate::render_prof::event("retained_surface.attempt");
         let started = crate::render_prof::timer();
         macro_rules! fallback {
             ($reason:literal) => {{
+                attempt.outcome(concat!("server.frame_fallback.", $reason));
                 crate::render_prof::event(concat!("retained_surface.fallback.", $reason));
                 crate::render_prof::duration_since("retained_surface.total", started);
                 return false;
@@ -241,6 +254,7 @@ impl HeadlessServer {
         }
         macro_rules! success {
             ($reason:literal) => {{
+                attempt.outcome(concat!("server.frame_success.", $reason));
                 crate::render_prof::event("retained_surface.success");
                 crate::render_prof::event(concat!("retained_surface.success.", $reason));
                 crate::render_prof::duration_since("retained_surface.total", started);
@@ -311,6 +325,7 @@ impl HeadlessServer {
         }
 
         let mut collected = Vec::with_capacity(pty_sources.len());
+        let mut diagnostic_sources = crate::latency_prof::runtime::PaneSources::default();
         for source in pty_sources {
             let mut public_pane_id = None;
             let mut width = 0u16;
@@ -343,6 +358,17 @@ impl HeadlessServer {
             let Some(snapshot) = runtime.collect_dirty_patch_snapshot(width, height) else {
                 fallback!("terminal_snapshot");
             };
+            if crate::latency_prof::active() {
+                diagnostic_sources.insert(&public_pane_id, runtime.runtime_instance());
+                crate::latency_prof::record_runtime_at(
+                    "pane.identity",
+                    pane_id.raw() as u64,
+                    crate::latency_prof::bytes_id(public_pane_id.as_bytes()),
+                    0,
+                    crate::latency_prof::now(),
+                    runtime.runtime_instance(),
+                );
+            }
             let patch = match snapshot.patch {
                 crate::pane::TerminalDirtyPatchOutcome::Clean => {
                     crate::render_prof::event("retained_surface.pane_clean");
@@ -537,38 +563,50 @@ impl HeadlessServer {
             } else {
                 protocol::MAX_FRAME_SIZE
             };
-            let mut serialized =
-                match Self::frame_server_message_with_max(prepared.message(), max_frame_size) {
-                    Ok(serialized) => serialized,
-                    Err(error) => {
-                        warn!(
-                            client_id,
-                            %error,
-                            "failed to serialize retained pane surface patch"
-                        );
-                        // A delta may own an encoded graphics payload that cannot be
-                        // trimmed in place. Force the bounded full-surface recovery path.
-                        client.render_state.request_repaint();
-                        client.defer_full_render();
-                        deferred += 1;
-                        continue;
-                    }
-                };
+            let (mut serialized, mut frame_trace) = match Self::frame_prepared_render_traced(
+                &prepared,
+                max_frame_size,
+                attempt.context(),
+                &diagnostic_sources,
+            ) {
+                Ok(serialized) => serialized,
+                Err(error) => {
+                    warn!(
+                        client_id,
+                        %error,
+                        "failed to serialize retained pane surface patch"
+                    );
+                    // A delta may own an encoded graphics payload that cannot be
+                    // trimmed in place. Force the bounded full-surface recovery path.
+                    client.render_state.request_repaint();
+                    client.defer_full_render();
+                    deferred += 1;
+                    continue;
+                }
+            };
             if let Some((_, message)) = &native_upload {
-                let Ok(file_frame) =
-                    Self::frame_server_message_with_max(message, MAX_GRAPHICS_FRAME_SIZE)
-                else {
+                let Ok((file_frame, file_trace)) = Self::frame_server_message_traced(
+                    message,
+                    MAX_GRAPHICS_FRAME_SIZE,
+                    attempt.context(),
+                    &crate::latency_prof::runtime::PaneSources::default(),
+                ) else {
                     client.defer_full_render();
                     deferred += 1;
                     continue;
                 };
+                crate::latency_prof::presentation::append(
+                    &mut frame_trace,
+                    file_trace,
+                    serialized.len(),
+                );
                 serialized.extend_from_slice(&file_frame);
             }
             crate::render_prof::counter("retained_surface.bytes", serialized.len() as u64);
             let send = if native_upload.is_some() || self.native_graphics.is_pending(client_id) {
-                writer.render.send_ordered(serialized)
+                writer.render.send_ordered_traced(serialized, &frame_trace)
             } else {
-                writer.render.try_send(serialized)
+                writer.render.try_send_traced(serialized, &frame_trace)
             };
             match send {
                 Ok(()) => {

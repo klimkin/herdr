@@ -23,6 +23,8 @@ fn public_move(
 ) -> Result<PaneMoveResult, ErrorResponse> {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+        #[cfg(feature = "latency-prof")]
+        diagnostic_trace: crate::latency_prof::event::EventTrace::default(),
         request: crate::api::schema::Request {
             id: "move-pane".into(),
             method: crate::api::schema::Method::PaneMove(params),

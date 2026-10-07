@@ -118,6 +118,11 @@ impl App {
             crate::latency_prof::bytes_id(id.as_bytes()),
             crate::latency_prof::bytes_id(params.label.as_bytes()),
         );
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::event::current().record(
+            "action.event_committed",
+            crate::latency_prof::bytes_id(params.label.as_bytes()),
+        );
         crate::logging::workspace_renamed(&ws.id);
         self.schedule_session_save();
         self.emit_event(EventEnvelope {
