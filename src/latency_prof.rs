@@ -1,5 +1,6 @@
 //! Opt-in batch diagnostics. No runtime state or published codec is changed.
 
+pub(crate) mod connect;
 pub(crate) mod event;
 pub(crate) mod presentation;
 pub(crate) mod runtime;

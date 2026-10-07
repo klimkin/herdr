@@ -222,8 +222,14 @@ pub(super) fn do_handshake(
             pixel_mouse: exact_cell_size && cfg!(unix),
         }
     };
-    protocol::write_message(stream, &hello)
-        .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
+    let trace = crate::latency_prof::connect::HandshakeTrace::begin();
+    let sent = protocol::write_message(stream, &hello);
+    trace.returned(if sent.is_ok() {
+        "client.hello_written"
+    } else {
+        "client.hello_failed"
+    });
+    sent.map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
 
     let read_timeout = if endpoint_shell && !surface_active {
         REMOTE_HANDSHAKE_READ_TIMEOUT
@@ -235,7 +241,13 @@ pub(super) fn do_handshake(
         Some(read_timeout),
         "client handshake read timeout unavailable",
     )?;
-    let welcome: ServerMessage = protocol::read_message(stream, MAX_FRAME_SIZE)?;
+    let welcome: Result<ServerMessage, _> = protocol::read_message(stream, MAX_FRAME_SIZE);
+    trace.returned(if welcome.is_ok() {
+        "client.welcome_received"
+    } else {
+        "client.welcome_failed"
+    });
+    let welcome = welcome?;
     set_handshake_recv_timeout(
         stream,
         None,

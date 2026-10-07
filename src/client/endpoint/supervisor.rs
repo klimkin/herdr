@@ -270,7 +270,10 @@ fn connect_once(
 ) -> Result<EndpointSupervisorEvent, std::io::Error> {
     let (mut stream, lifetime): (_, Box<dyn Send>) = match target {
         ConnectTarget::Local(path) => {
-            let stream = crate::ipc::connect_local_stream(path).map_err(|error| {
+            let connect_trace = crate::latency_prof::connect::ConnectTrace::begin();
+            let connection = crate::ipc::connect_local_stream(path);
+            connect_trace.complete(&connection);
+            let stream = connection.map_err(|error| {
                 // An absent Local socket is transient, unlike a missing SSH install.
                 if error.kind() == std::io::ErrorKind::NotFound {
                     std::io::Error::new(
