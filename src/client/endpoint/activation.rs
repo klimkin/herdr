@@ -108,6 +108,7 @@ impl PendingEndpointActivation {
             source_available,
             target: target_lease,
             focus,
+            late_focus: None,
             host_focused: shell.host_focus_baseline(),
             resize,
             phase: ActivationPhase::ReleasingSource {
@@ -222,10 +223,21 @@ impl PendingEndpointActivation {
     pub(crate) fn can_retarget(&self, endpoint_id: &ClientEndpointId) -> bool {
         self.target.endpoint_id == *endpoint_id
             && self.successor.is_none()
-            && matches!(
-                self.phase,
-                ActivationPhase::ReleasingSource { .. } | ActivationPhase::ActivatingTarget { .. }
-            )
+            && match &self.phase {
+                ActivationPhase::ReleasingSource { .. }
+                | ActivationPhase::ActivatingTarget { .. } => true,
+                ActivationPhase::SynchronizingPresentation { completion, .. }
+                | ActivationPhase::AwaitingPresentationEffects { completion, .. } => {
+                    **completion == ActivationCompletion::Activated
+                }
+                _ => false,
+            }
+    }
+
+    pub(crate) fn take_late_focus(
+        &mut self,
+    ) -> Option<crate::client::shell::ClientEndpointFocusTarget> {
+        self.late_focus.take().flatten()
     }
 
     /// Replace an in-flight handoff with the latest endpoint-qualified intent. The current
@@ -595,6 +607,14 @@ impl PendingEndpointActivation {
         #[cfg(windows)]
         if matches!(&focus, Some(crate::client::shell::ClientEndpointFocusTarget::Notification { boot_id, .. }) if boot_id != &self.target.boot_id)
         {
+            return Ok(());
+        }
+        if matches!(
+            self.phase,
+            ActivationPhase::SynchronizingPresentation { .. }
+                | ActivationPhase::AwaitingPresentationEffects { .. }
+        ) {
+            self.late_focus = Some(focus);
             return Ok(());
         }
         self.focus = focus;

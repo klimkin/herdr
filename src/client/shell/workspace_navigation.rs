@@ -16,6 +16,15 @@ pub(super) struct PendingWorkspaceHighlight {
     expires_at: std::time::Instant,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct EndpointFocusIntent {
+    pub(super) endpoint_id: ClientEndpointId,
+    pub(super) target: ClientEndpointFocusTarget,
+    pub(super) boot_id: String,
+    pub(super) generation: Option<u64>,
+    pub(super) request_id: Option<String>,
+}
+
 impl WorkspaceNavigationTarget {
     pub(super) fn matches(&self, endpoint_id: &ClientEndpointId, workspace_id: &str) -> bool {
         &self.endpoint_id == endpoint_id && self.workspace_id == workspace_id
@@ -23,6 +32,118 @@ impl WorkspaceNavigationTarget {
 }
 
 impl ClientShellState {
+    pub(super) fn record_endpoint_focus_intent(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        target: &ClientEndpointFocusTarget,
+    ) {
+        self.endpoint_focus_intent = self
+            .endpoints
+            .iter()
+            .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+            .and_then(|endpoint| {
+                let snapshot = endpoint.snapshot.as_deref()?;
+                Some(EndpointFocusIntent {
+                    endpoint_id: endpoint_id.clone(),
+                    target: target.clone(),
+                    boot_id: snapshot.boot_id.clone(),
+                    generation: endpoint.snapshot_generation,
+                    request_id: None,
+                })
+            });
+    }
+
+    pub(crate) fn clear_endpoint_focus_intent(&mut self) {
+        self.endpoint_focus_intent = None;
+    }
+
+    pub(super) fn valid_endpoint_focus_intent(&self) -> Option<&EndpointFocusIntent> {
+        let intent = self.endpoint_focus_intent.as_ref()?;
+        let endpoint = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == intent.endpoint_id)?;
+        let snapshot = endpoint.snapshot.as_deref()?;
+        (endpoint.status == ClientEndpointStatus::Online
+            && endpoint.snapshot_generation == intent.generation
+            && snapshot.boot_id == intent.boot_id)
+            .then_some(intent)
+    }
+
+    pub(super) fn intent_workspace_id(&self) -> Option<(&ClientEndpointId, &str)> {
+        let intent = self.valid_endpoint_focus_intent()?;
+        let endpoint = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == intent.endpoint_id)?;
+        let snapshot = endpoint.snapshot.as_deref()?;
+        let workspace_id = match &intent.target {
+            ClientEndpointFocusTarget::Workspace(workspace_id) => workspace_id.as_str(),
+            ClientEndpointFocusTarget::Tab(tab_id) => snapshot
+                .tabs
+                .iter()
+                .find(|tab| &tab.tab_id == tab_id)?
+                .workspace_id
+                .as_str(),
+            ClientEndpointFocusTarget::Pane(pane_id) => snapshot
+                .panes
+                .iter()
+                .find(|pane| &pane.pane_id == pane_id)?
+                .workspace_id
+                .as_str(),
+            #[cfg(windows)]
+            ClientEndpointFocusTarget::Notification { pane_id, .. } => snapshot
+                .panes
+                .iter()
+                .find(|pane| &pane.pane_id == pane_id)?
+                .workspace_id
+                .as_str(),
+        };
+        Some((&intent.endpoint_id, workspace_id))
+    }
+
+    pub(super) fn intent_agent_id(&self) -> Option<(&ClientEndpointId, &str)> {
+        let intent = self.valid_endpoint_focus_intent()?;
+        match &intent.target {
+            ClientEndpointFocusTarget::Pane(pane_id) => Some((&intent.endpoint_id, pane_id)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn reconcile_endpoint_focus_intent(&mut self) {
+        let Some(intent) = self.endpoint_focus_intent.as_ref() else {
+            return;
+        };
+        if self.valid_endpoint_focus_intent().is_none() {
+            self.endpoint_focus_intent = None;
+            return;
+        }
+        if intent.endpoint_id != self.active_endpoint_id {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return;
+        };
+        let confirmed = match &intent.target {
+            ClientEndpointFocusTarget::Workspace(id) => {
+                snapshot.focused_workspace_id.as_deref() == Some(id.as_str())
+            }
+            ClientEndpointFocusTarget::Tab(id) => {
+                snapshot.focused_tab_id.as_deref() == Some(id.as_str())
+            }
+            ClientEndpointFocusTarget::Pane(id) => {
+                snapshot.focused_pane_id.as_deref() == Some(id.as_str())
+            }
+            #[cfg(windows)]
+            ClientEndpointFocusTarget::Notification { pane_id, .. } => {
+                snapshot.focused_pane_id.as_deref() == Some(pane_id.as_str())
+            }
+        };
+        if confirmed {
+            self.endpoint_focus_intent = None;
+        }
+    }
+
     pub(crate) fn tick_workspace_highlight(&mut self, now: std::time::Instant) -> bool {
         if self
             .pending_workspace_highlight

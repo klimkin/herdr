@@ -297,6 +297,33 @@ impl ClientShellState {
         method: crate::api::schema::Method,
         outcome: &mut ClientShellInput,
     ) {
+        if self.multi_endpoint_active() {
+            let target = match &method {
+                crate::api::schema::Method::WorkspaceFocus(target) => Some(
+                    ClientEndpointFocusTarget::Workspace(target.workspace_id.clone()),
+                ),
+                crate::api::schema::Method::TabFocus(target) => {
+                    Some(ClientEndpointFocusTarget::Tab(target.tab_id.clone()))
+                }
+                crate::api::schema::Method::PaneFocus(target) => {
+                    Some(ClientEndpointFocusTarget::Pane(target.pane_id.clone()))
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                self.focus_or_activate(self.active_endpoint_id.clone(), target, outcome);
+                return;
+            }
+        }
+        if matches!(
+            method,
+            crate::api::schema::Method::PaneFocusDirection(_)
+                | crate::api::schema::Method::WorkspaceCreate(_)
+                | crate::api::schema::Method::TabCreate(_)
+                | crate::api::schema::Method::PaneSplit(_)
+        ) {
+            self.clear_endpoint_focus_intent();
+        }
         self.push_endpoint_method_with_kind(method, PendingEndpointKind::Generic, outcome);
     }
 
@@ -438,11 +465,12 @@ impl ClientShellState {
     pub(crate) fn focus_endpoint_target(
         &mut self,
         target: ClientEndpointFocusTarget,
-    ) -> Vec<ClientShellAction> {
+    ) -> ClientShellInput {
         #[cfg(windows)]
         if !self.notification_target_is_current(&self.active_endpoint_id, &target) {
-            return Vec::new();
+            return ClientShellInput::default();
         }
+        let requested_target = target.clone();
         let method = match target {
             ClientEndpointFocusTarget::Workspace(workspace_id) => {
                 crate::api::schema::Method::WorkspaceFocus(crate::api::schema::WorkspaceTarget {
@@ -461,8 +489,21 @@ impl ClientShellState {
             }
         };
         let mut outcome = ClientShellInput::default();
-        self.push_endpoint_method(method, &mut outcome);
-        outcome.actions
+        self.push_endpoint_method_with_kind(method, PendingEndpointKind::Generic, &mut outcome);
+        if let Some(ClientShellAction::Endpoint { request, .. }) = outcome.actions.last() {
+            if let Some(intent) = self.endpoint_focus_intent.as_mut() {
+                if intent.endpoint_id == self.active_endpoint_id
+                    && intent.target == requested_target
+                {
+                    intent.request_id = Some(request.id.clone());
+                }
+            }
+        } else if self.endpoint_focus_intent.as_ref().is_some_and(|intent| {
+            intent.endpoint_id == self.active_endpoint_id && intent.target == requested_target
+        }) {
+            self.clear_endpoint_focus_intent();
+        }
+        outcome
     }
 
     pub(crate) fn cancel_endpoint_request(&mut self, request_id: &str) -> bool {
@@ -515,6 +556,13 @@ impl ClientShellState {
             self.endpoint_notice_seen.remove(&timeout_key);
         }
         if let Err(error) = &result {
+            if self
+                .endpoint_focus_intent
+                .as_ref()
+                .is_some_and(|intent| intent.request_id.as_deref() == Some(request_id))
+            {
+                self.clear_endpoint_focus_intent();
+            }
             if self
                 .pending_workspace_highlight
                 .as_ref()

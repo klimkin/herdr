@@ -7,7 +7,9 @@
 //! point of the cross-machine surface handoff.
 
 use super::*;
-use crate::api::schema::{Method, Request, ResponseResult, SuccessResponse};
+use crate::api::schema::{
+    ErrorBody, ErrorResponse, Method, Request, ResponseResult, SuccessResponse,
+};
 use crate::client::endpoint::{
     accepts_endpoint_message, ClientEndpointId, ClientEndpointStatus, EndpointNegotiation,
     EndpointRegistry, EndpointTransport, PendingEndpointActivation, ProfileId, SavedSshEndpoint,
@@ -56,10 +58,7 @@ fn remote_profile() -> SavedSshEndpoint {
 }
 
 enum ServerEvent {
-    Response {
-        request_id: String,
-        result: Box<ResponseResult>,
-    },
+    Response { request_id: String, data: Vec<u8> },
     Snapshot(Box<ClientShellSnapshot>),
     Surface(Box<PaneSurfaceFrame>),
     EffectsReady(String),
@@ -79,6 +78,7 @@ struct FakeServer {
     inbox: SentMessages,
     read: usize,
     outbox: VecDeque<ServerEvent>,
+    reject_pane: Option<String>,
 }
 
 impl FakeServer {
@@ -103,7 +103,35 @@ impl FakeServer {
             inbox: Arc::new(Mutex::new(Vec::new())),
             read: 0,
             outbox: VecDeque::new(),
+            reject_pane: None,
         }
+    }
+
+    fn reply(&mut self, id: String, result: ResponseResult) {
+        let data = serde_json::to_vec(&SuccessResponse {
+            id: id.clone(),
+            result,
+        })
+        .unwrap();
+        self.outbox.push_back(ServerEvent::Response {
+            request_id: id,
+            data,
+        });
+    }
+
+    fn reject(&mut self, id: String, code: &str) {
+        let data = serde_json::to_vec(&ErrorResponse {
+            id: id.clone(),
+            error: ErrorBody {
+                code: code.into(),
+                message: "focus target is unavailable".into(),
+            },
+        })
+        .unwrap();
+        self.outbox.push_back(ServerEvent::Response {
+            request_id: id,
+            data,
+        });
     }
 
     fn snapshot(&self) -> ClientShellSnapshot {
@@ -149,6 +177,26 @@ impl FakeServer {
                 pane.tab_id = format!("{workspace_id}:tab");
                 pane.focused = *workspace_id == self.focused;
                 pane
+            })
+            .collect();
+        projected.agents = self
+            .workspaces
+            .iter()
+            .map(|workspace_id| ClientShellAgent {
+                pane_id: format!("{workspace_id}:pane"),
+                workspace_id: workspace_id.clone(),
+                tab_id: format!("{workspace_id}:tab"),
+                name: Some(workspace_id.clone()),
+                display_agent: None,
+                agent: Some("test".into()),
+                title: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
+                agent_status: crate::api::schema::AgentStatus::Idle,
+                state_change_seq: 1,
+                state_labels: Vec::new(),
+                tokens: Vec::new(),
+                focused: *workspace_id == self.focused,
             })
             .collect();
         projected
@@ -212,13 +260,13 @@ impl FakeServer {
                         Method::ClientShellSurfaceSet(params) => {
                             self.surface_active = params.active;
                             self.revision += 1;
-                            self.outbox.push_back(ServerEvent::Response {
-                                request_id: request.id,
-                                result: Box::new(ResponseResult::ClientShellSurfaceSet {
+                            self.reply(
+                                request.id,
+                                ResponseResult::ClientShellSurfaceSet {
                                     active: params.active,
                                     projection_revision: self.revision,
-                                }),
-                            });
+                                },
+                            );
                             if params.active {
                                 self.publish();
                             }
@@ -227,9 +275,9 @@ impl FakeServer {
                             assert!(self.workspaces.contains(&target.workspace_id));
                             self.focused = target.workspace_id.clone();
                             self.revision += 1;
-                            self.outbox.push_back(ServerEvent::Response {
-                                request_id: request.id,
-                                result: Box::new(ResponseResult::WorkspaceInfo {
+                            self.reply(
+                                request.id,
+                                ResponseResult::WorkspaceInfo {
                                     workspace: crate::api::schema::WorkspaceInfo {
                                         workspace_id: target.workspace_id.clone(),
                                         number: 1,
@@ -242,8 +290,50 @@ impl FakeServer {
                                         tokens: Default::default(),
                                         worktree: None,
                                     },
-                                }),
-                            });
+                                },
+                            );
+                            self.publish();
+                        }
+                        Method::PaneFocus(target) => {
+                            if self.reject_pane.as_deref() == Some(target.pane_id.as_str()) {
+                                self.reject(request.id, "pane_not_found");
+                                continue;
+                            }
+                            let workspace_id =
+                                target.pane_id.strip_suffix(":pane").expect("test pane ID");
+                            assert!(self.workspaces.iter().any(|id| id == workspace_id));
+                            self.focused = workspace_id.to_owned();
+                            self.revision += 1;
+                            let mut response = pane_scroll_result(0, 0, 1);
+                            let ResponseResult::PaneInfo { ref mut pane } = response else {
+                                unreachable!()
+                            };
+                            pane.pane_id = target.pane_id;
+                            pane.workspace_id = self.focused.clone();
+                            pane.tab_id = format!("{}:tab", self.focused);
+                            self.reply(request.id, response);
+                            self.publish();
+                        }
+                        Method::TabFocus(target) => {
+                            let workspace_id =
+                                target.tab_id.strip_suffix(":tab").expect("test tab ID");
+                            assert!(self.workspaces.iter().any(|id| id == workspace_id));
+                            self.focused = workspace_id.to_owned();
+                            self.revision += 1;
+                            self.reply(
+                                request.id,
+                                ResponseResult::TabInfo {
+                                    tab: crate::api::schema::TabInfo {
+                                        tab_id: target.tab_id,
+                                        workspace_id: self.focused.clone(),
+                                        number: 1,
+                                        label: self.focused.clone(),
+                                        focused: true,
+                                        pane_count: 1,
+                                        agent_status: crate::api::schema::AgentStatus::Idle,
+                                    },
+                                },
+                            );
                             self.publish();
                         }
                         method => panic!("fake server does not handle {method:?}"),
@@ -268,6 +358,23 @@ impl FakeServer {
                 ClientMessage::ClientShellEndpointRequest { request, .. } => {
                     match serde_json::from_str::<Request>(request).ok()?.method {
                         Method::WorkspaceFocus(target) => Some(target.workspace_id),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn pane_focus_requests(&self) -> Vec<String> {
+        self.inbox
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|message| match message {
+                ClientMessage::ClientShellEndpointRequest { request, .. } => {
+                    match serde_json::from_str::<Request>(request).ok()?.method {
+                        Method::PaneFocus(target) => Some(target.pane_id),
                         _ => None,
                     }
                 }
@@ -371,15 +478,91 @@ impl Harness {
 
     /// The user presses the `next_workspace` binding.
     fn press_next_workspace(&mut self) {
+        self.press_action(crate::input::KeybindAction::NextWorkspace);
+    }
+
+    fn press_action(&mut self, action: crate::input::KeybindAction) {
         let mut outcome = ClientShellInput::default();
         self.state
             .shell
             .as_mut()
             .expect("client shell")
-            .record_binding(
-                crate::input::KeybindMatch::Action(crate::input::KeybindAction::NextWorkspace),
+            .record_binding(crate::input::KeybindMatch::Action(action), &mut outcome);
+        finish_client_shell_input(
+            &mut self.state,
+            outcome,
+            None,
+            &mut self.endpoints,
+            &mut self.pending,
+            &mut self.commands,
+            &mut self.prefix,
+            &mut self.scheduled,
+        )
+        .unwrap();
+        self.run_scheduled();
+    }
+
+    fn focus_active_pane(&mut self, pane_id: &str) {
+        let mut outcome = ClientShellInput::default();
+        self.state
+            .shell
+            .as_mut()
+            .expect("client shell")
+            .push_endpoint_method(
+                Method::PaneFocus(crate::api::schema::PaneTarget {
+                    pane_id: pane_id.to_owned(),
+                }),
                 &mut outcome,
             );
+        finish_client_shell_input(
+            &mut self.state,
+            outcome,
+            None,
+            &mut self.endpoints,
+            &mut self.pending,
+            &mut self.commands,
+            &mut self.prefix,
+            &mut self.scheduled,
+        )
+        .unwrap();
+        self.run_scheduled();
+    }
+
+    fn select_machine(&mut self, endpoint_id: ClientEndpointId) {
+        let mut outcome = ClientShellInput::default();
+        outcome.actions.push(ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: None,
+        });
+        finish_client_shell_input(
+            &mut self.state,
+            outcome,
+            None,
+            &mut self.endpoints,
+            &mut self.pending,
+            &mut self.commands,
+            &mut self.prefix,
+            &mut self.scheduled,
+        )
+        .unwrap();
+        self.run_scheduled();
+    }
+
+    fn select_pane(&mut self, endpoint_id: ClientEndpointId, pane_id: &str) {
+        self.select_target(
+            endpoint_id,
+            ClientEndpointFocusTarget::Pane(pane_id.to_owned()),
+        );
+    }
+
+    fn select_target(&mut self, endpoint_id: ClientEndpointId, target: ClientEndpointFocusTarget) {
+        let mut outcome = ClientShellInput::default();
+        assert!(self
+            .state
+            .shell
+            .as_mut()
+            .expect("client shell")
+            .focus_or_activate(endpoint_id, target, &mut outcome));
         finish_client_shell_input(
             &mut self.state,
             outcome,
@@ -450,7 +633,7 @@ impl Harness {
             self.remote.boot_id.clone()
         };
         match event {
-            ServerEvent::Response { request_id, result } => {
+            ServerEvent::Response { request_id, data } => {
                 let command_response =
                     self.commands
                         .accepts_response(endpoint_id, generation, &boot_id, &request_id);
@@ -468,11 +651,6 @@ impl Harness {
                 ) {
                     return;
                 }
-                let data = serde_json::to_vec(&SuccessResponse {
-                    id: request_id.clone(),
-                    result: *result,
-                })
-                .unwrap();
                 if self.pending.as_ref().is_some_and(|pending| {
                     pending.accepts_response(endpoint_id, generation, &boot_id, &request_id)
                 }) {
@@ -680,6 +858,48 @@ fn next_workspace_pressed_while_handoff_finishes_is_not_lost() {
     );
 }
 
+#[test]
+fn next_workspace_during_presentation_effects_fence_is_delivered_after_commit() {
+    let mut h = Harness::new();
+    h.press_next_workspace();
+    h.run_until("presentation effects fence is sent", |h| {
+        h.remote.inbox.lock().unwrap().iter().any(|message| {
+            matches!(message, ClientMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::endpoint::PRESENTATION_EFFECTS_SYNC_KIND)
+        })
+    });
+    assert!(h.handoff_in_progress());
+
+    h.press_next_workspace();
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_2");
+    assert_eq!(
+        h.remote.workspace_focus_requests(),
+        vec!["remote_1", "remote_2"]
+    );
+    assert!(!h.interrupted_notice_visible());
+}
+
+#[test]
+fn multiple_late_navigation_inputs_send_only_latest_focus() {
+    let mut h = Harness::new();
+    h.press_next_workspace();
+    let remote = h.remote_id();
+    h.run_until("remote is projected", |h| {
+        h.shell().endpoint_is_active(&remote)
+    });
+    h.press_next_workspace();
+    h.press_next_workspace();
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_3");
+    assert_eq!(
+        h.remote.workspace_focus_requests(),
+        vec!["remote_1", "remote_3"]
+    );
+}
+
 /// Reproducer, early handoff phase. While the saved machine is still activating, the client
 /// still shows Local's snapshot, so the next press resolves to the same first workspace on the
 /// saved machine again and the press has no effect.
@@ -768,4 +988,344 @@ fn next_workspace_pressed_while_local_handoff_finishes_is_not_lost() {
         h.local.workspace_focus_requests()
     );
     assert!(!h.interrupted_notice_visible());
+}
+
+#[test]
+fn next_agent_pressed_while_remote_activates_advances_from_intended_pane() {
+    let mut h = Harness::new();
+    h.press_action(crate::input::KeybindAction::NextAgent);
+    let remote = h.remote_id();
+    h.run_until("remote surface activates", |h| h.remote.surface_active);
+    assert!(!h.shell().endpoint_is_active(&remote));
+
+    h.press_action(crate::input::KeybindAction::NextAgent);
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_2");
+    assert_eq!(
+        h.remote.pane_focus_requests(),
+        vec!["remote_1:pane", "remote_2:pane"]
+    );
+    assert!(!h.interrupted_notice_visible());
+}
+
+#[test]
+fn next_agent_pressed_while_remote_presentation_finishes_reaches_next_pane() {
+    let mut h = Harness::new();
+    h.press_action(crate::input::KeybindAction::NextAgent);
+    let remote = h.remote_id();
+    h.run_until("remote is projected", |h| {
+        h.shell().endpoint_is_active(&remote)
+    });
+    assert!(h.handoff_in_progress());
+
+    h.press_action(crate::input::KeybindAction::NextAgent);
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_2");
+    assert_eq!(
+        h.remote.pane_focus_requests(),
+        vec!["remote_1:pane", "remote_2:pane"]
+    );
+    assert!(!h.interrupted_notice_visible());
+}
+
+#[test]
+fn next_agent_pressed_while_local_activates_advances_from_intended_pane() {
+    let mut h = harness_on_remote_last_workspace();
+    h.press_action(crate::input::KeybindAction::NextAgent);
+    h.run_until("Local surface activates", |h| h.local.surface_active);
+    assert!(!h.shell().endpoint_is_active(&ClientEndpointId::Local));
+
+    h.press_action(crate::input::KeybindAction::NextAgent);
+    h.settle();
+
+    assert_eq!(h.local.focused, "local_2");
+    assert_eq!(
+        h.local.pane_focus_requests(),
+        vec!["local_1:pane", "local_2:pane"]
+    );
+    assert!(!h.interrupted_notice_visible());
+}
+
+#[test]
+fn next_agent_pressed_while_local_presentation_finishes_reaches_next_pane() {
+    let mut h = harness_on_remote_last_workspace();
+    h.press_action(crate::input::KeybindAction::NextAgent);
+    h.run_until("Local is projected", |h| {
+        h.shell().endpoint_is_active(&ClientEndpointId::Local)
+    });
+    assert!(h.handoff_in_progress());
+
+    h.press_action(crate::input::KeybindAction::NextAgent);
+    h.settle();
+
+    assert_eq!(h.local.focused, "local_2");
+    assert_eq!(
+        h.local.pane_focus_requests(),
+        vec!["local_1:pane", "local_2:pane"]
+    );
+    assert!(!h.interrupted_notice_visible());
+}
+
+#[test]
+fn mixed_agent_directions_follow_intended_cursor_during_handoff() {
+    let mut h = Harness::new();
+    h.press_action(crate::input::KeybindAction::NextAgent);
+    h.run_until("remote surface activates", |h| h.remote.surface_active);
+    h.press_action(crate::input::KeybindAction::NextAgent);
+    h.press_action(crate::input::KeybindAction::PreviousAgent);
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_1");
+    assert_eq!(h.remote.pane_focus_requests(), vec!["remote_1:pane"]);
+}
+
+#[test]
+fn explicit_pane_focus_during_remote_presentation_is_delivered_after_commit() {
+    let mut h = Harness::new();
+    h.press_next_workspace();
+    let remote = h.remote_id();
+    h.run_until("remote is projected", |h| {
+        h.shell().endpoint_is_active(&remote)
+    });
+    assert!(h.handoff_in_progress());
+
+    h.focus_active_pane("remote_2:pane");
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_2");
+    assert_eq!(h.remote.pane_focus_requests(), vec!["remote_2:pane"]);
+    assert!(!h.interrupted_notice_visible());
+}
+
+#[test]
+fn mixed_workspace_directions_follow_intended_cursor_during_handoff() {
+    let mut h = Harness::new();
+    h.press_next_workspace();
+    h.run_until("remote surface activates", |h| h.remote.surface_active);
+
+    h.press_next_workspace();
+    h.press_action(crate::input::KeybindAction::PreviousWorkspace);
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_1");
+    assert_eq!(h.remote.workspace_focus_requests(), vec!["remote_1"]);
+    assert!(!h.interrupted_notice_visible());
+}
+
+#[test]
+fn machine_only_selection_cancels_unsent_late_focus() {
+    let mut h = Harness::new();
+    h.press_next_workspace();
+    let remote = h.remote_id();
+    h.run_until("remote is projected", |h| {
+        h.shell().endpoint_is_active(&remote)
+    });
+    h.press_next_workspace();
+    h.select_machine(remote);
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_1");
+    assert_eq!(h.remote.workspace_focus_requests(), vec!["remote_1"]);
+    h.press_next_workspace();
+    h.settle();
+    assert_eq!(h.remote.focused, "remote_2");
+}
+
+#[test]
+fn rollback_discards_late_focus_without_sending_it_to_failed_target() {
+    let mut h = Harness::new();
+    h.press_next_workspace();
+    let remote = h.remote_id();
+    h.run_until("remote is projected", |h| {
+        h.shell().endpoint_is_active(&remote)
+    });
+    h.press_next_workspace();
+    rollback_endpoint_activation(
+        &mut h.state,
+        &mut h.endpoints,
+        &mut h.pending,
+        "remote activation failed".into(),
+        false,
+    );
+    h.settle();
+
+    assert!(h.shell().endpoint_is_active(&ClientEndpointId::Local));
+    assert_eq!(h.remote.workspace_focus_requests(), vec!["remote_1"]);
+    assert_eq!(h.local.focused, "local_2");
+}
+
+#[test]
+fn rejected_post_commit_focus_keeps_activated_machine_and_reports_rejection() {
+    let mut h = Harness::new();
+    h.press_next_workspace();
+    let remote = h.remote_id();
+    h.run_until("remote is projected", |h| {
+        h.shell().endpoint_is_active(&remote)
+    });
+    h.remote.reject_pane = Some("remote_2:pane".into());
+    h.focus_active_pane("remote_2:pane");
+    h.settle();
+
+    assert!(h.shell().endpoint_is_active(&remote));
+    assert_eq!(h.remote.focused, "remote_1");
+    assert_eq!(h.remote.pane_focus_requests(), vec!["remote_2:pane"]);
+    assert_eq!(
+        h.shell()
+            .visible_endpoint_notice
+            .as_ref()
+            .map(|notice| notice.title.as_str()),
+        Some("Action rejected")
+    );
+}
+
+#[test]
+fn unsupported_focus_on_active_federated_machine_reports_unavailable_action() {
+    let mut h = Harness::new();
+    h.press_next_workspace();
+    h.settle();
+    let remote = h.remote_id();
+    h.state
+        .shell
+        .as_mut()
+        .unwrap()
+        .set_endpoint_methods_for(&remote, Some(vec!["workspace.focus".into()]));
+
+    h.focus_active_pane("remote_2:pane");
+
+    assert!(h.remote.pane_focus_requests().is_empty());
+    assert_eq!(
+        h.shell()
+            .visible_endpoint_notice
+            .as_ref()
+            .map(|notice| notice.title.as_str()),
+        Some("Action unavailable")
+    );
+}
+
+#[test]
+fn explicit_pane_selection_anchors_immediate_relative_workspace_navigation() {
+    let mut h = Harness::new();
+    h.select_pane(h.remote_id(), "remote_2:pane");
+    h.press_action(crate::input::KeybindAction::PreviousWorkspace);
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_1");
+    assert!(h.remote.pane_focus_requests().is_empty());
+    assert_eq!(h.remote.workspace_focus_requests(), vec!["remote_1"]);
+}
+
+#[test]
+fn explicit_tab_selection_anchors_immediate_relative_workspace_navigation() {
+    let mut h = Harness::new();
+    h.select_target(
+        h.remote_id(),
+        ClientEndpointFocusTarget::Tab("remote_1:tab".into()),
+    );
+    h.press_next_workspace();
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_2");
+    assert_eq!(h.remote.workspace_focus_requests(), vec!["remote_2"]);
+}
+
+#[test]
+fn changed_endpoint_identity_discards_relative_navigation_anchor() {
+    let mut h = Harness::new();
+    h.select_pane(h.remote_id(), "remote_2:pane");
+    let remote = h.remote_id();
+    h.state
+        .shell
+        .as_mut()
+        .unwrap()
+        .cache_endpoint_snapshot_inactive_for_generation(&remote, 8, Box::new(h.remote.snapshot()));
+
+    let mut outcome = ClientShellInput::default();
+    h.state.shell.as_mut().unwrap().record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::PreviousWorkspace),
+        &mut outcome,
+    );
+    assert!(matches!(
+        &outcome.actions[..],
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id: ClientEndpointId::Local,
+            target: Some(ClientEndpointFocusTarget::Workspace(id)),
+        }] if id == "local_1"
+    ));
+}
+
+#[test]
+fn confirmed_focus_releases_cursor_for_later_external_focus() {
+    let mut h = Harness::new();
+    h.select_pane(h.remote_id(), "remote_2:pane");
+    h.settle();
+    assert_eq!(h.remote.focused, "remote_2");
+
+    h.remote.focused = "remote_1".into();
+    h.remote.revision += 1;
+    h.remote.publish();
+    h.settle();
+    h.press_next_workspace();
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_2");
+}
+
+#[test]
+fn relative_navigation_uses_latest_workspace_order() {
+    let mut h = Harness::new();
+    h.select_pane(h.remote_id(), "remote_2:pane");
+    let remote = h.remote_id();
+    let mut updated = h.remote.snapshot();
+    updated.revision += 1;
+    updated.workspaces.swap(0, 1);
+    h.state
+        .shell
+        .as_mut()
+        .unwrap()
+        .cache_endpoint_snapshot_inactive_for_generation(&remote, 7, Box::new(updated));
+
+    let mut outcome = ClientShellInput::default();
+    h.state.shell.as_mut().unwrap().record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::NextWorkspace),
+        &mut outcome,
+    );
+    assert!(matches!(
+        &outcome.actions[..],
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: Some(ClientEndpointFocusTarget::Workspace(id)),
+        }] if endpoint_id == &remote && id == "remote_1"
+    ));
+}
+
+#[test]
+fn missing_intended_workspace_falls_back_to_authoritative_focus() {
+    let mut h = Harness::new();
+    h.select_pane(h.remote_id(), "remote_2:pane");
+    let remote = h.remote_id();
+    let mut updated = h.remote.snapshot();
+    updated.revision += 1;
+    updated
+        .workspaces
+        .retain(|workspace| workspace.workspace_id != "remote_2");
+    h.state
+        .shell
+        .as_mut()
+        .unwrap()
+        .cache_endpoint_snapshot_inactive_for_generation(&remote, 7, Box::new(updated));
+
+    let mut outcome = ClientShellInput::default();
+    h.state.shell.as_mut().unwrap().record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::PreviousWorkspace),
+        &mut outcome,
+    );
+    assert!(matches!(
+        &outcome.actions[..],
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id: ClientEndpointId::Local,
+            target: Some(ClientEndpointFocusTarget::Workspace(id)),
+        }] if id == "local_1"
+    ));
 }

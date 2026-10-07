@@ -142,20 +142,30 @@ fn worktree_create_success_focuses_returned_tab_on_its_endpoint_after_snapshot_u
         );
         assert!(repaint);
         assert!(state.overlay.is_none());
-        let [ClientShellAction::Endpoint {
-            endpoint_id: target,
-            boot_id: target_boot,
-            request,
-        }] = &focus[..]
-        else {
-            panic!("creation should request focus through normal client navigation");
-        };
-        assert_eq!(target, &endpoint_id);
-        assert_eq!(target_boot, &boot_id);
-        assert!(matches!(
-            &request.method,
-            crate::api::schema::Method::TabFocus(target) if target.tab_id == "tab_2"
-        ));
+        if use_remote {
+            assert!(matches!(
+                &focus[..],
+                [ClientShellAction::ActivateEndpoint {
+                    endpoint_id: target,
+                    target: Some(ClientEndpointFocusTarget::Tab(id))
+                }] if target == &endpoint_id && id == "tab_2"
+            ));
+        } else {
+            let [ClientShellAction::Endpoint {
+                endpoint_id: target,
+                boot_id: target_boot,
+                request,
+            }] = &focus[..]
+            else {
+                panic!("creation should request focus through normal client navigation");
+            };
+            assert_eq!(target, &endpoint_id);
+            assert_eq!(target_boot, &boot_id);
+            assert!(matches!(
+                &request.method,
+                crate::api::schema::Method::TabFocus(target) if target.tab_id == "tab_2"
+            ));
+        }
         assert!(state
             .handle_endpoint_result(
                 &boot_id,
@@ -340,7 +350,9 @@ fn stale_queued_request_is_cancelled_without_blocking_the_current_generation() {
 
     let (mut state, actions) = pending_popup();
     let stale_id = request_id(&actions).to_owned();
-    let current = state.focus_endpoint_target(ClientEndpointFocusTarget::Workspace("ws_1".into()));
+    let current = state
+        .focus_endpoint_target(ClientEndpointFocusTarget::Workspace("ws_1".into()))
+        .actions;
     let current_id = request_id(&current).to_owned();
     let mut commands = EndpointCommands::default();
     for (generation, actions) in [(1, actions), (2, current)] {

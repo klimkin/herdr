@@ -102,6 +102,9 @@ impl ClientShellState {
                 .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
         });
         self.endpoints = next;
+        if self.valid_endpoint_focus_intent().is_none() {
+            self.clear_endpoint_focus_intent();
+        }
     }
 
     pub(crate) fn select_unavailable_local(&mut self) {
@@ -115,6 +118,13 @@ impl ClientShellState {
 
     pub(crate) fn retire_endpoint(&mut self, endpoint_id: &ClientEndpointId) {
         self.clear_machine_diagnostic(endpoint_id);
+        if self
+            .endpoint_focus_intent
+            .as_ref()
+            .is_some_and(|intent| &intent.endpoint_id == endpoint_id)
+        {
+            self.clear_endpoint_focus_intent();
+        }
         if endpoint_id == &self.active_endpoint_id {
             self.pending_workspace_highlight = None;
         }
@@ -141,6 +151,14 @@ impl ClientShellState {
         endpoint_id: &ClientEndpointId,
         status: ClientEndpointStatus,
     ) {
+        if status != ClientEndpointStatus::Online
+            && self
+                .endpoint_focus_intent
+                .as_ref()
+                .is_some_and(|intent| &intent.endpoint_id == endpoint_id)
+        {
+            self.clear_endpoint_focus_intent();
+        }
         if matches!(
             status,
             ClientEndpointStatus::Online | ClientEndpointStatus::Disabled
@@ -618,6 +636,12 @@ impl ClientShellState {
                 .iter()
                 .any(|agent| &agent.pane_id == pane_id)
         });
+        if self.endpoint_focus_intent.as_ref().is_some_and(|intent| {
+            &intent.endpoint_id == endpoint_id
+                && (intent.generation != generation || intent.boot_id != snapshot.boot_id)
+        }) {
+            self.clear_endpoint_focus_intent();
+        }
         let endpoint = &mut self.endpoints[index];
         endpoint.agent_recency = recency;
         endpoint.snapshot_generation = generation;

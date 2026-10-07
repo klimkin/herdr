@@ -225,6 +225,11 @@ pub(super) fn begin_endpoint_activation(
     }) {
         return Ok(());
     }
+    if target.is_none() {
+        if let Some(shell) = state.shell.as_mut() {
+            shell.clear_endpoint_focus_intent();
+        }
+    }
     state.deferred_local_activation = None;
     if endpoint_id.is_local() && !local_activation_metadata_ready(state, endpoints) {
         state.deferred_local_activation = Some(endpoint::EndpointActivationIntent {
@@ -269,16 +274,16 @@ pub(super) fn begin_endpoint_activation(
             .is_some_and(|connection| connection.surface_active);
     if already_active {
         if let (Some(shell), Some(target)) = (state.shell.as_mut(), target) {
-            let actions = shell.focus_endpoint_target(target);
-            let (_, repaint) = dispatch_client_shell_actions(
-                actions,
+            let outcome = shell.focus_endpoint_target(target);
+            let (_, dispatch_repaint) = dispatch_client_shell_actions(
+                outcome.actions,
                 endpoint_commands,
                 endpoints,
                 Some(shell),
                 &mut state.detached_process_children,
                 scheduled_activation,
             )?;
-            if repaint {
+            if outcome.repaint || dispatch_repaint {
                 if let Some(frame) = shell.compose(state.reported_size.0, state.reported_size.1) {
                     state.present_frame(frame);
                 }
@@ -325,6 +330,7 @@ pub(super) fn begin_endpoint_activation(
         ),
         Err(endpoint::ActivationBeginError::Preflight(error)) => {
             if let Some(shell) = state.shell.as_mut() {
+                shell.clear_endpoint_focus_intent();
                 shell.receive_endpoint_unavailable(format!(
                     "{}: {error}",
                     shell.endpoint_label(&endpoint_id)
@@ -414,6 +420,11 @@ pub(super) fn complete_endpoint_activation(
         return Ok(None);
     }
 
+    let late_focus = pending.as_mut().and_then(|activation| {
+        (completion == endpoint::ActivationCompletion::Activated)
+            .then(|| activation.take_late_focus())
+            .flatten()
+    });
     let _ = pending.take();
     endpoints.unfreeze_input();
     let successor = match completion {
@@ -424,6 +435,7 @@ pub(super) fn complete_endpoint_activation(
         } => {
             if next.is_none() {
                 if let Some(shell) = state.shell.as_mut() {
+                    shell.clear_endpoint_focus_intent();
                     shell.receive_endpoint_unavailable(error);
                 }
             }
@@ -434,6 +446,23 @@ pub(super) fn complete_endpoint_activation(
         | endpoint::ActivationCompletion::AwaitingPresentationEffects => unreachable!(),
     };
     state.unfreeze_presentation();
+    if let Some(target) = late_focus {
+        let shell = state.shell.as_mut().expect("checked client shell");
+        let outcome = shell.focus_endpoint_target(target);
+        let mut scheduled = None;
+        let _ = dispatch_client_shell_actions(
+            outcome.actions,
+            endpoint_commands,
+            endpoints,
+            Some(shell),
+            &mut state.detached_process_children,
+            &mut scheduled,
+        )?;
+        debug_assert!(
+            scheduled.is_none(),
+            "focus cannot schedule another activation"
+        );
+    }
     if successor.is_none() {
         let active_endpoint = endpoints.active_id().clone();
         let cancelled = endpoint_commands.send_next(&active_endpoint, endpoints);
@@ -470,6 +499,7 @@ pub(super) fn present_handoff_unavailable(state: &mut ClientState, message: Stri
     // source output blocked, while allowing this client-owned chrome frame through the freeze.
     state.freeze_presentation();
     let frame = state.shell.as_mut().and_then(|shell| {
+        shell.clear_endpoint_focus_intent();
         shell.receive_endpoint_unavailable(message);
         shell.compose(state.reported_size.0, state.reported_size.1)
     });
