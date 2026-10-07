@@ -224,7 +224,10 @@ fn run_client_with_mode(
     };
     let federated = endpoint_catalog.has_enabled_ssh();
 
-    let initial_stream = match crate::ipc::connect_local_stream(&socket_path) {
+    let connect_trace = crate::latency_prof::connect::ConnectTrace::begin();
+    let initial_connection = crate::ipc::connect_local_stream(&socket_path);
+    connect_trace.complete(&initial_connection);
+    let initial_stream = match initial_connection {
         Ok(stream) => Some(stream),
         Err(error) if federated => {
             warn!(%error, "Local is unavailable; keeping saved machines available");
