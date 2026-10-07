@@ -83,6 +83,7 @@ mod notifications;
 mod render;
 mod retained_surface;
 mod surface_interest;
+mod terminal_feedback;
 
 // Producers can refill even a bounded channel while it is being drained.
 // Yield to scheduled work and rendering between batches; select! below
@@ -757,6 +758,37 @@ impl HeadlessServer {
                 continue;
             }
 
+            if self.app.early_presentation.terminal_enabled() {
+                needs_render |= self.app.render_dirty.is_pending();
+                let service_now = Instant::now();
+                let ordinary_due = needs_render
+                    && (self.app.can_render_now(service_now)
+                        || (self.app.can_present_now(service_now)
+                            && self.has_pending_presentation_work(
+                                needs_full_render,
+                                needs_graphics_render,
+                            )));
+                if ordinary_due {
+                    continue;
+                }
+                if self.try_early_terminal_feedback(service_now) {
+                    needs_full_render = false;
+                    needs_graphics_render = false;
+                }
+
+                self.app.prune_terminal_feedback();
+                if self.app.full_redraw_pending {
+                    needs_render = true;
+                    needs_full_render = true;
+                }
+                if !needs_full_render
+                    && !needs_graphics_render
+                    && !self.app.render_dirty.is_pending()
+                {
+                    needs_render = false;
+                }
+            }
+
             // A runtime/API shutdown can be requested without setting the
             // external stop flag. It must not rely on another event or timer.
             if self.app.state.should_quit || self.should_quit.load(Ordering::Acquire) {
@@ -1101,7 +1133,9 @@ impl HeadlessServer {
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
+        self.cancel_terminal_source_opportunities(client_id);
         self.app.early_presentation.cancel_client(client_id);
+        self.app.prune_terminal_feedback();
         self.disconnect_native_graphics(client_id);
         let disconnected_focus = self
             .clients
@@ -1168,7 +1202,7 @@ impl HeadlessServer {
                     ) else {
                         continue;
                     };
-                    apply_client_pane_input_events(runtime, &[held.release])
+                    apply_client_pane_input_events(runtime, &[held.release]).map(|_| ())
                 }
                 ClientShellInputTarget::Popup(terminal_id) => {
                     let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) else {
@@ -1416,12 +1450,26 @@ impl HeadlessServer {
                 ) else {
                     return foreground_changed | geometry_changed;
                 };
-                if let Err(err) = apply_client_pane_input_events(
+                let baseline = self
+                    .app
+                    .terminal_input_baseline(workspace_index, runtime_pane_id);
+                let accepted = match apply_client_pane_input_events(
                     runtime,
                     &[protocol::ClientPaneInputEvent::Paste(path)],
                 ) {
-                    warn!(client_id, pane_id, err = %err, "client shell clipboard image paste failed");
-                }
+                    Ok(accepted) => accepted,
+                    Err(err) => {
+                        warn!(client_id,pane_id,err=%err,"client shell clipboard image paste failed");
+                        false
+                    }
+                };
+                let origin = self.clients.get(&client_id).map(|client| {
+                    app::early_presentation::OriginLease {
+                        client_id,
+                        projection_revision: client.shell_projection_revision,
+                    }
+                });
+                self.app.accepted_terminal_input(baseline, accepted, origin);
                 true
             }
             protocol::ClientClipboardImageTarget::Popup(terminal_id) => {
@@ -2689,11 +2737,29 @@ impl HeadlessServer {
                 ) else {
                     return foreground_changed | geometry_changed;
                 };
+                let baseline = self
+                    .app
+                    .terminal_input_baseline(workspace_index, runtime_pane_id);
                 let scroll_before = runtime.scroll_metrics();
-                if let Err(err) = apply_client_pane_input_events(runtime, &events) {
-                    warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                let accepted = match apply_client_pane_input_events(runtime, &events) {
+                    Ok(accepted) => Some(accepted),
+                    Err(err) => {
+                        self.app.rejected_terminal_input();
+                        warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                        None
+                    }
+                };
+                let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                let origin = self.clients.get(&client_id).map(|client| {
+                    app::early_presentation::OriginLease {
+                        client_id,
+                        projection_revision: client.shell_projection_revision,
+                    }
+                });
+                if let Some(accepted) = accepted {
+                    self.app.accepted_terminal_input(baseline, accepted, origin);
                 }
-                foreground_changed | geometry_changed || runtime.scroll_metrics() != scroll_before
+                foreground_changed | geometry_changed || scroll_changed
             }
             ServerEvent::ClientShellPopupInput {
                 client_id,

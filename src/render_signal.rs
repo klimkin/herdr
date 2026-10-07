@@ -1,3 +1,5 @@
+#[cfg(any(test, feature = "latency-experiments"))]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -64,6 +66,18 @@ pub(crate) struct RenderSignal {
 struct RenderSignalState {
     request: RenderRequest,
     immediate_pty_sources: HashSet<PaneId>,
+    #[cfg(any(test, feature = "latency-experiments"))]
+    target_ready: HashMap<PaneId, TargetReady>,
+}
+
+#[derive(Debug)]
+#[cfg(any(test, feature = "latency-experiments"))]
+struct TargetReady {
+    instance: u64,
+    baseline_revision: u64,
+    expires_at: std::time::Instant,
+    opportunity: u64,
+    armed: bool,
 }
 
 impl RenderSignal {
@@ -87,6 +101,16 @@ impl RenderSignal {
 
     /// Returns true when the signal becomes pending or visible PTY work joins it.
     pub(crate) fn request_pty(&self, pane_id: PaneId) -> bool {
+        self.publish_pty(pane_id, None)
+    }
+
+    /// Publishes only renderable state through the existing PTY signal. An
+    /// accepted input may wake once even if bulk output already owns the source.
+    pub(crate) fn request_pty_ready(&self, pane_id: PaneId, instance: u64, revision: u64) -> bool {
+        self.publish_pty(pane_id, Some((instance, revision)))
+    }
+
+    fn publish_pty(&self, pane_id: PaneId, ready: Option<(u64, u64)>) -> bool {
         crate::latency_prof::record("render.state_ready", pane_id.raw() as u64, 0);
         let mut state = self
             .state
@@ -94,8 +118,120 @@ impl RenderSignal {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_added = state.request.pty_sources.insert(pane_id);
         let wake_for_source = source_added && state.immediate_pty_sources.contains(&pane_id);
+        // No registered target means no clock read, terminal access or allocation.
+        #[cfg(any(test, feature = "latency-experiments"))]
+        let mut wake_for_target = false;
+        #[cfg(not(any(test, feature = "latency-experiments")))]
+        let wake_for_target = false;
+        #[cfg(any(test, feature = "latency-experiments"))]
+        if let (Some((instance, revision)), Some(target)) =
+            (ready, state.target_ready.get_mut(&pane_id))
+        {
+            if target.armed && target.instance == instance {
+                if std::time::Instant::now() >= target.expires_at {
+                    target.armed = false;
+                } else if revision.is_multiple_of(2) && revision > target.baseline_revision {
+                    target.armed = false;
+                    wake_for_target = true;
+                    crate::latency_prof::record_runtime_at(
+                        "render.target_ready_wake",
+                        pane_id.raw() as u64,
+                        revision,
+                        target.opportunity,
+                        crate::latency_prof::now(),
+                        instance,
+                    );
+                }
+            }
+        }
+        #[cfg(not(any(test, feature = "latency-experiments")))]
+        let _ = ready;
         let became_pending = !self.pending.swap(true, Ordering::AcqRel);
-        became_pending || wake_for_source
+        became_pending || wake_for_source || wake_for_target
+    }
+
+    /// Repeated input shares the first expiry and cannot rearm consumed output.
+    pub(crate) fn arm_target_ready(
+        &self,
+        pane_id: PaneId,
+        instance: u64,
+        baseline_revision: u64,
+        expires_at: std::time::Instant,
+        opportunity: u64,
+    ) {
+        #[cfg(any(test, feature = "latency-experiments"))]
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state
+                .target_ready
+                .get(&pane_id)
+                .is_some_and(|target| target.opportunity == opportunity)
+            {
+                return;
+            }
+            state.target_ready.insert(
+                pane_id,
+                TargetReady {
+                    instance,
+                    baseline_revision,
+                    expires_at,
+                    opportunity,
+                    armed: true,
+                },
+            );
+        }
+        #[cfg(not(any(test, feature = "latency-experiments")))]
+        let _ = (
+            pane_id,
+            instance,
+            baseline_revision,
+            expires_at,
+            opportunity,
+        );
+    }
+
+    /// Policy retirement owns latch lifetime, including sources that stop output.
+    #[cfg(test)]
+    pub(crate) fn cancel_target_ready(&self, pane_id: PaneId, opportunity: u64) {
+        #[cfg(any(test, feature = "latency-experiments"))]
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state
+                .target_ready
+                .get(&pane_id)
+                .is_some_and(|target| target.opportunity == opportunity)
+            {
+                state.target_ready.remove(&pane_id);
+            }
+        }
+        #[cfg(not(any(test, feature = "latency-experiments")))]
+        let _ = (pane_id, opportunity);
+    }
+
+    pub(crate) fn prune_target_ready(&self, mut keep: impl FnMut(u64) -> bool) {
+        #[cfg(any(test, feature = "latency-experiments"))]
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .target_ready
+            .retain(|_, target| keep(target.opportunity));
+        #[cfg(not(any(test, feature = "latency-experiments")))]
+        let _ = &mut keep;
+    }
+
+    pub(crate) fn has_pending_source(&self, pane_id: PaneId) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request
+            .pty_sources
+            .contains(&pane_id)
     }
 
     pub(crate) fn set_immediate_pty_sources(&self, sources: HashSet<PaneId>) {
@@ -311,5 +447,39 @@ mod tests {
         assert!(newest.request.terminal_title_sources.is_empty());
         newest.complete();
         assert!(!signal.is_pending());
+    }
+
+    #[test]
+    fn accepted_input_wakes_already_pending_target_once_after_new_ready_state() {
+        let signal = RenderSignal::new();
+        let pane = PaneId::from_raw(10);
+        assert!(signal.request_pty(pane));
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        signal.arm_target_ready(pane, 7, 20, expiry, 1);
+        assert!(!signal.request_pty_ready(pane, 7, 20));
+        assert!(!signal.request_pty_ready(pane, 8, 22));
+        assert!(signal.request_pty_ready(pane, 7, 22));
+        assert!(!signal.request_pty_ready(pane, 7, 24));
+        // Repeated accepted input shares the same opportunity, never rearming
+        // the one ready wake already consumed by output.
+        signal.arm_target_ready(pane, 7, 24, expiry, 1);
+        assert!(!signal.request_pty_ready(pane, 7, 26));
+        assert_eq!(signal.take().pty_sources, HashSet::from([pane]));
+    }
+
+    #[test]
+    fn expired_or_canceled_input_does_not_wake_pending_output() {
+        let signal = RenderSignal::new();
+        let pane = PaneId::from_raw(10);
+        signal.request_pty(pane);
+        signal.arm_target_ready(pane, 7, 20, std::time::Instant::now(), 1);
+        assert!(!signal.request_pty_ready(pane, 7, 22));
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        signal.arm_target_ready(pane, 7, 22, expiry, 2);
+        signal.cancel_target_ready(pane, 1);
+        assert!(signal.request_pty_ready(pane, 7, 24));
+        signal.arm_target_ready(pane, 7, 24, expiry, 3);
+        signal.cancel_target_ready(pane, 3);
+        assert!(!signal.request_pty_ready(pane, 7, 26));
     }
 }

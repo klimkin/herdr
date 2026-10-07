@@ -405,6 +405,11 @@ impl PreparedRender {
         if !crate::latency_prof::active() {
             return None;
         }
+        self.incorporated_panes()
+    }
+
+    /// Server-local exact incorporated metadata; independent of diagnostics.
+    pub(crate) fn incorporated_panes(&self) -> Option<&[crate::protocol::PaneSurfacePane]> {
         match self {
             Self::Semantic {
                 committed_surface, ..

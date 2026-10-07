@@ -291,3 +291,66 @@ The action report separates an opportunity's grant, admission, and coherent
 enqueue from client output completion. `critical_paths` carries completed
 server/client paths; an `early_enqueued` opportunity alone does not prove a
 committed client presentation. Missing identities remain unassigned.
+
+## Early terminal-feedback experiment
+
+Linux also supports `target` and `target-all` with the `latency-experiments`
+feature. Accepted nonempty terminal input creates one opportunity for that
+terminal/runtime. Its first content revision and 16 ms expiry remain fixed
+across coalesced input. Changed target state can spend one global extra attempt
+per 16 ms. Unchanged state creates no early frame; empty/rejected input and
+release cleanup create no opportunity. Ordinary delivery can satisfy the
+opportunity first.
+
+`target` uses a coherent retained update for the selected terminal. Residual
+sources, titles, and generic work keep their ordinary deadline. Unsafe retained
+state falls back to ordinary scheduling. `target-all` is a diagnostic comparator
+that can carry unrelated dirty sources in a full frame after target readiness.
+Neither policy changes the ordinary presentation interval or adds an expiry,
+refill, or idle timer. macOS and Windows keep native experiment support disabled.
+The default stays `ordinary`; queue selectors remain `current` and `64`.
+
+Compare both policies with the same recording-disabled binary:
+
+```sh
+just latency-build latency-experiments
+latency_artifacts="${CARGO_TARGET_DIR:-target}/release"
+
+for latency_policy in ordinary target; do
+  env -u HERDR_LATENCY_TRACE_DIR \
+    HERDR_LATENCY_PRESENTATION="$latency_policy" \
+    HERDR_LATENCY_QUEUE_ORDER=current HERDR_LATENCY_QUEUE_COUNT=64 \
+    "$latency_artifacts/examples/latency_bench" \
+    --binary "$latency_artifacts/herdr" \
+    --probe "$latency_artifacts/examples/latency_probe" \
+    --path echo --clients 3 --samples 1100 --warmups 10 --interval-ms 40 \
+    --load visible --layout active --panes 15 \
+    --output ".local/latency/target-$latency_policy"
+done
+```
+
+Repeat at least three pairs in reversed order. Keep all required response
+outcomes, actual producer progress, per-client latency, and server/client CPU.
+The local screen completed all 79,200 outputs and reduced active-15 p95 by
+67–80%, but summed client CPU exceeded the experiment's component limit in all
+active pairs. Active-1 median improved while p95 stayed near ordinary cadence.
+These results support further experiments; they do not justify default promotion
+or an idle CPU claim. Recording-on diagnostic latency differed materially from
+recording-disabled runs, so use diagnostics to explain mechanisms and separate
+runs to judge operating cost.
+
+For target diagnostics, build with `just latency-build`, enable
+`HERDR_LATENCY_TRACE_DIR=1`, and pass the printed run's PID-named trace files:
+
+```sh
+python3 scripts/latency_target_report.py "$latency_run"/traces/[0-9]*.jsonl \
+  > .local/latency/reports/target.json
+```
+
+The target report preserves accepted, empty, rejected, coalesced, and unassigned
+input outcomes. Exact runtime/revision/recipient/serialization receipts establish
+which target state reached a queue. A receipt alone does not prove controlled
+process echo or every client's committed output. Use the regular latency report
+and owned-PTY outcomes for those boundaries. Earlier unrelated target output can
+consume urgency before a later echo; delayed-response tests must retain that
+outcome rather than extend expiry to hide it.

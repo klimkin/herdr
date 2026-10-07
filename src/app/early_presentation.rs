@@ -12,12 +12,26 @@ pub(crate) struct OriginLease {
     pub(crate) projection_revision: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalPlacement {
+    pub(crate) workspace_id: String,
+    pub(crate) tab_root: crate::layout::PaneId,
+    pub(crate) pane_id: crate::layout::PaneId,
+    pub(crate) public_pane_id: String,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Work {
     Action {
         workspace_id: String,
         label: String,
         request_id: String,
+    },
+    Terminal {
+        placement: TerminalPlacement,
+        terminal_id: crate::terminal::TerminalId,
+        runtime_instance: u64,
+        baseline_revision: u64,
     },
 }
 
@@ -37,6 +51,7 @@ impl Opportunity {
     fn target_key(&self) -> &str {
         match &self.work {
             Work::Action { workspace_id, .. } => workspace_id,
+            Work::Terminal { terminal_id, .. } => terminal_id.as_str(),
         }
     }
 }
@@ -195,7 +210,10 @@ impl EarlyPresentation {
                 workspace_id,
                 label,
                 request_id,
-            } = &opportunity.work;
+            } = &opportunity.work
+            else {
+                return true;
+            };
             if !snapshot.workspaces.iter().any(|workspace| {
                 &workspace.workspace_id == workspace_id && &workspace.label == label
             }) {
@@ -221,6 +239,158 @@ impl EarlyPresentation {
             false
         });
         satisfied
+    }
+
+    pub(crate) fn terminal_enabled(&self) -> bool {
+        matches!(
+            self.policy,
+            PresentationPolicy::Target | PresentationPolicy::TargetAll
+        )
+    }
+
+    pub(crate) fn pending(&self) -> bool {
+        !self.opportunities.is_empty()
+    }
+    pub(crate) fn contains(&self, id: u64) -> bool {
+        self.opportunities
+            .iter()
+            .any(|opportunity| opportunity.id == id)
+    }
+
+    pub(crate) fn tracks_terminal(&self, terminal_id: &crate::terminal::TerminalId) -> bool {
+        self.opportunities.iter().any(|opportunity|matches!(&opportunity.work,Work::Terminal{terminal_id:target,..} if target==terminal_id))
+    }
+
+    pub(crate) fn accepted_terminal(
+        &mut self,
+        terminal_id: crate::terminal::TerminalId,
+        placement: TerminalPlacement,
+        runtime_instance: u64,
+        baseline_revision: u64,
+        origin: Option<OriginLease>,
+        now: Instant,
+    ) -> Option<Opportunity> {
+        if !self.terminal_enabled() || runtime_instance == 0 || !baseline_revision.is_multiple_of(2)
+        {
+            return None;
+        }
+        self.expire(now);
+        if let Some(existing) = self.opportunities.iter().find(|opportunity| {
+            matches!(&opportunity.work, Work::Terminal { terminal_id: old, runtime_instance: old_instance, .. }
+                if old == &terminal_id && *old_instance == runtime_instance)
+        }) {
+            crate::latency_prof::record("opportunity.coalesced", existing.id, baseline_revision);
+            return Some(existing.clone());
+        }
+        // A replacement runtime cannot share a prior counter lifetime.
+        self.opportunities.retain(|opportunity| {
+            !matches!(&opportunity.work,
+            Work::Terminal { terminal_id: old, .. } if old == &terminal_id)
+        });
+        let next_id = self.next_id.checked_add(1)?;
+        let id = self.next_id;
+        self.next_id = next_id;
+        crate::latency_prof::record_runtime_at(
+            "opportunity.terminal_granted",
+            id,
+            baseline_revision,
+            crate::latency_prof::bytes_id(terminal_id.as_str().as_bytes()),
+            crate::latency_prof::now(),
+            runtime_instance,
+        );
+        crate::latency_prof::record_runtime_at(
+            "opportunity.target_pane",
+            id,
+            crate::latency_prof::bytes_id(placement.public_pane_id.as_bytes()),
+            0,
+            crate::latency_prof::now(),
+            runtime_instance,
+        );
+        #[cfg(feature = "latency-prof")]
+        let diagnostic_times = diagnostic_opportunity_times(now);
+        #[cfg(feature = "latency-prof")]
+        record_opportunity_times(id, diagnostic_times);
+        let opportunity = Opportunity {
+            id,
+            accepted_at: now,
+            expires_at: now + INTERVAL,
+            origin,
+            work: Work::Terminal {
+                placement,
+                terminal_id,
+                runtime_instance,
+                baseline_revision,
+            },
+            attempted: false,
+            #[cfg(feature = "latency-prof")]
+            diagnostic_times,
+        };
+        self.opportunities.push(opportunity.clone());
+        Some(opportunity)
+    }
+
+    pub(crate) fn acknowledge_terminal(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        runtime_instance: u64,
+        revision: u64,
+        client_id: u64,
+        context: crate::latency_prof::TraceContext,
+    ) -> bool {
+        if !self.terminal_enabled()
+            || runtime_instance == 0
+            || revision == 0
+            || !revision.is_multiple_of(2)
+        {
+            return false;
+        }
+        self.expire(Instant::now());
+        let mut satisfied = false;
+        self.opportunities.retain(|opportunity| {
+            let Work::Terminal {
+                terminal_id: target,
+                runtime_instance: instance,
+                baseline_revision,
+                ..
+            } = &opportunity.work
+            else {
+                return true;
+            };
+            if target != terminal_id
+                || *instance != runtime_instance
+                || revision <= *baseline_revision
+            {
+                return true;
+            }
+            satisfied = true;
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::record_context_at(
+                "opportunity.terminal_enqueued",
+                opportunity.id,
+                revision,
+                client_id,
+                crate::latency_prof::now(),
+                crate::latency_prof::TraceContext {
+                    runtime_instance,
+                    ..context
+                },
+            );
+            #[cfg(not(feature = "latency-prof"))]
+            let _ = (client_id, context);
+            false
+        });
+        satisfied
+    }
+
+    pub(crate) fn prune_terminals(&mut self, now: Instant, mut valid: impl FnMut(&Work) -> bool) {
+        self.expire(now);
+        self.opportunities.retain(|opportunity| {
+            !matches!(opportunity.work, Work::Terminal { .. }) || valid(&opportunity.work)
+        });
+    }
+
+    pub(crate) fn cancel_terminal(&mut self, terminal_id: &crate::terminal::TerminalId) {
+        self.opportunities.retain(|opportunity| !matches!(&opportunity.work,Work::Terminal{terminal_id:target,..} if target==terminal_id));
     }
 
     pub(crate) fn cancel_client(&mut self, client_id: u64) {
@@ -262,11 +432,15 @@ impl super::App {
             {
                 return false;
             }
+
             let Work::Action {
                 workspace_id,
                 label,
                 ..
-            } = &opportunity.work;
+            } = &opportunity.work
+            else {
+                return false;
+            };
             state.workspaces.iter().any(|workspace| {
                 &workspace.id == workspace_id && workspace.custom_name.as_ref() == Some(label)
             })

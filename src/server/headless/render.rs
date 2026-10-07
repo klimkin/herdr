@@ -387,7 +387,14 @@ impl HeadlessServer {
         &mut self,
         context: crate::latency_prof::TraceContext,
     ) -> FullRenderOutcome {
-        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context)
+        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context, false)
+    }
+
+    pub(super) fn render_all_dirty_terminal_feedback(
+        &mut self,
+        context: crate::latency_prof::TraceContext,
+    ) -> FullRenderOutcome {
+        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context, true)
     }
 
     #[cfg(all(test, unix))]
@@ -400,6 +407,7 @@ impl HeadlessServer {
         self.render_and_stream_impl(
             graphics_frame_limit,
             crate::latency_prof::TraceContext::default(),
+            false,
         );
     }
 
@@ -407,6 +415,7 @@ impl HeadlessServer {
         &mut self,
         graphics_frame_limit: usize,
         context: crate::latency_prof::TraceContext,
+        target_material_required: bool,
     ) -> FullRenderOutcome {
         let mut outcome = FullRenderOutcome {
             ordinary_work_handled: true,
@@ -706,10 +715,13 @@ impl HeadlessServer {
                 }
             }
             let mut surface_parts = None;
+            let mut terminal_receipts =
+                super::super::terminal_receipts::TerminalReceipts::default();
             let mut diagnostic_sources = crate::latency_prof::runtime::PaneSources::default();
             let frame = match mode {
                 ClientConnectionMode::ClientShell => {
                     let crate::server::client_shell::RenderedPaneSurface {
+                        terminal_receipts: receipts,
                         frame,
                         panes,
                         splits,
@@ -719,6 +731,7 @@ impl HeadlessServer {
                         graphics_sources,
                         diagnostic_sources: sources,
                     } = shell_render.expect("active shell surface");
+                    terminal_receipts = receipts;
                     diagnostic_sources = sources;
                     surface_parts = Some((
                         panes,
@@ -821,19 +834,26 @@ impl HeadlessServer {
             let prepared =
                 if let Some((panes, splits, popup, graphics, delivery, _)) = surface_parts {
                     next_shell_graphics_delivery = Some(delivery);
-                    client.render_state.prepare_pane_surface_with_file(
-                        protocol::PaneSurfaceFrame {
-                            boot_id: self.client_shell_boot_id.clone(),
-                            projection_revision: shell_projection_revision,
-                            surface_revision: 0,
-                            frame,
-                            panes,
-                            splits,
-                            popup,
-                            graphics,
-                        },
-                        native_upload.is_some(),
-                    )
+                    let candidate = protocol::PaneSurfaceFrame {
+                        boot_id: self.client_shell_boot_id.clone(),
+                        projection_revision: shell_projection_revision,
+                        surface_revision: 0,
+                        frame,
+                        panes,
+                        splits,
+                        popup,
+                        graphics,
+                    };
+                    if target_material_required {
+                        terminal_receipts.retain_material(
+                            client.render_state.last_pane_surface(),
+                            &candidate,
+                            attempt.context(),
+                        );
+                    }
+                    client
+                        .render_state
+                        .prepare_pane_surface_with_file(candidate, native_upload.is_some())
                 } else {
                     client.render_state.prepare_frame(frame)
                 };
@@ -973,6 +993,7 @@ impl HeadlessServer {
                     if let Some(delivery) = next_shell_graphics_delivery {
                         client.shell_graphics_delivery = delivery;
                     }
+                    terminal_receipts.retain_incorporated(prepared.incorporated_panes());
                     client.render_state.commit_sent_frame(prepared);
                     if self.app.early_presentation.actions_enabled() {
                         if let (Some(snapshot), Some(surface)) = (
@@ -987,6 +1008,12 @@ impl HeadlessServer {
                             );
                         }
                     }
+
+                    terminal_receipts.acknowledge(
+                        &mut self.app,
+                        client_id,
+                        crate::latency_prof::presentation::primary_context(&frame_trace),
+                    );
                     if shell_graphics_pending || shell_assets_deferred {
                         client.defer_full_render();
                     } else {
