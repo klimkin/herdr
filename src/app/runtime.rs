@@ -153,12 +153,23 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn next_headless_loop_deadline_with_git_refresh(
         &self,
         now: Instant,
         needs_render: bool,
         include_git_refresh: bool,
     ) -> Option<Instant> {
+        self.next_headless_deadline_selection(now, needs_render, include_git_refresh)
+            .deadline
+    }
+
+    pub(crate) fn next_headless_deadline_selection(
+        &self,
+        now: Instant,
+        needs_render: bool,
+        include_git_refresh: bool,
+    ) -> crate::latency_prof::wait::DeadlineSelection {
         let render_deadline = if needs_render {
             self.last_render_at
                 .map(|last_render_at| last_render_at + MIN_RENDER_INTERVAL)
@@ -167,7 +178,8 @@ impl App {
             None
         };
 
-        [
+        let mut selection = crate::latency_prof::wait::DeadlineSelection::default();
+        for (index, deadline) in [
             self.config_diagnostic_deadline,
             self.toast_deadline,
             self.state.next_pending_agent_notification_deadline(),
@@ -185,8 +197,11 @@ impl App {
             render_deadline,
         ]
         .into_iter()
-        .flatten()
-        .min()
+        .enumerate()
+        {
+            selection.include(deadline, 1 << index);
+        }
+        selection
     }
 
     #[cfg(test)]

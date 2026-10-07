@@ -11,13 +11,25 @@ def pair_stages(records):
     pending = defaultdict(deque)
     exact = {}
     pairs = []
+    occurrences = defaultdict(lambda: defaultdict(int))
+    for record in records:
+        if record["stage"] in ("server.enqueue", "server.writer_claim") and record.get("occurrence"):
+            occurrences[(record["pid"], record.get("connection", 0), record["occurrence"])][record["stage"]] += 1
+    modern_pids = {record["pid"] for record in records
+                   if record["stage"] == "diagnostics.schema" and record.get("value", 0) >= 2}
     for record in sorted(records, key=lambda item: item["ns"]):
         # Scope identifies one queue; legacy records cannot prove this pairing.
         if not record.get("scope"):
             continue
         key = (record["pid"], record["scope"], record["id"])
         occurrence = record.get("occurrence", 0)
+        if record["stage"] in ("server.enqueue", "server.writer_claim") and record["pid"] in modern_pids \
+                and (not occurrence or not record.get("connection")):
+            continue
         exact_key = (record["pid"], record.get("connection", 0), occurrence)
+        if occurrence and record["stage"] in ("server.enqueue", "server.writer_claim") and (
+                occurrences[exact_key]["server.enqueue"] != 1 or occurrences[exact_key]["server.writer_claim"] != 1):
+            continue
         if record["stage"] == "server.queue_discard":
             for pending_key in list(pending):
                 if pending_key[:2] == key[:2]:
@@ -34,10 +46,13 @@ def pair_stages(records):
             enqueued = exact.pop(exact_key, None) if occurrence else pending[key].popleft() if pending[key] else None
             if enqueued is None or enqueued["id"] != record["id"] or enqueued["scope"] != record["scope"]:
                 continue
+            context = {name: record.get(name, 0) for name in ("presentation", "attempt", "serialization")}
+            if any(enqueued.get(name, 0) != value for name, value in context.items()):
+                continue
             pairs.append({"pid": record["pid"], "scope": record["scope"], "frame_fingerprint": record["id"],
                           "connection":record.get("connection",0),"occurrence":occurrence,"offset":record.get("offset",0),
                           "enqueue_ns": enqueued["ns"], "claim_ns": record["ns"],
-                          "queue_ns": record["ns"] - enqueued["ns"]})
+                          "queue_ns": record["ns"] - enqueued["ns"], **context})
     return pairs
 
 
@@ -153,6 +168,11 @@ def delivery_join(records, queues, queue, output, trace_audit=None):
             if process is None or not process.get("complete"):
                 return None
     wire = queue["frame_fingerprint"]
+    modern_pids = {record["pid"] for record in records
+                   if record["stage"] == "diagnostics.schema" and record.get("value", 0) >= 2}
+    if (queue["pid"] in modern_pids or output["pid"] in modern_pids) and (
+            not queue.get("occurrence") or not queue.get("connection") or not output.get("connection")):
+        return None
     if queue.get("occurrence"):
         connection = mapped_connection(records, queue, output["pid"], trace_audit)
         if connection is None or output.get("connection") != connection or output.get("offset") != queue["offset"]:
@@ -166,6 +186,8 @@ def delivery_join(records, queues, queue, output, trace_audit=None):
                     and item["id"] == wire and item.get("scope") == queue["scope"]
                     and item.get("connection") == queue["connection"] and item.get("occurrence") == queue["occurrence"]
                     and item.get("offset") == queue["offset"]
+                    and all(item.get(name, 0) == queue.get(name, 0)
+                            for name in ("presentation", "attempt", "serialization"))
                     and queue["claim_ns"] <= item["ns"] <= output["ns"]]
         starts, completes = written("server.write_start"), written("server.write_complete")
         if len(receive) != 1 or len(starts) != 1 or len(completes) != 1:
@@ -194,13 +216,267 @@ def fingerprint(text):
     return value
 
 
+def event_service(records):
+    """Preserve actual producer/consumer boundaries, including send races."""
+    grouped = defaultdict(list)
+    fragments = defaultdict(set)
+    for record in records:
+        if record["stage"] == "input.event_fragment":
+            fragments[(record["pid"], record["id"])].add(record["value"])
+        elif record["stage"].startswith(("event.", "handler.")) and record.get("id"):
+            grouped[(record["pid"], record.get("scope", 0), record["id"])].append(record)
+    events = []
+    modern_pids = {record["pid"] for record in records
+                   if record["stage"] == "diagnostics.schema" and record.get("value", 0) >= 2}
+    lanes = defaultdict(lambda: {"offered":0,"admitted":0,"rejected":0,"received":0,"handled":0})
+    population = defaultdict(lambda: {"received":0,"traced_received":0,"untraced_received":0,"service":0,"traced_service":0,"untraced_service":0,"max_queue_depth_after_receive":0})
+    for record in records:
+        if record["stage"] in ("lane.received", "lane.service"):
+            kind=record["stage"].removeprefix("lane.")
+            lane=population[str(record["scope"])]
+            lane[kind]+=1
+            lane[("traced_" if record.get("id") else "untraced_")+kind]+=1
+            if kind=="received":lane["max_queue_depth_after_receive"]=max(lane["max_queue_depth_after_receive"],record["value"])
+    for (pid, lane, identifier), selected in sorted(grouped.items()):
+        def unique(stage):
+            matches = [record for record in selected if record["stage"] == stage]
+            return matches[0] if len(matches) == 1 else None
+        ingress, begin, end = unique("event.ingress"), unique("event.send_begin"), unique("event.send_end")
+        received, handler, finished = unique("event.received"), unique("handler.begin"), unique("handler.end")
+        service_ids = {record.get("service",0) for record in selected if record["stage"].startswith("handler.")}
+        attempts=[]
+        for service in sorted(service_ids):
+            if pid in modern_pids and not service:
+                continue
+            starts=[record for record in selected if record["stage"]=="handler.begin" and record.get("service",0)==service]
+            finishes=[record for record in selected if record["stage"]=="handler.end" and record.get("service",0)==service]
+            if len(starts)==len(finishes)==1 and starts[0]["ns"]<=finishes[0]["ns"]:
+                attempt={"service":service,"start_ns":starts[0]["ns"],"end_ns":finishes[0]["ns"],"elapsed_ns":finishes[0]["ns"]-starts[0]["ns"]}
+                if finishes[0].get("value"):
+                    attempt["outcome"]={1:"completed",2:"deferred",3:"rejected"}.get(finishes[0]["value"],"unknown")
+                service_lanes=[record for record in selected if record["stage"]=="handler.lane" and record.get("service")==service and starts[0]["ns"]<=record["ns"]<=finishes[0]["ns"]]
+                service_lane=service_lanes[0]["value"] if len(service_lanes)==1 else lane if pid not in modern_pids else None
+                if len(service_lanes)==1:attempt["service_lane"]=service_lane
+                turns=[record for record in selected if record["stage"]=="handler.turn" and record.get("service")==service]
+                if len(turns)==1 and turns[0]["value"] and starts[0]["ns"]<=turns[0]["ns"]<=finishes[0]["ns"]:
+                    turn=turns[0]["value"]
+                    matching=[record for record in records if record["stage"]=="loop.turn" and record["pid"]==pid and record["id"]==turn and record["ns"]<=starts[0]["ns"]]
+                    newer=[record for record in records if record["stage"]=="loop.turn" and record["pid"]==pid and matching and matching[0]["ns"]<record["ns"]<=starts[0]["ns"]]
+                    if len(matching)==1 and not newer:attempt["turn"]=turn
+                dispatches=[record for record in selected if record["stage"]=="event.dispatch" and record.get("service")==service and starts[0]["ns"]<=record["ns"]<=finishes[0]["ns"]]
+                if len(dispatches)==1:attempt["dispatch_ns"]=dispatches[0]["ns"]
+                commands=[record for record in selected if record["stage"]=="event.dispatch_command" and record.get("service")==service and starts[0]["ns"]<=record["ns"]<=finishes[0]["ns"]]
+                if commands:
+                    attempt["dispatch_commands"]=[{"command":record["value"],"ns":record["ns"]} for record in commands]
+                waits=[record for record in selected if record["stage"]=="handler.selected_wait" and record.get("service")==service and record["value"]]
+                # A new completion receive may select a wait; retries/drained work cannot inherit one.
+                if len(waits)==1:
+                    wait=waits[0]["value"]
+                    beginning=[record for record in records if record["stage"]=="loop.wait_begin" and record["pid"]==pid and record["id"]==wait]
+                    returned=[record for record in records if record["stage"].startswith("loop.wait_end.") and record["pid"]==pid and record["id"]==wait]
+                    receives=[record for record in selected if record["stage"]=="event.selected_wait" and record["value"]==wait]
+                    if (len(beginning)==len(returned)==len(receives)==1
+                            and returned[0]["stage"]=={1:"loop.wait_end.server_event",2:"loop.wait_end.api",3:"loop.wait_end.internal"}.get(service_lane)
+                            and beginning[0]["ns"]<=returned[0]["ns"]<=receives[0]["ns"]<=starts[0]["ns"]<=waits[0]["ns"]<=finishes[0]["ns"]
+                            and beginning[0].get("scope")==returned[0].get("scope") and beginning[0].get("value")==returned[0].get("value")):
+                        attempt["selected_wait"]=wait
+                        attempt["selected_branch"]=returned[0]["stage"].removeprefix("loop.wait_end.")
+                attempts.append(attempt)
+        admitted = bool(begin and end and end["value"] == 1 and begin["ns"] <= end["ns"])
+        valid_receive = bool(admitted and received and begin["ns"] <= received["ns"])
+        def elapsed(first, last):
+            return last["ns"]-first["ns"] if first and last and first["ns"] <= last["ns"] else None
+        lanes[str(lane)]["offered"] += int(ingress is not None)
+        lanes[str(lane)]["admitted"] += int(admitted)
+        lanes[str(lane)]["rejected"] += int(bool(end and end["value"] == 0))
+        lanes[str(lane)]["received"] += int(received is not None)
+        lanes[str(lane)]["handled"] += int(bool(attempts))
+        origin,payload=unique("event.origin"),unique("event.payload")
+        classes=[record for record in selected if record["stage"].startswith("event.class.")]
+        payloads=[record for record in selected if record["stage"].startswith("event.payload.")]
+        by_unit=defaultdict(list)
+        for record in payloads:by_unit[record["stage"].removeprefix("event.payload.")].append(record)
+        payload_values={unit:values[0]["value"] for unit,values in by_unit.items() if len(values)==1}
+        payload_unit="bytes" if "bytes" in payload_values else next(iter(payload_values)) if len(payload_values)==1 else None
+        if payload_unit:payload=by_unit[payload_unit][0]
+        method=unique("event.method")
+        events.append({"pid":pid,"lane":lane,"event":identifier,"admitted":admitted,
+                       "ingress_to_receive_ns":elapsed(ingress, received) if valid_receive else None,
+                       "sender_wait_ns":elapsed(begin, end),
+                       "queue_residence_ns":[max(0,received["ns"]-end["ns"]),received["ns"]-begin["ns"]] if valid_receive else None,
+                       "handler_ns":elapsed(handler,finished),"service_attempts":attempts,
+                       "completion_received_ns":[record["ns"] for record in selected if record["stage"]=="event.completion_received"],
+                       "response_outcomes":[{"ns":record["ns"],"outcome":{1:"completed",3:"rejected"}.get(record["value"],"unknown")} for record in selected if record["stage"]=="event.response_completed"],
+                       "origin":origin["value"] if origin else None,"payload":payload["value"] if payload else None})
+        events[-1].update({"class":classes[0]["stage"].removeprefix("event.class.") if len(classes)==1 else None,
+                           "payload_unit":payload_unit,"method":method["value"] if method else None,
+                           "payloads":payload_values,
+                           "queue_depth_after_receive":received["value"] if received else None,
+                           "oldest_whole_lane_age_ns":None})
+        residents=[]
+        if received:
+            for (candidate_pid,candidate_lane,candidate_id), candidates in grouped.items():
+                if (candidate_pid,candidate_lane)!=(pid,lane) or candidate_id==identifier:continue
+                sends=[record for record in candidates if record["stage"]=="event.send_begin"]
+                returns=[record for record in candidates if record["stage"]=="event.send_end"]
+                receives=[record for record in candidates if record["stage"]=="event.received"]
+                if (len(sends)==len(returns)==1 and returns[0]["value"]==1
+                        and sends[0]["ns"]<=returns[0]["ns"]<=received["ns"]
+                        and not any(record["ns"]<=received["ns"] for record in receives)):
+                    residents.append([received["ns"]-returns[0]["ns"],received["ns"]-sends[0]["ns"]])
+        events[-1]["oldest_traced_queue_residence_ns"]=[max(value[index] for value in residents) for index in (0,1)] if residents else None
+        events[-1]["completion_events"]=[record["id"] for record in records if record["stage"]=="event.completion_of" and record["pid"]==pid and record["value"]==identifier]
+    return {"events":events,"lanes":dict(lanes),
+            "lane_population":dict(population),
+            "input_contributors":[{"pid":pid,"identity":identity,"events":sorted(ids)}
+                                  for (pid,identity),ids in sorted(fragments.items())],
+            "semantics":"Queue residence is an interval: publication can precede send return. Handler spans can contain nested barriers; do not add them."}
+
+
+def wait_service(records):
+    selected = defaultdict(int)
+    deadlines = []
+    begins = defaultdict(list)
+    ends = defaultdict(list)
+    invalid = 0
+    reason_names = {}
+    names = ["config_diagnostic","toast","agent_notification","managed_agent","git_refresh",
+             "worktree_validation_retry","app_update","manifest_update","agent_metadata",
+             "pending_resume","session_save","tab_status","render_cadence","alt_screen_read","listener_error_retry"]
+    for record in records:
+        if record["stage"] == "loop.wait_begin":
+            begins[(record["pid"],record["id"])].append(record)
+        elif record["stage"].startswith("loop.wait_end."):
+            selected[record["stage"].removeprefix("loop.wait_end.")] += 1
+            ends[(record["pid"],record["id"])].append(record)
+    known_reasons = (1 << len(names)) - 1
+    for key in sorted(begins.keys() | ends.keys()):
+        values, starting = ends[key], begins[key]
+        if len(values) != 1 or len(starting) != 1:
+            invalid += 1
+            continue
+        end, begin = values[0], starting[0]
+        if end["ns"] < begin["ns"] or end.get("scope") != begin.get("scope") or end.get("value") != begin.get("value"):
+            invalid += 1
+            continue
+        if end["stage"] == "loop.wait_end.deadline":
+            deadline, mask = begin.get("value"), begin.get("scope")
+            if (type(deadline) is not int or deadline <= 0
+                    or type(mask) is not int or mask <= 0 or mask & ~known_reasons
+                    or end["ns"] < deadline):
+                invalid += 1
+                continue
+            reason_names[str(mask)] = [name for index,name in enumerate(names) if mask & (1 << index)]
+            deadlines.append({"pid":key[0],"wait":key[1],"armed_deadline_ns":deadline,
+                              "reasons_mask":mask,"return_ns":end["ns"],
+                              "overdue_ns":end["ns"]-deadline})
+    return {"loop_turns":sum(record["stage"]=="loop.turn" for record in records),
+            "selected_returns":dict(selected),"deadline_returns":deadlines,
+            "invalid_waits":invalid,"deadline_reason_names":reason_names,
+            "scheduler_wakeups":None,"context_switches":None,
+            "semantics":"Selected future returns are neither scheduler wakeups nor context switches."}
+
+
+def runtime_work(records):
+    starts = defaultdict(list)
+    ends = defaultdict(list)
+    notifications = defaultdict(int)
+    for record in records:
+        if record["stage"].startswith("batch.begin."):
+            starts[(record["pid"],record["id"],record["stage"].removeprefix("batch.begin."))].append(record)
+        elif record["stage"].startswith("batch.end."):
+            ends[(record["pid"],record["id"],record["stage"].removeprefix("batch.end."))].append(record)
+        elif record["stage"].startswith("render.notify_"):
+            notifications[record["stage"].removeprefix("render.notify_")] += 1
+    batches=[]
+    for (pid,identifier,kind), values in sorted(ends.items()):
+        beginning=starts[(pid,identifier,kind)]
+        if len(values)==len(beginning)==1 and beginning[0]["ns"]<=values[0]["ns"]:
+            batches.append({"pid":pid,"batch":identifier,"class":kind,"count":values[0]["value"],
+                            "elapsed_ns":values[0]["ns"]-beginning[0]["ns"]})
+    accepts=[]
+    for accepted in [record for record in records if record["stage"]=="client.accepted"]:
+        def boundary(stage):
+            matching=[item for item in records if item["stage"]==stage and item["pid"]==accepted["pid"] and item["id"]==accepted["id"]]
+            return matching[0]["ns"] if len(matching)==1 else None
+        connection=[item for item in records if item["stage"]=="server.connection" and item["pid"]==accepted["pid"] and item["scope"]==accepted["id"]]
+        accepts.append({"pid":accepted["pid"],"client":accepted["id"],"peer_pid":accepted["value"],"accepted_ns":accepted["ns"],
+                        "handshake_begin_ns":boundary("client.handshake_begin"),"hello_ready_ns":boundary("client.hello_ready"),
+                        "welcome_written_ns":boundary("client.welcome_written"),"connection":connection[0]["id"] if len(connection)==1 else None})
+    return {"batches":batches,"notifications":dict(notifications),"accepts":accepts,
+            "semantics":"Whole-handler and barrier spans overlap; counts bound messages, not elapsed time or the whole turn."}
+
+
 def critical_paths(run, records, trace_audit=None):
     """Join diagnostic links, refusing absent or ambiguous causal attribution."""
     stages = defaultdict(list)
     for record in sorted(records, key=lambda item: item["ns"]):
         stages[record["stage"]].append(record)
     queues = pair_stages(records)
+    modern_pids = {record["pid"] for record in stages["diagnostics.schema"] if record.get("value", 0) >= 2}
+    services = event_service(records)
+    def response_service(pid, identity, commit, start, end):
+        command_links=[]
+        if run["path"] == "action":
+            contributors = [commit["id"]] if commit else []
+        elif run["path"] == "echo":
+            actor=input_actor_path(records,identity,pid,start,end)
+            valid_actor=actor["attribution"]=="complete contributing accepted parts"
+            if valid_actor:
+                for part in actor["parts"]:
+                    matches=[record for record in records if record["stage"]=="input.command_event" and record["pid"]==pid and record["id"]==part["command_id"] and record.get("scope")==part["scope"] and start<=record["ns"]<=end]
+                    if len(matches)!=1:valid_actor=False;break
+                    link={"command":part["command_id"],"event":matches[0]["value"],"ns":matches[0]["ns"]}
+                    if link not in command_links:command_links.append(link)
+            contributors=sorted({link["event"] for link in command_links}) if valid_actor else []
+            fragments={record["value"] for record in records if record["stage"]=="input.event_fragment" and record["pid"]==pid and record["id"]==identity and start<=record["ns"]<=end}
+            if fragments!=set(contributors):contributors=[]
+        else:
+            return None
+        events = [dict(item) for item in services["events"] if item["pid"] == pid and item["event"] in contributors]
+        complete = bool(contributors) and len(events) == len(contributors)
+        for event in events:
+            attempts = [attempt for attempt in event["service_attempts"] if start<=attempt["start_ns"]<=end]
+            event["service_attempts"]=attempts
+            received=[record for record in records if record["stage"]=="event.received" and record["pid"]==pid and record["id"]==event["event"] and record.get("scope")==event["lane"] and start<=record["ns"]<=end]
+            complete &= bool(event["admitted"] and event["ingress_to_receive_ns"] is not None and attempts and len(received)==1 and received[0]["ns"]<=attempts[0]["start_ns"])
+            if run["path"]=="echo":
+                for link in [link for link in command_links if link["event"]==event["event"]]:
+                    dispatches=[command for attempt in attempts if attempt.get("turn") for command in attempt.get("dispatch_commands",[]) if command["command"]==link["command"] and attempt["start_ns"]<=link["ns"]<=command["ns"]<=attempt["end_ns"]]
+                    complete &= len(dispatches)==1
+            else:
+                complete &= all(attempt.get("turn") and attempt.get("dispatch_ns") for attempt in attempts)
+            selected = [record for record in records if record["pid"] == pid and record["id"] == event["event"] and record["stage"] in ("event.selected_wait", "handler.selected_wait")]
+            if selected:
+                complete &= bool(attempts and attempts[0].get("selected_wait"))
+        if commit:
+            complete &= any(attempt["service"] == commit.get("service") and attempt["start_ns"] <= commit["ns"] <= attempt["end_ns"]
+                            for event in events for attempt in event["service_attempts"])
+        return {"attribution":"exact event service and selected wait" if complete else "incomplete event service chain",
+                "events":events,"contributors":contributors,"command_links":command_links,
+                "semantics":"Service attempts overlap source-to-ready and nested work; do not add them to the response partition."}
     def gate_window(pid, ready, surface):
+        presentation, attempt = surface.get("presentation", 0), surface.get("attempt", 0)
+        if presentation or attempt or surface.get("serialization", 0):
+            if not presentation or not attempt:
+                return None
+            selected = [item for item in stages["presentation.selected_deadline"]
+                        if item["pid"] == pid and item.get("presentation") == presentation]
+            starts = [item for item in stages["server.frame_start"]
+                      if item["pid"] == pid and item.get("presentation") == presentation
+                      and item.get("attempt") == attempt]
+            if len(selected) != 1 or len(starts) != 1:
+                return None
+            gate, frame = selected[0], starts[0]
+            eligible = max(ready, gate["value"])
+            if not eligible <= frame["ns"] <= surface["ns"]:
+                return None
+            return {"presentation":presentation,"attempt":attempt,
+                    "frame_start_ns":frame["ns"],"cadence_floor_ns":gate["value"],
+                    "eligible_ns":eligible,"state_ready_to_eligible_ns":eligible-ready,
+                    "eligible_to_frame_start_ns":frame["ns"]-eligible,
+                    "attribution":"exact presentation and producing attempt, host clock"}
+        surface = surface["ns"]
         selected = [item for item in stages["presentation.selected_overdue"] if item["pid"]==pid and ready<=item["ns"]<=surface]
         starts = [item for item in stages["server.frame_start"] if item["pid"]==pid and ready<=item["ns"]<=surface]
         if not selected or not starts:
@@ -231,22 +507,66 @@ def critical_paths(run, records, trace_audit=None):
         else:
             for stimulus in stimuli:
                 for surface in stages["surface.content"]:
-                    if (surface["pid"] == stimulus["pid"] and surface["id"] == next((item["value"] for item in stages["pane.identity"] if item["pid"]==stimulus["pid"] and item["id"]==stimulus["scope"]),stimulus["scope"])
+                    instance = stimulus.get("runtime_instance", 0)
+                    if stimulus["pid"] in modern_pids and (
+                            not instance or surface.get("runtime_instance") != instance
+                            or surface["value"] % 2):
+                        continue
+                    mappings = [item for item in stages["pane.identity"]
+                                if item["pid"] == stimulus["pid"] and item["id"] == stimulus["scope"]
+                                and item["ns"] <= surface["ns"]
+                                and (not instance or item.get("runtime_instance") == instance)]
+                    if stimulus["pid"] in modern_pids:
+                        if not mappings:
+                            continue
+                        latest = mappings[-1]["ns"]
+                        if len([item for item in mappings if item["ns"] == latest]) != 1:
+                            continue
+                    pane_id = mappings[-1]["value"] if mappings else stimulus["scope"]
+                    if (surface["pid"] == stimulus["pid"] and surface["id"] == pane_id
                             and surface["value"] >= stimulus["value"] and stimulus["ns"] <= surface["ns"] <= end):
                         # A replacement marker in this pane supersedes the older effect.
                         overwritten = any(other["pid"] == stimulus["pid"] and other["scope"] == stimulus["scope"]
+                                          and (not instance or other.get("runtime_instance") == instance)
                                           and other["id"] != stimulus["id"] and other["value"] >= stimulus["value"] and other["value"] <= surface["value"]
                                           for other in stages["terminal.stimulus"])
                         if not overwritten:
                             links.append((stimulus, surface))
         seen = set()
         for stimulus, surface in links:
+            if surface["pid"] in modern_pids:
+                context = tuple(surface.get(name, 0) for name in ("presentation", "attempt", "serialization"))
+                semantic_stage = "snapshot.label" if stimulus is None else "surface.content"
+                matching = [item for item in stages[semantic_stage]
+                            if item["pid"] == surface["pid"] and item["id"] == surface["id"]
+                            and tuple(item.get(name, 0) for name in ("presentation", "attempt", "serialization")) == context]
+                if not all(context) or len(matching) != 1:
+                    continue
+                serializations = [item for item in stages["server.serialization"]
+                                  if item["pid"] == surface["pid"] and item.get("serialization") == context[2]]
+                if len(serializations) != 1:
+                    continue
+                serialized = serializations[0]
+                if (tuple(serialized.get(name, 0) for name in ("presentation", "attempt", "serialization")) != context
+                        or serialized["id"] != surface["scope"] or serialized["ns"] > surface["ns"]):
+                    continue
             wire = surface["scope"]
             for queue in queues:
                 if queue["pid"] != surface["pid"] or queue["frame_fingerprint"] != wire:
                     continue
+                semantic_context = tuple(surface.get(name, 0) for name in ("presentation", "attempt", "serialization"))
+                queue_context = tuple(queue.get(name, 0) for name in ("presentation", "attempt", "serialization"))
+                if any(semantic_context + queue_context) and (
+                        not all(semantic_context) or semantic_context != queue_context):
+                    continue
                 if not surface["ns"] <= queue["enqueue_ns"] <= end:
                     continue
+                if surface["pid"] in modern_pids:
+                    enqueues = [item for item in stages["server.enqueue"]
+                                if item["pid"] == queue["pid"] and item.get("connection") == queue["connection"]
+                                and item.get("occurrence") == queue["occurrence"]]
+                    if len(enqueues) != 1 or enqueues[0]["value"] != serialized["value"]:
+                        continue
                 outputs = [item for item in stages["client.delivery"]
                            if item["id"] == wire and queue["claim_ns"] <= item["ns"] <= end]
                 for output in outputs:
@@ -264,9 +584,12 @@ def critical_paths(run, records, trace_audit=None):
                     if key in seen:
                         continue
                     seen.add(key)
-                    action_commit = next((item for item in stages["server.action_committed"] if run["path"]=="action" and item["pid"]==queue["pid"] and item["value"]==label and start<=item["ns"]<=surface["ns"]),None)
+                    commit_stage = "action.event_committed" if queue["pid"] in modern_pids else "server.action_committed"
+                    commits = [item for item in stages[commit_stage] if run["path"]=="action" and item["pid"]==queue["pid"] and item["value"]==label and start<=item["ns"]<=surface["ns"]]
+                    action_commit = commits[0] if len(commits)==1 else None
+                    service_chain = response_service(queue["pid"], identity, action_commit, start, surface["ns"])
                     state_ready = stimulus["ns"] if stimulus else action_commit["ns"] if action_commit else start
-                    gate = gate_window(queue["pid"], state_ready, surface["ns"])
+                    gate = gate_window(queue["pid"], state_ready, surface)
                     forward = {}
                     actor_input = None
                     helper_received = None
@@ -304,10 +627,13 @@ def critical_paths(run, records, trace_audit=None):
                                   "client_pid":output["pid"], "queue_scope":queue["scope"],
                                   "frame_fingerprint":wire, "start_ns":start,
                                   "connection":queue.get("connection",0),"occurrence":queue.get("occurrence",0),"wire_offset":queue.get("offset",0),"connection_attribution":connection_attribution,
+                                  "serialization":queue.get("serialization",0),
+                                  "runtime_instance":stimulus.get("runtime_instance",0) if stimulus else None,
                                   "terminal_ready_ns":stimulus["ns"] if stimulus else None,
                                   "terminal_revision":stimulus["value"] if stimulus else None,
                                   "surface_content_revision":surface["value"], "surface_ns":surface["ns"],"presentation_gate":gate,"forward_boundaries":forward,"action_commit_ns":action_commit["ns"] if action_commit else None,
                                   "actor_input":actor_input,"helper_received_ns":helper_received,
+                                  "response_service":service_chain,
                                   "enqueue_ns":queue["enqueue_ns"],"claim_ns":queue["claim_ns"],
                                   "queue_ns":queue["queue_ns"],"socket_start_ns":write_start,"socket_complete_ns":written,
                                   "client_receive_ns":receive,"client_output_ns":output["ns"],
@@ -510,9 +836,11 @@ def read_process_traces(directory, expected, diagnostics=None):
                     invalid += 1
                     continue
                 if (not isinstance(record, dict) or not isinstance(record.get("stage"), str)
-                        or any(type(record.get(field)) is not int or record[field] < 0
+                        or any(type(record.get(field)) is not int or not 0 <= record[field] < 1 << 64
                                for field in ("pid", "ns", "id", "scope", "value"))
-                        or type(record.get("dropped", 0)) is not int or record.get("dropped", 0) < 0):
+                        or any(type(record.get(field, 0)) is not int or not 0 <= record.get(field, 0) < 1 << 64
+                               for field in ("dropped", "thread", "connection", "occurrence", "offset",
+                                             "presentation", "attempt", "serialization", "runtime_instance", "service"))):
                     invalid += 1
                     continue
                 if record["pid"] != pid:
@@ -733,6 +1061,9 @@ def main():
     pairs = pair_stages(records)
     paths = critical_paths(run, records, trace_audit)
     stage_report = stage_distributions(run, paths)
+    service_report = event_service(records)
+    wait_report = wait_service(records)
+    work_report = runtime_work(records)
     input_report = input_distributions(run, paths)
     coverage = stage_report["coverage"]
     lines.extend(["", f"Uniquely attributed effects: {coverage['uniquely_attributed_effects']} / {coverage['completed_effects']} completed; {coverage['offered_effects']} offered.",
@@ -773,7 +1104,7 @@ def main():
         lines.extend(["", trace_audit["semantics"]])
     if args.output:
         args.output.with_suffix(".json").write_text(json.dumps({"queue_pairs": pairs,"critical_paths":paths,
-            "stage_report":stage_report,"input_report":input_report,"trace_audit":trace_audit,"freshness":freshness(run),
+            "stage_report":stage_report,"event_service":service_report,"wait_service":wait_report,"runtime_work":work_report,"input_report":input_report,"trace_audit":trace_audit,"freshness":freshness(run),
             "max_consecutive_deadline_misses":miss_bursts(run),"reader_recovery":recovery}, indent=2)+"\n")
     lines.extend(["", "Queue pairing uses process and queue identity plus content fingerprints. Causal paths require terminal/snapshot links and client write completion. Ambiguous links remain unassigned.",
                   "", "Results include observer and host scheduling. No pixel, GPU, remote one-way, or production-SLO claim.", ""])

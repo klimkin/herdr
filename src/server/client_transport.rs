@@ -244,6 +244,14 @@ impl ClientControlWriter {
     pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
         self.queue.send_control(data)
     }
+
+    pub(crate) fn send_traced(
+        &self,
+        data: Vec<u8>,
+        trace: &[crate::latency_prof::SerializedFrame],
+    ) -> Result<(), SendError<Vec<u8>>> {
+        self.queue.send_control_traced(data, trace)
+    }
 }
 
 impl ClientRenderWriter {
@@ -256,6 +264,7 @@ impl ClientRenderWriter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn try_send(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
         #[cfg(test)]
         if let Some(sender) = &self.test_render {
@@ -264,8 +273,29 @@ impl ClientRenderWriter {
         self.queue.try_send_render(data)
     }
 
+    #[cfg(test)]
     pub(crate) fn send_ordered(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
         self.queue.send_ordered(data)
+    }
+
+    pub(crate) fn try_send_traced(
+        &self,
+        data: Vec<u8>,
+        trace: &[crate::latency_prof::SerializedFrame],
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        #[cfg(test)]
+        if let Some(sender) = &self.test_render {
+            return sender.try_send(data);
+        }
+        self.queue.try_send_render_traced(data, trace)
+    }
+
+    pub(crate) fn send_ordered_traced(
+        &self,
+        data: Vec<u8>,
+        trace: &[crate::latency_prof::SerializedFrame],
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        self.queue.send_ordered_traced(data, trace)
     }
 }
 
@@ -311,6 +341,20 @@ impl QueuedClientData {
             frames: crate::latency_prof::queued_frames(&bytes, connection),
             bytes,
         }
+    }
+    fn new_traced(
+        bytes: Vec<u8>,
+        connection: u64,
+        trace: &[crate::latency_prof::SerializedFrame],
+    ) -> Self {
+        let data = Self::new(bytes, connection);
+        #[cfg(feature = "latency-prof")]
+        let mut data = data;
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::presentation::bind(&mut data.frames, trace);
+        #[cfg(not(feature = "latency-prof"))]
+        let _ = trace;
+        data
     }
     fn diagnostics(&self) -> Vec<crate::latency_prof::QueuedFrame> {
         #[cfg(feature = "latency-prof")]
@@ -390,10 +434,25 @@ impl ClientWriterQueue {
     }
 
     fn send_control(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
-        let data = QueuedClientData::new(data, self.scope());
+        self.send_control_traced(data, &[])
+    }
+
+    fn send_control_traced(
+        &self,
+        data: Vec<u8>,
+        trace: &[crate::latency_prof::SerializedFrame],
+    ) -> Result<(), SendError<Vec<u8>>> {
+        let data = QueuedClientData::new_traced(data, self.scope(), trace);
         let ids = data.diagnostics();
         let mut state = self.lock_state();
         if !state.writer_alive {
+            drop(state);
+            crate::latency_prof::emit_queued_frames(
+                "server.queue_disconnected",
+                data.frames(),
+                self.scope() * 2,
+                crate::latency_prof::now(),
+            );
             return Err(SendError(data.bytes));
         }
         let enqueued_ns = crate::latency_prof::now();
@@ -413,11 +472,27 @@ impl ClientWriterQueue {
         Ok(())
     }
 
+    #[cfg(test)]
     fn try_send_render(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
-        let data = QueuedClientData::new(data, self.scope());
+        self.try_send_render_traced(data, &[])
+    }
+
+    fn try_send_render_traced(
+        &self,
+        data: Vec<u8>,
+        trace: &[crate::latency_prof::SerializedFrame],
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        let data = QueuedClientData::new_traced(data, self.scope(), trace);
         let ids = data.diagnostics();
         let mut state = self.lock_state();
         if !state.writer_alive {
+            drop(state);
+            crate::latency_prof::emit_queued_frames(
+                "server.queue_disconnected",
+                data.frames(),
+                self.scope() * 2 + 1,
+                crate::latency_prof::now(),
+            );
             return Err(TrySendError::Disconnected(data.bytes));
         }
         if state.render.is_some() {
@@ -449,10 +524,24 @@ impl ClientWriterQueue {
 
     fn discard_pending_render(&self) {
         let mut state = self.lock_state();
+        #[cfg(feature = "latency-prof")]
+        let discarded = state
+            .render
+            .iter()
+            .chain(state.ordered.iter())
+            .flat_map(|data| data.frames().iter().copied())
+            .collect::<Vec<_>>();
         state.render = None;
         state.ordered.clear();
         let discarded_ns = crate::latency_prof::now();
         drop(state);
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::emit_queued_frames(
+            "server.queue_discarded_frame",
+            &discarded,
+            self.scope() * 2 + 1,
+            discarded_ns,
+        );
         crate::latency_prof::record_at(
             "server.queue_discard",
             0,
@@ -463,14 +552,37 @@ impl ClientWriterQueue {
         self.ready.notify_all();
     }
 
+    #[cfg(test)]
     fn send_ordered(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
-        let data = QueuedClientData::new(data, self.scope());
+        self.send_ordered_traced(data, &[])
+    }
+
+    fn send_ordered_traced(
+        &self,
+        data: Vec<u8>,
+        trace: &[crate::latency_prof::SerializedFrame],
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        let data = QueuedClientData::new_traced(data, self.scope(), trace);
         let ids = data.diagnostics();
         let mut state = self.lock_state();
         if !state.writer_alive {
+            drop(state);
+            crate::latency_prof::emit_queued_frames(
+                "server.queue_disconnected",
+                data.frames(),
+                self.scope() * 2 + 1,
+                crate::latency_prof::now(),
+            );
             return Err(TrySendError::Disconnected(data.bytes));
         }
         if !state.ordered.is_empty() {
+            drop(state);
+            crate::latency_prof::emit_queued_frames(
+                "server.render_deferred",
+                data.frames(),
+                self.scope() * 2 + 1,
+                crate::latency_prof::now(),
+            );
             return Err(TrySendError::Full(data.bytes));
         }
         if let Some(older) = state.render.take() {
@@ -605,6 +717,11 @@ impl ClientWriterQueue {
 /// Internal event sent from client transport threads to the main event loop.
 #[derive(Debug)]
 pub(crate) enum ServerEvent {
+    #[cfg(feature = "latency-prof")]
+    Diagnostic {
+        trace: crate::latency_prof::event::EventTrace,
+        event: Box<ServerEvent>,
+    },
     /// A new client completed the handshake.
     ClientConnected {
         client_id: u64,
@@ -765,6 +882,48 @@ pub(crate) enum ServerEvent {
     QuitSignal,
 }
 
+impl ServerEvent {
+    pub(crate) fn traced(self, trace: crate::latency_prof::event::EventTrace) -> Self {
+        #[cfg(feature = "latency-prof")]
+        if trace.is_active() && !matches!(self, Self::Diagnostic { .. }) {
+            return Self::Diagnostic {
+                trace,
+                event: Box::new(self),
+            };
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        let _ = trace;
+        self
+    }
+
+    pub(crate) fn into_trace(self) -> (Self, crate::latency_prof::event::EventTrace) {
+        #[cfg(feature = "latency-prof")]
+        if let Self::Diagnostic { trace, event } = self {
+            return (*event, trace);
+        }
+        (self, crate::latency_prof::event::EventTrace::default())
+    }
+
+    pub(crate) fn selected_wait(&mut self, wait: &crate::latency_prof::wait::WaitTrace) {
+        #[cfg(feature = "latency-prof")]
+        if let Self::Diagnostic { trace, .. } = self {
+            *trace = trace.with_selected_wait(wait);
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        let _ = wait;
+    }
+
+    pub(crate) fn received(&self, remaining: usize) {
+        #[cfg(feature = "latency-prof")]
+        match self {
+            Self::Diagnostic { trace, .. } => trace.received(1, remaining),
+            _ => crate::latency_prof::event::EventTrace::default().received(1, remaining),
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        let _ = remaining;
+    }
+}
+
 /// Clamp client-reported terminal dimensions to a minimum viable size.
 pub(crate) fn clamp_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
     let clamped_cols = cols.max(MIN_CLIENT_COLS);
@@ -884,6 +1043,7 @@ pub(crate) fn handle_client_handshake(
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
 ) -> io::Result<()> {
+    crate::latency_prof::record("client.handshake_begin", client_id, 0);
     if should_quit.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -1026,6 +1186,7 @@ pub(crate) fn handle_client_handshake(
             return Ok(());
         }
     };
+    crate::latency_prof::record("client.hello_ready", client_id, 0);
 
     if should_quit.load(Ordering::Acquire) {
         return Ok(());
@@ -1057,6 +1218,7 @@ pub(crate) fn handle_client_handshake(
         }
     };
     protocol::write_message(&mut stream, &welcome).map_err(|e| io::Error::other(e.to_string()))?;
+    crate::latency_prof::record("client.welcome_written", client_id, 0);
 
     set_client_recv_timeout(
         &stream,
@@ -1342,6 +1504,37 @@ fn client_read_loop_with_endpoint_controls(
             }
         };
 
+        let diagnostic_event = if crate::latency_prof::active() {
+            let class = match &msg {
+                ClientMessage::Input { .. } => Some("event.class.raw_input"),
+                ClientMessage::ClientShellPaneInput { .. } => Some("event.class.terminal_input"),
+                ClientMessage::ClientShellPopupInput { .. } => Some("event.class.popup_input"),
+                ClientMessage::ClientShellEndpointRequest { .. } => {
+                    Some("event.class.runtime_action")
+                }
+                _ => None,
+            };
+            class.map_or_else(crate::latency_prof::event::EventTrace::default, |class| {
+                let trace = crate::latency_prof::event::EventTrace::ingress(1, class, 0);
+                trace.record("event.origin", client_id);
+                let payload = match &msg {
+                    ClientMessage::Input { data } => data.len(),
+                    ClientMessage::ClientShellPaneInput { events, .. }
+                    | ClientMessage::ClientShellPopupInput { events, .. } => events.len(),
+                    ClientMessage::ClientShellEndpointRequest { request, .. } => request.len(),
+                    _ => 0,
+                };
+                #[cfg(feature = "latency-prof")]
+                trace.record(
+                    "event.payload.bytes",
+                    crate::latency_prof::received_payload_bytes(),
+                );
+                trace.record("event.payload_items", payload as u64);
+                trace
+            })
+        } else {
+            crate::latency_prof::event::EventTrace::default()
+        };
         let event = match msg {
             ClientMessage::Input { data } => {
                 // Validate input size.
@@ -1722,7 +1915,21 @@ fn client_read_loop_with_endpoint_controls(
             }
         };
 
-        if server_event_tx.blocking_send(event).is_err() {
+        #[cfg(feature = "latency-prof")]
+        if diagnostic_event.is_active() {
+            if let ServerEvent::ClientShellEndpointRequest { request, .. } = &event {
+                diagnostic_event.record(
+                    "event.method",
+                    crate::latency_prof::bytes_id(
+                        crate::api::api_method_name(&request.method).as_bytes(),
+                    ),
+                );
+            }
+        }
+        diagnostic_event.record("event.send_begin", 0);
+        let sent = server_event_tx.blocking_send(event.traced(diagnostic_event));
+        diagnostic_event.record("event.send_end", u64::from(sent.is_ok()));
+        if sent.is_err() {
             break; // Main loop gone.
         }
     }

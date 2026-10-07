@@ -559,6 +559,7 @@ impl ClientState {
                 0,
                 completed_ns,
             );
+            crate::latency_prof::mark("client.output_complete");
             crate::latency_prof::delivery_with_snapshot(encoded.len(), snapshot, completed_ns);
         }
         #[cfg(not(feature = "latency-prof"))]

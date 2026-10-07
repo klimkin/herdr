@@ -140,6 +140,8 @@ pub(crate) fn spawn_response_waiter(
     response_rx: mpsc::Receiver<String>,
     server_event_tx: tokio_mpsc::Sender<ServerEvent>,
 ) -> io::Result<()> {
+    #[cfg(feature = "latency-prof")]
+    let diagnostic_origin = crate::latency_prof::event::current().deferred();
     std::thread::Builder::new()
         .name("herdr-client-endpoint-response".into())
         .spawn(move || {
@@ -151,30 +153,54 @@ pub(crate) fn spawn_response_waiter(
                 )
             });
             let response = correlate_response_id(response, &request_id).into_bytes();
+            #[cfg(feature = "latency-prof")]
+            let completion_trace = |event: ServerEvent, bytes: usize| {
+                let trace = if diagnostic_origin.is_active() {
+                    let trace = crate::latency_prof::event::EventTrace::ingress(
+                        1,
+                        "event.class.endpoint_completion",
+                        bytes,
+                    );
+                    trace.record("event.completion_of", diagnostic_origin.id);
+                    trace.record("event.send_begin", 0);
+                    trace
+                } else {
+                    crate::latency_prof::event::EventTrace::default()
+                };
+                (event.traced(trace), trace)
+            };
             if response.is_empty() {
-                let _ = server_event_tx.blocking_send(
-                    ServerEvent::ClientShellEndpointResponseChunkReady {
-                        client_id,
-                        boot_id,
-                        request_id,
-                        final_chunk: true,
-                        data: Vec::new(),
-                    },
-                );
+                let event = ServerEvent::ClientShellEndpointResponseChunkReady {
+                    client_id,
+                    boot_id,
+                    request_id,
+                    final_chunk: true,
+                    data: Vec::new(),
+                };
+                #[cfg(feature = "latency-prof")]
+                let (event, trace) = completion_trace(event, 0);
+                let sent = server_event_tx.blocking_send(event);
+                #[cfg(feature = "latency-prof")]
+                trace.record("event.send_end", u64::from(sent.is_ok()));
+                #[cfg(not(feature = "latency-prof"))]
+                let _ = sent;
                 return;
             }
             let chunk_count = response.len().div_ceil(ENDPOINT_RESPONSE_CHUNK_BYTES);
             for (index, chunk) in response.chunks(ENDPOINT_RESPONSE_CHUNK_BYTES).enumerate() {
-                if server_event_tx
-                    .blocking_send(ServerEvent::ClientShellEndpointResponseChunkReady {
-                        client_id,
-                        boot_id: boot_id.clone(),
-                        request_id: request_id.clone(),
-                        final_chunk: index + 1 == chunk_count,
-                        data: chunk.to_vec(),
-                    })
-                    .is_err()
-                {
+                let event = ServerEvent::ClientShellEndpointResponseChunkReady {
+                    client_id,
+                    boot_id: boot_id.clone(),
+                    request_id: request_id.clone(),
+                    final_chunk: index + 1 == chunk_count,
+                    data: chunk.to_vec(),
+                };
+                #[cfg(feature = "latency-prof")]
+                let (event, trace) = completion_trace(event, chunk.len());
+                let sent = server_event_tx.blocking_send(event);
+                #[cfg(feature = "latency-prof")]
+                trace.record("event.send_end", u64::from(sent.is_ok()));
+                if sent.is_err() {
                     break;
                 }
             }

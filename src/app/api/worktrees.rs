@@ -1138,6 +1138,8 @@ mod tests {
         app.handle_api_worktree_add_finished(WorktreeAddResult {
             path: checkout.clone(),
             api_request: Some(ApiWorktreeAddRequest {
+                #[cfg(feature = "latency-prof")]
+                diagnostic_trace: crate::latency_prof::event::EventTrace::default(),
                 id: "req".into(),
                 operation_id: 9,
                 checkout_key,
@@ -2586,6 +2588,8 @@ mod tests {
             worktree: Some(Box::new(worktree_snapshot)),
             forced: false,
             api_request: Some(ApiWorktreeRemoveRequest {
+                #[cfg(feature = "latency-prof")]
+                diagnostic_trace: crate::latency_prof::event::EventTrace::default(),
                 id: "req".into(),
                 operation_id: 7,
                 checkout_key,
@@ -2673,6 +2677,8 @@ mod tests {
             worktree: Some(Box::new(worktree_snapshot)),
             forced: false,
             api_request: Some(ApiWorktreeRemoveRequest {
+                #[cfg(feature = "latency-prof")]
+                diagnostic_trace: crate::latency_prof::event::EventTrace::default(),
                 id: "req".into(),
                 operation_id: 7,
                 checkout_key: crate::worktree::canonical_or_original(&checkout),
@@ -2743,6 +2749,8 @@ mod tests {
             worktree: Some(Box::new(worktree_snapshot)),
             forced: true,
             api_request: Some(ApiWorktreeRemoveRequest {
+                #[cfg(feature = "latency-prof")]
+                diagnostic_trace: crate::latency_prof::event::EventTrace::default(),
                 id: "req".into(),
                 operation_id: 7,
                 checkout_key: crate::worktree::canonical_or_original(&checkout),

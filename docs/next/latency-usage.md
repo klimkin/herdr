@@ -122,13 +122,13 @@ starting benchmark in a third terminal:
 ```sh
 # Terminal 1: server
 tracy-capture -a 127.0.0.1 -p 18086 \
-  -o .local/latency/captures/server.tracy -s 30
+  -o .local/latency/captures/server.tracy
 ```
 
 ```sh
 # Terminal 2: client 0
 tracy-capture -a 127.0.0.1 -p 18087 \
-  -o .local/latency/captures/client-0.tracy -s 30
+  -o .local/latency/captures/client-0.tracy
 ```
 
 ```sh
@@ -141,6 +141,10 @@ HERDR_LATENCY_TRACE_DIR=1 HERDR_TRACY=1 \
   --samples 400 --interval-ms 40 --tracy-port 18086 \
   --output .local/latency/tracy
 ```
+
+Collectors save after their runtime disconnects. Wait for successful save
+completion before inspecting files. A fixed collector cutoff can truncate the
+measurement interval.
 
 Additional clients use ports 18088, 18089, and so on. Choose new capture filenames
 for repeat runs. Open original `.tracy` files in matching Tracy profiler.
@@ -180,8 +184,10 @@ of newer observed generations; undelivered required echoes/actions remain missin
 
 Same-host monotonic clocks are checked explicitly. Matched socket RTT remains
 separate from application response. Missing or ambiguous causal stages stay
-unavailable. Off-CPU attribution and PTY submission queue residence are unassigned;
-overlapping intervals must not be summed.
+unavailable. CPU versus off-CPU attribution remains unassigned. Accepted
+input-actor records can establish PTY submission queue residence when all contributing command and
+part boundaries are complete; missing boundaries remain unassigned. Overlapping
+intervals must not be summed.
 
 For local fanout, diagnostics retain each queued occurrence and framed-byte
 position through socket write, receipt, and client output. Native peer PIDs link
@@ -192,6 +198,29 @@ and that client's completed outer-PTY observation. Reconnects, multiple sockets
 between the same PID pair, missing records, and unavailable peer credentials
 remain unassigned. Windows currently lacks this native mapping; SSH bridge peer
 PIDs do not prove a remote destination. Published wire bytes stay unchanged.
+
+Schema-2 diagnostics carry explicit presentation, retained/full attempt,
+serialization, runtime-instance and service-attempt identities beside the existing
+connection/queue identities. Retained fallback and its subsequent full attempt
+remain distinct. Runtime replacement cannot inherit an earlier reader's revision
+links. Missing modern identities remain unassigned. Published wire bytes do not
+carry these fields.
+
+`report.json` includes:
+
+| Field | Use |
+|---|---|
+| `critical_paths`, `stage_report` | Per-response service and presentation chain, stage coverage and response accounting |
+| `event_service` | Offered/admitted/received populations, service attempts, dispatch links, queue-residence bounds and tracing coverage |
+| `wait_service` | Selected branches, real deadline reasons, overdue time and invalid/unmatched wait records |
+| `runtime_work` | Complete-message batches, nested API barriers, notifications and accept/handshake stages |
+| `input_report` | Accepted command/part intervals without multiplying input samples by client fanout |
+| `trace_audit` | Expected processes, record integrity, drops and final flush |
+
+Whole-handler and barrier spans overlap. Sender return can follow consumer
+service, so publication-to-service residence is an interval. A selected future
+return is separate from a scheduler wakeup or context switch. Untraced internal
+producers limit whole-lane oldest-age attribution.
 
 Detailed background: [latency measurement documentation](website/src/content/docs/latency-measurement.mdx).
 

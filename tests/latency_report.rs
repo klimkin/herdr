@@ -13,6 +13,603 @@ fn latency_report_keeps_missing_outcomes_and_sparse_tails() {
 }
 
 #[test]
+fn latency_report_uses_exact_fallback_attempt_and_serialization() {
+    let script = r#"
+import copy, sys
+sys.path.insert(0, 'scripts')
+from latency_report import critical_paths, stage_distributions
+run={'path':'output','client_pids':[2], 'samples':[{'identity':'7','injected_ns':90,
+ 'process_start_ns':100,'observed_ns':[900]}]}
+records=[
+ {'stage':'diagnostics.schema','pid':1,'id':0,'scope':0,'value':2,'ns':1},
+ {'stage':'server.connection','pid':1,'id':30,'scope':30,'value':2,'ns':10},
+ {'stage':'client.connection','pid':2,'id':40,'scope':0,'value':1,'ns':20},
+ {'stage':'pane.identity','pid':1,'id':22,'scope':0,'value':22,'ns':100,'runtime_instance':50},
+ {'stage':'terminal.stimulus','pid':1,'id':7,'scope':22,'value':4,'ns':200,'runtime_instance':50},
+ {'stage':'presentation.selected_deadline','pid':1,'id':10,'scope':0,'value':250,'ns':210,'presentation':10},
+ {'stage':'server.frame_start','pid':1,'id':101,'scope':0,'value':1,'ns':260,'presentation':10,'attempt':101},
+ {'stage':'server.frame_fallback.geometry','pid':1,'id':101,'scope':0,'value':0,'ns':270,'presentation':10,'attempt':101},
+ {'stage':'server.frame_start','pid':1,'id':102,'scope':0,'value':2,'ns':280,'presentation':10,'attempt':102},
+ {'stage':'server.serialization','pid':1,'id':777,'scope':0,'value':20,'ns':295,'presentation':10,'attempt':102,'serialization':201},
+ {'stage':'surface.content','pid':1,'id':22,'scope':777,'value':6,'ns':300,'presentation':10,'attempt':102,'serialization':201,'runtime_instance':50},
+ # Same bytes from an unrelated attempt arrive before the first writer claim.
+ {'stage':'server.frame_start','pid':1,'id':103,'scope':0,'value':2,'ns':320,'presentation':11,'attempt':103},
+]
+def queued(stage,ns,occurrence,offset,presentation,attempt,serialization):
+ records.append({'stage':stage,'pid':1,'id':777,'scope':61,'value':20,'ns':ns,
+ 'connection':30,'occurrence':occurrence,'offset':offset,
+ 'presentation':presentation,'attempt':attempt,'serialization':serialization})
+queued('server.enqueue',310,1,0,10,102,201)
+queued('server.enqueue',330,2,0,11,103,202)
+queued('server.writer_claim',400,1,0,10,102,201)
+queued('server.write_start',410,1,0,10,102,201)
+queued('server.write_complete',500,1,0,10,102,201)
+queued('server.writer_claim',650,2,24,11,103,202)
+queued('server.write_start',660,2,24,11,103,202)
+queued('server.write_complete',700,2,24,11,103,202)
+for stage,ns,offset in [('transport.receive',510,0),('client.delivery',600,0),
+                      ('transport.receive',710,24),('client.delivery',750,24)]:
+ records.append({'stage':stage,'pid':2,'id':777,'scope':0,'value':20,'ns':ns,
+                 'connection':40,'occurrence':0,'offset':offset})
+records += [{'stage':'process.finish','pid':pid,'id':0,'scope':0,'value':0,
+             'ns':1000,'dropped':0} for pid in (1,2)]
+paths=critical_paths(run,records)
+assert len(paths)==1,paths
+gate=paths[0]['presentation_gate']
+assert gate is not None,paths
+assert (gate['presentation'],gate['attempt'],paths[0]['serialization'])==(10,102,201)
+assert (gate['eligible_ns'],gate['frame_start_ns'])==(250,280)
+assert gate['state_ready_to_eligible_ns']==50
+assert gate['eligible_to_frame_start_ns']==30
+assert paths[0]['queue_ns']==90
+assert paths[0]['client_output_ns']==600
+# Serialization identity must uniquely bind the semantic effect to actual bytes.
+for changed in ('missing','duplicate','fingerprint','attempt'):
+ bad=copy.deepcopy(records)
+ serial=next(r for r in bad if r['stage']=='server.serialization')
+ if changed=='missing':bad.remove(serial)
+ elif changed=='duplicate':bad.append(copy.copy(serial))
+ elif changed=='fingerprint':serial['id']=888
+ else:serial['attempt']=999
+ assert critical_paths(run,bad)==[],(changed,critical_paths(run,bad))
+# Missing or duplicate attempt evidence cannot fall back to a nearby start.
+missing=[r for r in records if not(r['stage']=='server.frame_start' and r.get('attempt')==102)]
+assert critical_paths(run,missing)[0]['presentation_gate'] is None
+duplicate=copy.deepcopy(records)
+duplicate.insert(-2,copy.copy(next(r for r in records if r['stage']=='server.frame_start' and r.get('attempt')==102)))
+assert critical_paths(run,duplicate)[0]['presentation_gate'] is None
+# Semantic bytes from another serialization cannot claim the delivered occurrence.
+conflict=copy.deepcopy(records)
+next(r for r in conflict if r['stage']=='surface.content')['serialization']=999
+assert critical_paths(run,conflict)==[]
+assert stage_distributions(run,[])['coverage']['unassigned_completed_effects']==1
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_report_leaves_reused_queue_occurrences_unassigned() {
+    let script = r#"
+import copy,sys
+sys.path.insert(0,'scripts')
+from latency_report import pair_stages
+records=[]
+for stage,ns in [('server.enqueue',100),('server.writer_claim',120),
+                 ('server.enqueue',200),('server.writer_claim',220)]:
+ records.append(dict(stage=stage,pid=1,id=7,scope=8,value=20,ns=ns,connection=30,occurrence=10))
+# Identity reuse after a claim invalidates both pairs, even for identical bytes.
+assert pair_stages(records)==[]
+# A second claim alone makes the first match ambiguous too.
+assert pair_stages(records[:2]+[records[3]])==[]
+# Independent occurrences remain usable.
+distinct=copy.deepcopy(records)
+distinct[2]['occurrence']=distinct[3]['occurrence']=11
+assert [pair['occurrence'] for pair in pair_stages(distinct)]==[10,11]
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_report_leaves_incomplete_modern_context_unassigned() {
+    let script = r#"
+import copy, sys
+sys.path.insert(0, 'scripts')
+from latency_report import critical_paths, stage_distributions
+run={'path':'output','client_pids':[2], 'samples':[{'identity':'7',
+ 'process_start_ns':100,'observed_ns':[900]}]}
+records=[
+ {'stage':'diagnostics.schema','pid':1,'id':0,'scope':0,'value':2,'ns':1},
+ {'stage':'server.connection','pid':1,'id':30,'scope':30,'value':2,'ns':10},
+ {'stage':'client.connection','pid':2,'id':40,'scope':0,'value':1,'ns':20},
+ {'stage':'terminal.stimulus','pid':1,'id':7,'scope':22,'value':4,'ns':200,'runtime_instance':50},
+ # Old nearby records cannot fill missing context in schema-2 captures.
+ {'stage':'pane.identity','pid':1,'id':22,'scope':0,'value':22,'ns':250,'runtime_instance':50},
+ {'stage':'presentation.selected_deadline','pid':1,'id':0,'scope':0,'value':250,'ns':260},
+ {'stage':'presentation.selected_overdue','pid':1,'id':0,'scope':0,'value':10,'ns':260},
+ {'stage':'server.frame_start','pid':1,'id':0,'scope':0,'value':1,'ns':280},
+ {'stage':'surface.content','pid':1,'id':22,'scope':777,'value':6,'ns':300,'runtime_instance':50},
+]
+for stage,ns in [('server.enqueue',310),('server.writer_claim',400),
+                 ('server.write_start',410),('server.write_complete',500)]:
+ records.append({'stage':stage,'pid':1,'id':777,'scope':61,'value':20,'ns':ns,
+                 'connection':30,'occurrence':1,'offset':0})
+for stage,ns in [('transport.receive',510),('client.delivery',600)]:
+ records.append({'stage':stage,'pid':2,'id':777,'scope':0,'value':20,'ns':ns,
+                 'connection':40,'occurrence':0,'offset':0})
+records += [{'stage':'process.finish','pid':pid,'id':0,'scope':0,'value':0,
+             'ns':1000,'dropped':0} for pid in (1,2)]
+assert critical_paths(run,records)==[]
+assert stage_distributions(run,[])['coverage']['completed_effects']==1
+# Exact context permits attribution; write context or semantic ambiguity forbids it.
+modern=copy.deepcopy(records)
+for record in modern:
+ if record['pid']==1 and record['stage'] in ('surface.content','server.enqueue',
+       'server.writer_claim','server.write_start','server.write_complete','server.frame_start',
+       'presentation.selected_deadline'):
+  record.update(presentation=10,attempt=102,serialization=201)
+modern.insert(-2,{'stage':'server.serialization','pid':1,'id':777,'scope':0,'value':20,'ns':300,
+                  'presentation':10,'attempt':102,'serialization':201})
+assert len(critical_paths(run,modern))==1
+missing=copy.deepcopy(modern)
+next(r for r in missing if r['stage']=='server.write_complete').pop('serialization')
+assert critical_paths(run,missing)==[]
+legacy_queue=copy.deepcopy(modern)
+for record in legacy_queue:
+ if record['stage'] in ('server.enqueue','server.writer_claim','server.write_start','server.write_complete',
+                        'transport.receive','client.delivery'):
+  record.pop('occurrence',None)
+  record.pop('connection',None)
+assert critical_paths(run,legacy_queue)==[]
+conflict=copy.deepcopy(modern)
+duplicate=copy.copy(next(r for r in conflict if r['stage']=='surface.content'))
+duplicate['value']=8
+conflict.insert(-2,duplicate)
+assert critical_paths(run,conflict)==[]
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_report_never_joins_replaced_runtime_or_unstable_snapshot() {
+    let script = r#"
+import copy, sys
+sys.path.insert(0, 'scripts')
+from latency_report import critical_paths, stage_distributions
+run={'path':'output','client_pids':[2], 'samples':[{'identity':'7',
+ 'process_start_ns':100,'observed_ns':[900]}]}
+records=[
+ {'stage':'diagnostics.schema','pid':1,'id':0,'scope':0,'value':2,'ns':1},
+ {'stage':'server.connection','pid':1,'id':30,'scope':30,'value':2,'ns':10},
+ {'stage':'client.connection','pid':2,'id':40,'scope':0,'value':1,'ns':20},
+ {'stage':'pane.identity','pid':1,'id':22,'scope':0,'value':99,'ns':50,'runtime_instance':49},
+ {'stage':'pane.identity','pid':1,'id':22,'scope':0,'value':33,'ns':150,'runtime_instance':50},
+ {'stage':'terminal.stimulus','pid':1,'id':7,'scope':22,'value':4,'ns':200,'runtime_instance':50},
+ {'stage':'presentation.selected_deadline','pid':1,'id':10,'scope':0,'value':250,'ns':260,'presentation':10},
+ {'stage':'server.frame_start','pid':1,'id':102,'scope':0,'value':2,'ns':280,'presentation':10,'attempt':102},
+ {'stage':'server.serialization','pid':1,'id':777,'scope':0,'value':20,'ns':295,'presentation':10,'attempt':102,'serialization':201},
+ {'stage':'surface.content','pid':1,'id':33,'scope':777,'value':8,'ns':300,
+  'presentation':10,'attempt':102,'serialization':201,'runtime_instance':50},
+]
+for stage,ns in [('server.enqueue',310),('server.writer_claim',400),
+                 ('server.write_start',410),('server.write_complete',500)]:
+ records.append({'stage':stage,'pid':1,'id':777,'scope':61,'value':20,'ns':ns,
+  'connection':30,'occurrence':1,'offset':0,'presentation':10,'attempt':102,'serialization':201})
+for stage,ns in [('transport.receive',510),('client.delivery',600)]:
+ records.append({'stage':stage,'pid':2,'id':777,'scope':0,'value':20,'ns':ns,
+                 'connection':40,'occurrence':0,'offset':0})
+records += [{'stage':'process.finish','pid':pid,'id':0,'scope':0,'value':0,
+             'ns':1000,'dropped':0} for pid in (1,2)]
+paths=critical_paths(run,records)
+assert len(paths)==1,paths
+assert paths[0]['runtime_instance']==50
+unmapped=[r for r in records if r['stage']!='pane.identity']
+assert critical_paths(run,unmapped)==[]
+# Numeric equality cannot substitute for missing public-pane mapping.
+coincident=copy.deepcopy(unmapped)
+next(r for r in coincident if r['stage']=='surface.content')['id']=22
+assert critical_paths(run,coincident)==[]
+ambiguous=copy.deepcopy(records)
+mapping=copy.copy(next(r for r in ambiguous if r['stage']=='pane.identity' and r['runtime_instance']==50))
+mapping['value']=44
+ambiguous.insert(-2,mapping)
+assert critical_paths(run,ambiguous)==[]
+replaced=copy.deepcopy(records)
+next(r for r in replaced if r['stage']=='surface.content')['runtime_instance']=51
+assert critical_paths(run,replaced)==[]
+missing=copy.deepcopy(records)
+next(r for r in missing if r['stage']=='terminal.stimulus').pop('runtime_instance')
+assert critical_paths(run,missing)==[]
+unstable=copy.deepcopy(records)
+next(r for r in unstable if r['stage']=='surface.content')['value']=9
+assert critical_paths(run,unstable)==[]
+assert stage_distributions(run,[])['coverage']['completed_effects']==1
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_report_follows_response_service_turn_and_selected_wait() {
+    let script = r#"
+import copy,sys
+sys.path.insert(0,'scripts')
+from latency_report import critical_paths,event_service
+run={'path':'action','client_pids':[2],'samples':[{'identity':'7','injected_ns':90,'observed_ns':[900]}]}
+records=[
+ {'stage':'diagnostics.schema','pid':1,'id':0,'scope':0,'value':2,'ns':1},
+ {'stage':'server.connection','pid':1,'id':30,'scope':30,'value':2,'ns':10},
+ {'stage':'client.connection','pid':2,'id':40,'scope':0,'value':1,'ns':20},
+ {'stage':'loop.turn','pid':1,'id':70,'scope':0,'value':0,'ns':95},
+ {'stage':'loop.wait_begin','pid':1,'id':80,'scope':0,'value':0,'ns':100},
+ {'stage':'loop.wait_end.server_event','pid':1,'id':80,'scope':0,'value':0,'ns':160},
+]
+for stage,ns,value in [('event.ingress',110,0),('event.class.runtime_action',111,0),
+ ('event.send_begin',120,0),('event.send_end',130,1),('event.received',161,0),
+ ('event.selected_wait',162,80),('handler.begin',170,0),('handler.lane',170,1),('handler.turn',171,70),('handler.selected_wait',172,80),
+ ('event.dispatch',180,0),('action.event_committed',200,0),('handler.end',210,1)]:
+ records.append({'stage':stage,'pid':1,'id':50,'scope':1,'value':value,'ns':ns,
+ 'service':60 if stage.startswith('handler.') or stage in ('event.dispatch','action.event_committed') else 0})
+from latency_report import fingerprint
+label=fingerprint('A000007')
+next(r for r in records if r['stage']=='action.event_committed')['value']=label
+records += [
+ {'stage':'server.serialization','pid':1,'id':777,'scope':0,'value':20,'ns':295,'presentation':10,'attempt':11,'serialization':12},
+ {'stage':'snapshot.label','pid':1,'id':label,'scope':777,'value':0,'ns':300,'presentation':10,'attempt':11,'serialization':12},
+ {'stage':'server.enqueue','pid':1,'id':777,'scope':61,'value':20,'ns':310,'connection':30,'occurrence':1,'offset':0,'presentation':10,'attempt':11,'serialization':12},
+ {'stage':'server.writer_claim','pid':1,'id':777,'scope':61,'value':20,'ns':400,'connection':30,'occurrence':1,'offset':0,'presentation':10,'attempt':11,'serialization':12},
+ {'stage':'server.write_start','pid':1,'id':777,'scope':61,'value':20,'ns':410,'connection':30,'occurrence':1,'offset':0,'presentation':10,'attempt':11,'serialization':12},
+ {'stage':'server.write_complete','pid':1,'id':777,'scope':61,'value':20,'ns':500,'connection':30,'occurrence':1,'offset':0,'presentation':10,'attempt':11,'serialization':12},
+ {'stage':'transport.receive','pid':2,'id':777,'scope':0,'value':20,'ns':510,'connection':40,'offset':0},
+ {'stage':'client.delivery','pid':2,'id':777,'scope':0,'value':20,'ns':600,'connection':40,'offset':0},
+]
+records += [{'stage':'process.finish','pid':pid,'id':0,'scope':0,'value':0,'ns':1000,'dropped':0} for pid in (1,2)]
+path=critical_paths(run,records)[0]
+chain=path['response_service']
+assert chain['attribution']=='exact event service and selected wait'
+assert chain['events'][0]['event']==50
+attempt=chain['events'][0]['service_attempts'][0]
+assert attempt['turn']==70 and attempt['selected_wait']==80
+assert attempt['selected_branch']=='server_event' and attempt['dispatch_ns']==180
+assert path['action_commit_ns']==200
+# Missing or conflicting modern ownership cannot inherit nearby legacy boundaries.
+missing=[r for r in records if r['stage']!='handler.turn']
+assert critical_paths(run,missing)[0]['response_service']['attribution']=='incomplete event service chain'
+conflict=copy.deepcopy(records)
+next(r for r in conflict if r['stage']=='action.event_committed')['service']=999
+assert critical_paths(run,conflict)[0]['response_service']['attribution']=='incomplete event service chain'
+# A non-event return, stale turn or late link cannot become a receive wake.
+for stage in ('loop.wait_end.deadline','loop.wait_end.api','loop.wait_end.listener_ready'):
+ bad=copy.deepcopy(records)
+ next(r for r in bad if r['stage']=='loop.wait_end.server_event')['stage']=stage
+ assert critical_paths(run,bad)[0]['response_service']['attribution']=='incomplete event service chain'
+bad=copy.deepcopy(records)
+next(r for r in bad if r['stage']=='handler.turn')['ns']=250
+assert critical_paths(run,bad)[0]['response_service']['attribution']=='incomplete event service chain'
+bad=copy.deepcopy(records)
+bad.insert(-2,{'stage':'loop.turn','pid':1,'id':71,'scope':0,'value':0,'ns':169})
+assert critical_paths(run,bad)[0]['response_service']['attribution']=='incomplete event service chain'
+missing=[r for r in records if r['stage']!='event.selected_wait']
+assert critical_paths(run,missing)[0]['response_service']['attribution']=='incomplete event service chain'
+zero=copy.deepcopy(records)
+for r in zero:
+ if r['stage'].startswith('handler.'):r['service']=0
+assert event_service(zero)['events'][0]['service_attempts']==[]
+# Endpoint completion keeps original service lifecycle while consuming a new lane occurrence.
+records += [
+ {'stage':'event.ingress','pid':1,'id':51,'scope':1,'value':0,'ns':215},
+ {'stage':'event.completion_of','pid':1,'id':51,'scope':1,'value':50,'ns':216},
+ {'stage':'event.send_begin','pid':1,'id':51,'scope':1,'value':0,'ns':217},
+ {'stage':'event.send_end','pid':1,'id':51,'scope':1,'value':1,'ns':218},
+ {'stage':'event.received','pid':1,'id':51,'scope':1,'value':0,'ns':220},
+ {'stage':'handler.begin','pid':1,'id':51,'scope':1,'value':0,'ns':221,'service':61},
+ {'stage':'handler.end','pid':1,'id':51,'scope':1,'value':1,'ns':225,'service':61},
+]
+original=next(e for e in event_service(records)['events'] if e['event']==50)
+assert original['completion_events']==[51]
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_report_exposes_payload_units_and_whole_lane_coverage() {
+    let script = r#"
+import sys
+sys.path.insert(0,'scripts')
+from latency_report import event_service
+records=[]
+for stage,ns,value in [('event.ingress',100,0),('event.class.api',101,128),
+ ('event.origin',102,44),('event.payload.bytes',103,128),('event.method',104,55),
+ ('event.send_begin',110,0),('event.send_end',120,1),('event.received',130,2),
+ ('handler.begin',140,0),('event.dispatch',150,55),('handler.end',160,1)]:
+ records.append({'stage':stage,'pid':1,'id':21,'scope':2,'value':value,'ns':ns,'service':9 if stage.startswith('handler.') or stage=='event.dispatch' else 0})
+records += [
+ {'stage':'lane.received','pid':1,'id':21,'scope':2,'value':2,'ns':130},
+ {'stage':'lane.received','pid':1,'id':0,'scope':2,'value':1,'ns':170},
+ {'stage':'lane.service','pid':1,'id':21,'scope':2,'value':0,'ns':140},
+ {'stage':'lane.service','pid':1,'id':0,'scope':2,'value':0,'ns':180},
+]
+report=event_service(records)
+event=report['events'][0]
+assert event['class']=='api' and event['payload_unit']=='bytes' and event['payload']==128
+assert event['method']==55 and event['queue_depth_after_receive']==2
+assert report['lane_population']['2']=={'received':2,'traced_received':1,'untraced_received':1,'service':2,'traced_service':1,'untraced_service':1,'max_queue_depth_after_receive':2}
+assert event['oldest_whole_lane_age_ns'] is None
+records.append({'stage':'event.payload.events','pid':1,'id':21,'scope':2,'value':3,'ns':105})
+event=event_service(records)['events'][0]
+assert event['payloads']=={'bytes':128,'events':3}
+assert event['payload']==128 and event['payload_unit']=='bytes'
+# Oldest traced age remains a bound when the full lane includes untraced work.
+records += [
+ {'stage':'event.ingress','pid':1,'id':22,'scope':2,'value':0,'ns':90},
+ {'stage':'event.send_begin','pid':1,'id':22,'scope':2,'value':0,'ns':95},
+ {'stage':'event.send_end','pid':1,'id':22,'scope':2,'value':1,'ns':115},
+]
+event=next(e for e in event_service(records)['events'] if e['event']==21)
+assert event['oldest_traced_queue_residence_ns']==[15,35]
+assert event['oldest_whole_lane_age_ns'] is None
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_report_preserves_event_admission_races_and_contributors() {
+    let script = r#"
+import sys
+sys.path.insert(0, 'scripts')
+from latency_report import event_service
+records=[]
+def event(stage,identifier,ns,value=0,lane=1):
+ records.append({'stage':stage,'pid':1,'id':identifier,'scope':lane,'value':value,'ns':ns})
+for stage,ns in [('event.ingress',100),('event.send_begin',105),('event.send_end',115),
+                 ('event.received',130),('handler.begin',135),('handler.end',145)]:
+ event(stage,11,ns,1 if stage=='event.send_end' else 0)
+for stage,ns in [('event.ingress',110),('event.send_begin',120),('event.received',150),
+                 ('handler.begin',160),('event.dispatch',170),('handler.end',180),('event.send_end',200)]:
+ event(stage,12,ns,1 if stage=='event.send_end' else 0)
+event('event.received',99,146)
+event('handler.begin',99,147)
+event('handler.end',99,148)
+for identifier,lane in [(21,2),(31,3)]:
+ event('event.ingress',identifier,210,lane=lane)
+ event('event.send_begin',identifier,220,lane=lane)
+ event('event.send_end',identifier,230,1,lane)
+ event('event.received',identifier,240,lane=lane)
+ event('handler.begin',identifier,250,lane=lane)
+ event('handler.end',identifier,260,lane=lane)
+records += [{'stage':'input.event_fragment','pid':1,'id':7,'scope':1,'value':identifier,'ns':170}
+            for identifier in (11,12)]
+report=event_service(records)
+by_id={event['event']:event for event in report['events']}
+assert by_id[11]['queue_residence_ns']==[15,25]
+assert by_id[12]['queue_residence_ns']==[0,30]
+assert by_id[12]['ingress_to_receive_ns']==40
+assert by_id[12]['sender_wait_ns']==80
+assert by_id[12]['handler_ns']==20
+assert by_id[99]['queue_residence_ns'] is None
+assert report['input_contributors']==[{'pid':1,'identity':7,'events':[11,12]}]
+assert report['lanes']['1']['admitted']==2
+assert report['lanes']['2']['admitted']==1
+assert report['lanes']['3']['admitted']==1
+# A dropped internal publication remains offered but cannot become admitted.
+event('event.ingress',32,270,lane=3)
+event('event.send_begin',32,280,lane=3)
+event('event.send_end',32,290,0,3)
+assert event_service(records)['lanes']['3']=={'offered':2,'admitted':1,'rejected':1,'received':1,'handled':1}
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_report_classifies_wait_returns_without_scheduler_claims() {
+    let script = r#"
+import sys
+sys.path.insert(0, 'scripts')
+from latency_report import wait_service
+records=[
+ {'stage':'loop.turn','pid':1,'id':1,'scope':0,'value':0,'ns':10},
+ {'stage':'loop.wait_begin','pid':1,'id':1,'scope':18,'value':100,'ns':20},
+ {'stage':'loop.wait_end.deadline','pid':1,'id':1,'scope':18,'value':100,'ns':120},
+ {'stage':'loop.wait_begin','pid':1,'id':2,'scope':0,'value':0,'ns':140},
+ {'stage':'loop.wait_end.server_event','pid':1,'id':2,'scope':0,'value':0,'ns':150},
+ {'stage':'loop.wait_begin','pid':1,'id':3,'scope':0,'value':0,'ns':160},
+ {'stage':'loop.wait_end.stop','pid':1,'id':3,'scope':0,'value':0,'ns':170},
+ {'stage':'loop.wait_begin','pid':1,'id':4,'scope':0,'value':0,'ns':180},
+ {'stage':'loop.wait_end.api_closed','pid':1,'id':4,'scope':0,'value':0,'ns':190},
+ {'stage':'loop.wait_begin','pid':1,'id':5,'scope':0,'value':0,'ns':200},
+ {'stage':'loop.wait_end.listener_ready','pid':1,'id':5,'scope':0,'value':0,'ns':210},
+]
+report=wait_service(records)
+assert report['loop_turns']==1
+assert report['selected_returns']=={'deadline':1,'server_event':1,'stop':1,'api_closed':1,'listener_ready':1}
+assert report['deadline_returns']==[{'pid':1,'wait':1,'armed_deadline_ns':100,'reasons_mask':18,'return_ns':120,'overdue_ns':20}]
+assert report['scheduler_wakeups'] is None
+assert report['context_switches'] is None
+# Contradictory masks, missing boundaries and early timer returns stay invalid.
+records += [
+ {'stage':'loop.wait_begin','pid':1,'id':6,'scope':2,'value':400,'ns':300},
+ {'stage':'loop.wait_end.deadline','pid':1,'id':6,'scope':4,'value':400,'ns':410},
+ {'stage':'loop.wait_begin','pid':1,'id':7,'scope':2,'value':500,'ns':420},
+ {'stage':'loop.wait_end.deadline','pid':1,'id':7,'scope':2,'value':500,'ns':450},
+]
+report=wait_service(records)
+assert len(report['deadline_returns'])==1
+assert report['invalid_waits']==2
+assert report['deadline_reason_names']['18']==['toast','git_refresh']
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_report_keeps_batches_barriers_and_notification_outcomes_distinct() {
+    let script = r#"
+import sys
+sys.path.insert(0, 'scripts')
+from latency_report import runtime_work
+records=[
+ {'stage':'batch.begin.server','pid':1,'id':10,'scope':1,'value':64,'ns':100},
+ {'stage':'batch.end.server','pid':1,'id':10,'scope':1,'value':8,'ns':400},
+ {'stage':'batch.begin.api_barrier','pid':1,'id':11,'scope':2,'value':0,'ns':500},
+ {'stage':'batch.end.api_barrier','pid':1,'id':11,'scope':2,'value':96,'ns':1500},
+ {'stage':'render.notify_requested','pid':1,'id':22,'scope':50,'value':4,'ns':1600},
+ {'stage':'render.notify_coalesced','pid':1,'id':22,'scope':50,'value':6,'ns':1700},
+ {'stage':'render.notify_suppressed','pid':1,'id':22,'scope':50,'value':8,'ns':1800},
+ {'stage':'render.notify_delayed','pid':1,'id':22,'scope':50,'value':8,'ns':1900},
+]
+report=runtime_work(records)
+assert report['batches']==[{'pid':1,'batch':10,'class':'server','count':8,'elapsed_ns':300},
+                          {'pid':1,'batch':11,'class':'api_barrier','count':96,'elapsed_ns':1000}]
+assert report['notifications']=={'requested':1,'coalesced':1,'suppressed':1,'delayed':1}
+assert report['semantics'].startswith('Whole-handler and barrier spans overlap')
+# Accepted socket identity links exact handshake and server queue ownership.
+records += [
+ {'stage':'client.accepted','pid':1,'id':7,'scope':0,'value':2,'ns':2000},
+ {'stage':'client.handshake_begin','pid':1,'id':7,'scope':0,'value':0,'ns':2050},
+ {'stage':'client.hello_ready','pid':1,'id':7,'scope':0,'value':0,'ns':2100},
+ {'stage':'client.welcome_written','pid':1,'id':7,'scope':0,'value':0,'ns':2200},
+ {'stage':'server.connection','pid':1,'id':30,'scope':7,'value':2,'ns':2300},
+]
+assert runtime_work(records)['accepts']==[{'pid':1,'client':7,'peer_pid':2,'accepted_ns':2000,
+ 'handshake_begin_ns':2050,'hello_ready_ns':2100,'welcome_written_ns':2200,'connection':30}]
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_report_keeps_deferred_receive_lane_separate_from_admission() {
+    let script = r#"
+import copy,sys
+sys.path.insert(0,'scripts')
+from latency_report import event_service
+records=[{'stage':'diagnostics.schema','pid':1,'id':0,'scope':0,'value':2,'ns':1}]
+for stage,ns,value in [('event.ingress',100,0),('event.send_begin',110,0),
+                       ('event.send_end',120,1),('event.received',130,0)]:
+ records.append(dict(stage=stage,pid=1,id=21,scope=2,value=value,ns=ns))
+for stage,ns,value in [('handler.begin',140,0),('handler.lane',141,2),('handler.end',150,2)]:
+ records.append(dict(stage=stage,pid=1,id=21,scope=2,value=value,ns=ns,service=101))
+records += [dict(stage='loop.wait_begin',pid=1,id=80,scope=0,value=0,ns=200),
+            dict(stage='loop.wait_end.internal',pid=1,id=80,scope=0,value=0,ns=230)]
+for stage,ns,value in [('event.selected_wait',231,80),('event.completion_received',232,0),
+                       ('handler.begin',240,0),('handler.lane',241,3),
+                       ('handler.selected_wait',242,80),('handler.end',270,1)]:
+ records.append(dict(stage=stage,pid=1,id=21,scope=2,value=value,ns=ns,
+                     service=102 if stage.startswith('handler.') else 0))
+report=event_service(records)
+event=report['events'][0]
+assert event['lane']==2 and report['lanes']['2']['admitted']==1
+assert event['service_attempts'][0].get('selected_wait') is None
+completion=event['service_attempts'][1]
+assert completion['service_lane']==3 and completion['selected_wait']==80
+assert completion['selected_branch']=='internal'
+for changed in ('missing','wrong','duplicate'):
+ bad=copy.deepcopy(records)
+ lane=next(r for r in bad if r['stage']=='handler.lane' and r['service']==102)
+ if changed=='missing':bad.remove(lane)
+ elif changed=='wrong':lane['value']=2
+ else:bad.append(copy.copy(lane))
+ assert event_service(bad)['events'][0]['service_attempts'][1].get('selected_wait') is None
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_report_counts_deferred_service_attempts_without_duplicate_admission() {
+    let script = r#"
+import sys
+sys.path.insert(0, 'scripts')
+from latency_report import event_service
+records=[]
+for stage,ns,value in [('event.ingress',100,0),('event.send_begin',110,0),
+                       ('event.send_end',120,1),('event.received',130,0)]:
+ records.append({'stage':stage,'pid':1,'id':21,'scope':2,'value':value,'ns':ns})
+records += [
+ {'stage':'handler.begin','pid':1,'id':21,'scope':2,'value':0,'ns':140,'service':101},
+ {'stage':'handler.end','pid':1,'id':21,'scope':2,'value':0,'ns':150,'service':101},
+ {'stage':'handler.begin','pid':1,'id':21,'scope':2,'value':0,'ns':240,'service':102},
+ {'stage':'handler.end','pid':1,'id':21,'scope':2,'value':0,'ns':270,'service':102},
+ {'stage':'event.origin','pid':1,'id':21,'scope':2,'value':7,'ns':105},
+ {'stage':'event.payload','pid':1,'id':21,'scope':2,'value':4096,'ns':106},
+]
+report=event_service(records)
+assert report['lanes']['2']=={'offered':1,'admitted':1,'rejected':0,'received':1,'handled':1}
+event=report['events'][0]
+assert event['queue_residence_ns']==[10,20]
+assert event['service_attempts']==[{'service':101,'start_ns':140,'end_ns':150,'elapsed_ns':10},
+                                 {'service':102,'start_ns':240,'end_ns':270,'elapsed_ns':30}]
+assert event['handler_ns'] is None
+assert event['origin']==7 and event['payload']==4096
+next(r for r in records if r['stage']=='handler.end' and r.get('service')==101)['value']=2
+next(r for r in records if r['stage']=='handler.end' and r.get('service')==102)['value']=1
+event=event_service(records)['events'][0]
+assert event['service_attempts'][0]['outcome']=='deferred'
+assert event['service_attempts'][1]['outcome']=='completed'
+# Deferred completion retains original producer identity and distinct lifecycle.
+records += [
+ {'stage':'event.completion_received','pid':1,'id':21,'scope':2,'value':0,'ns':235},
+ {'stage':'event.response_completed','pid':1,'id':21,'scope':2,'value':1,'ns':275},
+]
+event=event_service(records)['events'][0]
+assert event['completion_received_ns']==[235]
+assert event['response_outcomes']==[{'ns':275,'outcome':'completed'}]
+assert event['queue_residence_ns']==[10,20]
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
 fn latency_trace_report_keeps_client_queues_distinct() {
     let script = r#"
 import sys
@@ -124,6 +721,37 @@ ambiguous=stage_distributions(run,[path,{**path,'surface_ns':301}])
 assert ambiguous['coverage']['ambiguous_completed_effects']==1
 assert ambiguous['stages']['server_writer_queue']['sample_count']==0
 assert ambiguous['stages']['server_writer_queue']['p50_ns'] is None
+"#;
+    let status = std::process::Command::new("python3")
+        .args(["-c", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("report executable");
+    assert!(status.success());
+}
+
+#[test]
+fn latency_trace_audit_rejects_malformed_diagnostic_identities() {
+    let script = r#"
+import json, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+from latency_report import load_traces
+run={'server_pid':1,'client_pids':[],'clients':0}
+record={'stage':'server.enqueue','pid':1,'id':7,'scope':8,'value':20,'ns':100}
+finish={'stage':'process.finish','pid':1,'id':0,'scope':0,'value':0,'ns':200,'dropped':0}
+with tempfile.TemporaryDirectory() as directory:
+ path=Path(directory)
+ for field in ('thread','connection','occurrence','offset','presentation','attempt',
+               'serialization','runtime_instance','service'):
+  for malformed in (-1,'9',True,[],1 << 64):
+   bad=dict(record,**{field:malformed})
+   (path/'1.jsonl').write_text(json.dumps(bad)+'\n'+json.dumps(finish)+'\n')
+   records,audit=load_traces(run,path)
+   process=audit['processes'][0]
+   assert process['invalid_records']==1,(field,malformed,process)
+   assert not process['complete']
+   assert all(item['stage']!='server.enqueue' for item in records)
 "#;
     let status = std::process::Command::new("python3")
         .args(["-c", script])
@@ -460,7 +1088,7 @@ assert input_actor_path([],7,1,90,1000)['attribution']=='actor records unavailab
 #[test]
 fn latency_echo_report_joins_actor_acceptance_to_helper_receipt() {
     let script = r#"
-import sys
+import copy,sys
 sys.path.insert(0,'scripts')
 from latency_report import critical_paths
 run={'path':'echo','clock':'host monotonic; observer includes scheduling and reconstruction',
@@ -483,6 +1111,26 @@ assert path['actor_input']['attribution']=='complete contributing accepted parts
 assert path['helper_received_ns']==205
 assert path['actor_input']['write_complete_to_helper_received_ns']==15
 assert 'PTY submission queue residence' not in path['unavailable']
+# Contributing commands prove service without rejecting other commands in the same event.
+records += [event('loop.turn',105,id=70,scope=0),event('event.ingress',108,id=50,scope=1),
+ event('event.send_begin',109,id=50,scope=1),event('event.send_end',110,id=50,scope=1),
+ event('event.received',111,id=50,scope=1),event('input.command_event',120,id=1,value=50),
+ event('input.event_fragment',121,value=50,scope=1)]
+for stage,ns,value in [('handler.begin',112,0),('handler.turn',113,70),
+ ('event.dispatch_command',120,1),('event.dispatch_command',123,2),('handler.end',130,1)]:
+ r=event(stage,ns,id=50,scope=1,value=value);r['service']=60;records.append(r)
+chain=critical_paths(run,records,audit)[0]['response_service']
+assert chain['attribution']=='exact event service and selected wait',chain
+assert chain['command_links']==[{'command':1,'event':50,'ns':120}]
+duplicate=records+[dict(next(r for r in records if r['stage']=='event.dispatch_command' and r['value']==1))]
+assert critical_paths(run,duplicate,audit)[0]['response_service']['attribution']=='incomplete event service chain'
+ordered=copy.deepcopy(records)
+next(r for r in ordered if r['stage']=='event.dispatch_command' and r['value']==1)['ns']+=1
+assert critical_paths(run,ordered,audit)[0]['response_service']['attribution']=='exact event service and selected wait'
+# Records outside this effect interval cannot establish its input service.
+wrong=[dict(r) for r in records]
+next(r for r in wrong if r['stage']=='input.command_event')['ns']=650
+assert critical_paths(run,wrong,audit)[0]['response_service']['attribution']=='incomplete event service chain'
 # Missing trace completion cannot establish all contributing fragments.
 unfinished=[record for record in records if record['stage']!='process.finish']
 path=critical_paths(run,unfinished)[0]

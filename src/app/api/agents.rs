@@ -90,6 +90,12 @@ impl App {
         let validated = match self.validate_agent_prompt(request.id, &params) {
             Ok(validated) => validated,
             Err(response) => {
+                #[cfg(feature = "latency-prof")]
+                {
+                    let trace = crate::latency_prof::event::current();
+                    trace.response(&response);
+                    crate::latency_prof::event::outcome(3);
+                }
                 let _ = respond_to.send(response);
                 return true;
             }
@@ -102,6 +108,8 @@ impl App {
             std::sync::mpsc::Receiver<std::io::Result<()>>,
         )>();
         let waiter_respond_to = respond_to.clone();
+        #[cfg(feature = "latency-prof")]
+        let diagnostic_trace = crate::latency_prof::event::current().deferred();
         let spawned = crate::thread_spawn::spawn_named("herdr-agent-prompt", move || {
             let Ok((id, agent, completion)) = handoff_rx.recv() else {
                 return;
@@ -114,15 +122,23 @@ impl App {
                 Ok(Err(err)) => encode_error(id, "agent_prompt_failed", err.to_string()),
                 Err(_) => encode_error(id, "agent_prompt_failed", "pty actor closed"),
             };
+            #[cfg(feature = "latency-prof")]
+            diagnostic_trace.response(&response);
             let _ = waiter_respond_to.send(response);
         });
         if let Err(err) = spawned {
             tracing::warn!(err = %err, "failed to spawn agent prompt thread");
-            let _ = respond_to.send(encode_error(
+            let response = encode_error(
                 validated.id,
                 "agent_prompt_failed",
                 format!("could not start prompt completion waiter: {err}"),
-            ));
+            );
+            #[cfg(feature = "latency-prof")]
+            {
+                crate::latency_prof::event::current().response(&response);
+                crate::latency_prof::event::outcome(3);
+            }
+            let _ = respond_to.send(response);
             return true;
         }
         match self.submit_agent_prompt(validated, &params) {
@@ -130,6 +146,12 @@ impl App {
                 let _ = handoff_tx.send(submission);
             }
             Err(response) => {
+                #[cfg(feature = "latency-prof")]
+                {
+                    let trace = crate::latency_prof::event::current();
+                    trace.response(&response);
+                    crate::latency_prof::event::outcome(3);
+                }
                 let _ = respond_to.send(response);
             }
         }

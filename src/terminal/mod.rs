@@ -1,6 +1,7 @@
 mod history_read;
 mod id;
 mod runtime;
+pub(crate) mod runtime_instance;
 mod runtime_registry;
 pub mod state;
 mod title;

@@ -36,7 +36,9 @@ impl App {
         }
     }
 
-    fn send_api_response(respond_to: std::sync::mpsc::Sender<String>, response: String) {
+    pub(super) fn send_api_response(respond_to: std::sync::mpsc::Sender<String>, response: String) {
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::event::current().response(&response);
         let _ = respond_to.send(response);
     }
 
@@ -177,6 +179,8 @@ impl App {
                 .and_then(|ws| ws.worktree_space().cloned())
         });
         let api_request = ApiWorktreeAddRequest {
+            #[cfg(feature = "latency-prof")]
+            diagnostic_trace: crate::latency_prof::event::current().deferred(),
             id,
             operation_id,
             checkout_key,
@@ -364,6 +368,8 @@ impl App {
             params.trust_repository,
         );
         let api_request = ApiWorktreeRemoveRequest {
+            #[cfg(feature = "latency-prof")]
+            diagnostic_trace: crate::latency_prof::event::current().deferred(),
             id,
             operation_id,
             checkout_key,

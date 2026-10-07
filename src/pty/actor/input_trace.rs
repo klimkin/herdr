@@ -5,6 +5,7 @@ pub(super) struct InputQueueTrace {
     scope: u64,
     // One incomplete controlled marker; ordinary input retains no bytes.
     tail: [(u8, u64); 14],
+    event_tail: [u64; 14],
     len: usize,
 }
 
@@ -34,6 +35,15 @@ impl InputQueueTrace {
             self.scope = crate::latency_prof::next_scope();
         }
         let id = crate::latency_prof::next_scope();
+        let event = crate::latency_prof::event::current();
+        if event.is_active() {
+            crate::latency_prof::record_at("input.command_event", id, event.id, self.scope, ns);
+            event.record("event.dispatch_command", id);
+            event.record(
+                "event.dispatch",
+                text.len() as u64 + enter.map_or(0, |bytes| bytes.len() as u64),
+            );
+        }
         let bytes = text.len() as u64 + enter.map_or(0, |bytes| bytes.len() as u64);
         let trace = CommandTrace {
             id,
@@ -77,6 +87,7 @@ impl InputQueueTrace {
             remaining = &remaining[1..];
             if byte == b'!' {
                 self.tail[0] = (byte, part.id);
+                self.event_tail[0] = crate::latency_prof::event::current().id;
                 self.len = 1;
                 continue;
             }
@@ -90,6 +101,7 @@ impl InputQueueTrace {
                 continue;
             }
             self.tail[self.len] = (byte, part.id);
+            self.event_tail[self.len] = crate::latency_prof::event::current().id;
             self.len += 1;
             if self.len == 14 {
                 let identity = self.tail[1..13].iter().fold(0u64, |value, &(byte, _)| {
@@ -111,6 +123,13 @@ impl InputQueueTrace {
                             crate::latency_prof::now(),
                         );
                         previous = contributor;
+                    }
+                }
+                let mut previous_event = 0;
+                for &event in &self.event_tail {
+                    if event != previous_event {
+                        crate::latency_prof::event::link_actor_fragment(identity, event);
+                        previous_event = event;
                     }
                 }
                 self.len = 0;

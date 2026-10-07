@@ -39,17 +39,30 @@ pub(crate) fn accept_pending_client_connections(
     should_quit: &Arc<AtomicBool>,
     server_event_tx: &mpsc::Sender<ServerEvent>,
 ) -> io::Result<AcceptStats> {
+    let mut batch = crate::latency_prof::work::BatchTrace::begin(
+        "batch.begin.accept",
+        CLIENT_ACCEPT_BATCH_LIMIT,
+    );
     let mut stats = AcceptStats::default();
     for _ in 0..CLIENT_ACCEPT_BATCH_LIMIT {
         if should_quit.load(Ordering::Acquire) {
             break;
         }
         stats.attempted += 1;
+        batch.handled();
         match listener.accept() {
             Ok(stream) => {
                 stats.accepted += 1;
                 let client_id = *next_client_id;
                 *next_client_id = next_client_id.saturating_add(1);
+                #[cfg(feature = "latency-prof")]
+                if crate::latency_prof::active() {
+                    crate::latency_prof::record(
+                        "client.accepted",
+                        client_id,
+                        u64::from(crate::platform::local_stream_peer_pid(&stream).unwrap_or(0)),
+                    );
+                }
 
                 if let Err(err) = stream.set_nonblocking(true) {
                     crate::render_prof::event("client.accept.stream_setup_failed");

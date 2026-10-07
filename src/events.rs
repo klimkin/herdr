@@ -11,6 +11,8 @@ use crate::workspace::{GitStatusCacheEntry, WorkspaceGitStatus};
 
 #[derive(Debug)]
 pub struct ApiWorktreeAddRequest {
+    #[cfg(feature = "latency-prof")]
+    pub(crate) diagnostic_trace: crate::latency_prof::event::EventTrace,
     pub id: String,
     pub operation_id: u64,
     pub checkout_key: std::path::PathBuf,
@@ -34,6 +36,8 @@ pub struct WorktreeAddResult {
 
 #[derive(Debug)]
 pub struct ApiWorktreeRemoveRequest {
+    #[cfg(feature = "latency-prof")]
+    pub(crate) diagnostic_trace: crate::latency_prof::event::EventTrace,
     pub id: String,
     pub operation_id: u64,
     pub checkout_key: std::path::PathBuf,
@@ -54,6 +58,8 @@ pub struct WorktreeRemoveResult {
 
 #[derive(Debug)]
 pub struct WorktreeReadResult {
+    #[cfg(feature = "latency-prof")]
+    pub(crate) diagnostic_trace: crate::latency_prof::event::EventTrace,
     // Keep the slot until completion is consumed, including time queued on the app loop.
     pub(crate) _permit: tokio::sync::OwnedSemaphorePermit,
     pub(crate) client_local: bool,
@@ -76,6 +82,13 @@ pub(crate) struct WorktreeReadData {
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
+    #[cfg(feature = "latency-prof")]
+    DiagnosticDelegation { event: Box<AppEvent> },
+    #[cfg(feature = "latency-prof")]
+    Diagnostic {
+        trace: crate::latency_prof::event::EventTrace,
+        event: Box<AppEvent>,
+    },
     /// A pane's child process exited.
     PaneDied {
         pane_id: PaneId,
@@ -217,4 +230,127 @@ pub enum AppEvent {
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
     /// Background worktree discovery completed for an API list/open request.
     WorktreeReadFinished(Box<WorktreeReadResult>),
+}
+
+impl AppEvent {
+    #[cfg(feature = "latency-prof")]
+    fn trace_mut(&mut self) -> Option<&mut crate::latency_prof::event::EventTrace> {
+        match self {
+            Self::Diagnostic { trace, .. } => Some(trace),
+            Self::WorktreeReadFinished(result) => Some(&mut result.diagnostic_trace),
+            Self::WorktreeAddFinished(result) => result
+                .api_request
+                .as_mut()
+                .map(|request| &mut request.diagnostic_trace),
+            Self::WorktreeRemoveFinished(result) => result
+                .api_request
+                .as_mut()
+                .map(|request| &mut request.diagnostic_trace),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn received(&self, remaining: usize) {
+        #[cfg(feature = "latency-prof")]
+        match self {
+            Self::Diagnostic { trace, .. } => trace.received(3, remaining),
+            Self::WorktreeReadFinished(result) => {
+                result.diagnostic_trace.completion_received(remaining)
+            }
+            Self::WorktreeAddFinished(result) => {
+                if let Some(request) = &result.api_request {
+                    request.diagnostic_trace.completion_received(remaining);
+                } else {
+                    crate::latency_prof::event::EventTrace::default().received(3, remaining);
+                }
+            }
+            Self::WorktreeRemoveFinished(result) => {
+                if let Some(request) = &result.api_request {
+                    request.diagnostic_trace.completion_received(remaining);
+                } else {
+                    crate::latency_prof::event::EventTrace::default().received(3, remaining);
+                }
+            }
+            _ => crate::latency_prof::event::EventTrace::default().received(3, remaining),
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        let _ = remaining;
+    }
+
+    pub(crate) fn selected_wait(&mut self, wait: &crate::latency_prof::wait::WaitTrace) {
+        #[cfg(feature = "latency-prof")]
+        if let Some(trace) = self.trace_mut() {
+            *trace = trace.with_selected_wait(wait);
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        let _ = wait;
+    }
+
+    pub(crate) fn into_trace(self) -> (Self, crate::latency_prof::event::EventTrace) {
+        #[cfg(feature = "latency-prof")]
+        {
+            let mut event = self;
+            if let Self::DiagnosticDelegation { event: delegated } = event {
+                return (
+                    *delegated,
+                    crate::latency_prof::event::EventTrace::default(),
+                );
+            }
+            if let Self::Diagnostic { trace, event } = event {
+                return (*event, trace);
+            }
+            if let Some(trace) = event.trace_mut() {
+                let trace = std::mem::take(trace);
+                return (event, trace);
+            }
+            (event, crate::latency_prof::event::EventTrace::default())
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        (self, crate::latency_prof::event::EventTrace::default())
+    }
+
+    pub(crate) fn delegate(self) -> Self {
+        #[cfg(feature = "latency-prof")]
+        if crate::latency_prof::active() {
+            return Self::DiagnosticDelegation {
+                event: Box::new(self),
+            };
+        }
+        self
+    }
+
+    pub(crate) fn is_delegation(&self) -> bool {
+        #[cfg(feature = "latency-prof")]
+        {
+            matches!(self, Self::DiagnosticDelegation { .. })
+        }
+        #[cfg(not(feature = "latency-prof"))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn try_send_traced(
+        sender: &tokio::sync::mpsc::Sender<Self>,
+        event: Self,
+        class: &'static str,
+    ) -> Result<(), &'static str> {
+        let trace = crate::latency_prof::event::EventTrace::ingress(3, class, 0);
+        trace.record("event.send_begin", 0);
+        #[cfg(feature = "latency-prof")]
+        let event = if trace.is_active() {
+            Self::Diagnostic {
+                trace,
+                event: Box::new(event),
+            }
+        } else {
+            event
+        };
+        let result = sender.try_send(event);
+        trace.record("event.send_end", u64::from(result.is_ok()));
+        result.map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => "event channel full",
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => "event channel closed",
+        })
+    }
 }

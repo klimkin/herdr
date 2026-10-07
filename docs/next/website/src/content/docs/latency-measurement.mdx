@@ -72,20 +72,33 @@ compiled out by default. In feature builds, set `HERDR_LATENCY_TRACE_DIR=1` to
 enable bounded diagnostic recording; the harness places records under each
 run's `traces/` directory. Set `HERDR_TRACY=1` as well to enable Tracy.
 
+Build before starting collectors, then keep one collector per runtime process
+running throughout the benchmark:
+
 ```sh
-HERDR_LATENCY_TRACE_DIR=1 HERDR_TRACY=1 just bench-latency \
+just latency-build
+tracy-capture -a 127.0.0.1 -p 18086 -o server.tracy
+tracy-capture -a 127.0.0.1 -p 18087 -o client-0.tracy
+```
+
+Run the prebuilt benchmark in another terminal:
+
+```sh
+HERDR_LATENCY_TRACE_DIR=1 HERDR_TRACY=1 \
+  "${CARGO_TARGET_DIR:-target}/release/examples/latency_bench" \
+  --binary "${CARGO_TARGET_DIR:-target}/release/herdr" \
+  --probe "${CARGO_TARGET_DIR:-target}/release/examples/latency_probe" \
   --path echo --load visible --samples 200 --tracy-port 18086
-# Concurrent collectors: server port 18086; client 0 port 18087.
-tracy-capture -a 127.0.0.1 -p 18086 -o server.tracy -s 15
-tracy-capture -a 127.0.0.1 -p 18087 -o client.tracy -s 15
 python3 scripts/latency_report.py RUN/samples.json \
   --traces RUN/traces --output RUN/report.md
 ```
 
-Start collectors concurrently with benchmark execution. Additional clients use
-successive ports. Retain original captures. Tracy 0.14.1 supports `tracy-merge`,
-but merging does not synchronize clocks and drops lock events, context switches,
-callstacks, GPU zones, allocation events, and frame images.
+Additional clients use successive ports. Collectors save after runtime
+disconnection; wait for successful save completion. A fixed cutoff can truncate
+the measurement interval. Retain separate original captures. Tracy 0.14.1
+supports `tracy-merge`, but merging does not synchronize clocks and drops lock
+events, context switches, callstacks, GPU zones, allocation events, and frame
+images. Positive saved duration alone does not establish interval coverage.
 
 Diagnostics use static synchronous zones and host-monotonic numeric anchors.
 JSONL records carry PID, thread, stage, correlation identity, scope, timestamp,
@@ -111,10 +124,27 @@ contributing accepted part; batched identities remain separate. Delayed Enter
 shares its command enqueue/claim but starts a separate pending-write interval
 when scheduled. Rejected input has no accepted interval; shutdown or handoff
 release cancels incomplete attribution. Diagnostics do not cross a process
-handoff, and the Windows actor queue leg remains unavailable. Render attempts
-and selected presentation opportunities use separate records. Elapsed
-zones do not establish CPU execution or off-CPU cause; baseline mode provides
+handoff, and the Windows actor queue leg remains unavailable.
+
+Schema-2 records carry exact presentation, producing attempt, serialization,
+runtime-instance and service-attempt identities. Retained fallback and full
+render attempts remain separate. Runtime replacement allocates a new instance;
+missing modern context cannot use legacy delivery matching. These diagnostic
+fields remain outside published wire codecs. Elapsed zones do not establish
+CPU execution or off-CPU cause; baseline mode provides
 no scheduler evidence. Overlapping stage intervals must not be summed.
+
+The JSON report includes `event_service`, `wait_service` and `runtime_work`
+alongside per-response `critical_paths`, stage distributions and trace integrity.
+Service attempts preserve deferred/completed outcomes without counting a retry
+as another admitted request. Queue residence uses producer-send bounds because
+consumer service can precede send return. Whole-handler and API-barrier spans
+overlap; batch counts bound complete messages, not elapsed work. Receiver-depth
+and traced/untraced populations expose coverage limits.
+
+Wait records classify selected input/API/internal/render/listener returns and
+real deadline reason ties. Invalid or unmatched wait evidence remains unassigned.
+These returns are neither scheduler wakeups nor context switches.
 
 Same-host timestamps use an explicitly checked shared monotonic clock. Socket
 RTT is a matched health response, separate from application presentation. No

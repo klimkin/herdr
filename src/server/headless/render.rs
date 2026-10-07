@@ -372,8 +372,13 @@ impl HeadlessServer {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn render_and_stream(&mut self) {
         self.render_and_stream_with_graphics_limit(MAX_GRAPHICS_FRAME_SIZE);
+    }
+
+    pub(super) fn render_and_stream_traced(&mut self, context: crate::latency_prof::TraceContext) {
+        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context);
     }
 
     #[cfg(all(test, unix))]
@@ -381,9 +386,21 @@ impl HeadlessServer {
         self.render_and_stream_with_graphics_limit(max);
     }
 
+    #[cfg(test)]
     fn render_and_stream_with_graphics_limit(&mut self, graphics_frame_limit: usize) {
+        self.render_and_stream_impl(
+            graphics_frame_limit,
+            crate::latency_prof::TraceContext::default(),
+        );
+    }
+
+    fn render_and_stream_impl(
+        &mut self,
+        graphics_frame_limit: usize,
+        context: crate::latency_prof::TraceContext,
+    ) {
+        let attempt = crate::latency_prof::AttemptTrace::begin(context, false, self.clients.len());
         crate::latency_prof::zone!("server.full_render");
-        crate::latency_prof::record("server.frame_start", 0, self.clients.len() as u64);
         let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
 
@@ -637,7 +654,12 @@ impl HeadlessServer {
                             continue;
                         }
                     };
-                    let snapshot_framed = match Self::frame_server_message(&snapshot_message) {
+                    let (snapshot_framed, snapshot_trace) = match Self::frame_server_message_traced(
+                        &snapshot_message,
+                        MAX_FRAME_SIZE,
+                        attempt.context(),
+                        &crate::latency_prof::runtime::PaneSources::default(),
+                    ) {
                         Ok(framed) => framed,
                         Err(err) => {
                             warn!(client_id, err = %err, "failed to frame endpoint snapshot");
@@ -649,10 +671,13 @@ impl HeadlessServer {
                         broken_clients.push(client_id);
                         continue;
                     };
-                    crate::latency_prof::snapshot_links(&candidate, &snapshot_framed);
+                    crate::latency_prof::presentation::snapshot_links(&candidate, &snapshot_trace);
                     if projection_framed.is_some_and(|framed| writer.control.send(framed).is_err())
                         || writer.control.send(completion_framed).is_err()
-                        || writer.control.send(snapshot_framed).is_err()
+                        || writer
+                            .control
+                            .send_traced(snapshot_framed, &snapshot_trace)
+                            .is_err()
                     {
                         broken_clients.push(client_id);
                         continue;
@@ -668,6 +693,7 @@ impl HeadlessServer {
                 }
             }
             let mut surface_parts = None;
+            let mut diagnostic_sources = crate::latency_prof::runtime::PaneSources::default();
             let frame = match mode {
                 ClientConnectionMode::ClientShell => {
                     let crate::server::client_shell::RenderedPaneSurface {
@@ -678,7 +704,9 @@ impl HeadlessServer {
                         graphics,
                         graphics_delivery: next_graphics_delivery,
                         graphics_sources,
+                        diagnostic_sources: sources,
                     } = shell_render.expect("active shell surface");
+                    diagnostic_sources = sources;
                     surface_parts = Some((
                         panes,
                         splits,
@@ -806,8 +834,12 @@ impl HeadlessServer {
             let mut shell_assets_deferred = false;
             let mut suppress_impossible_asset_retry = false;
             let mut stripped_assets = Vec::new();
-            let mut serialized = match Self::frame_server_message_with_max(prepared.message(), max)
-            {
+            let (mut serialized, mut frame_trace) = match Self::frame_prepared_render_traced(
+                &prepared,
+                max,
+                attempt.context(),
+                &diagnostic_sources,
+            ) {
                 Ok(frame) => frame,
                 Err(protocol::FramingError::Oversized { claimed, max }) if has_graphics => {
                     warn!(
@@ -819,7 +851,12 @@ impl HeadlessServer {
                             break None;
                         };
                         stripped_assets.push(key);
-                        match Self::frame_server_message_with_max(prepared.message(), max) {
+                        match Self::frame_prepared_render_traced(
+                            &prepared,
+                            max,
+                            attempt.context(),
+                            &diagnostic_sources,
+                        ) {
                             Ok(framed) => break Some(framed),
                             Err(protocol::FramingError::Oversized { .. }) => {}
                             Err(err) => {
@@ -885,18 +922,26 @@ impl HeadlessServer {
                     .as_ref()
                     .is_some_and(crate::kitty_graphics::surface::DeliveryCache::has_pending);
             if let Some((_, message)) = &native_upload {
-                let Ok(file_frame) =
-                    Self::frame_server_message_with_max(message, MAX_GRAPHICS_FRAME_SIZE)
-                else {
+                let Ok((file_frame, file_trace)) = Self::frame_server_message_traced(
+                    message,
+                    MAX_GRAPHICS_FRAME_SIZE,
+                    attempt.context(),
+                    &crate::latency_prof::runtime::PaneSources::default(),
+                ) else {
                     client.defer_full_render();
                     continue;
                 };
+                crate::latency_prof::presentation::append(
+                    &mut frame_trace,
+                    file_trace,
+                    serialized.len(),
+                );
                 serialized.extend_from_slice(&file_frame);
             }
             let send = if native_upload.is_some() || self.native_graphics.is_pending(client_id) {
-                writer.render.send_ordered(serialized)
+                writer.render.send_ordered_traced(serialized, &frame_trace)
             } else {
-                writer.render.try_send(serialized)
+                writer.render.try_send_traced(serialized, &frame_trace)
             };
             match send {
                 Ok(()) => {

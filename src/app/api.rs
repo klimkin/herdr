@@ -28,6 +28,9 @@ enum RuntimeExitAction {
 
 impl App {
     pub(crate) fn handle_internal_event_with_render_impact(&mut self, ev: AppEvent) -> bool {
+        let delegated = ev.is_delegation();
+        let (ev, trace) = ev.into_trace();
+        let _handler = (!delegated).then(|| trace.handler());
         match ev {
             AppEvent::GitStatusRefreshed {
                 results,
@@ -47,11 +50,11 @@ impl App {
                 changes_workspace
             }
             ev @ AppEvent::TerminalBell { .. } => {
-                self.handle_internal_event(ev);
+                self.handle_internal_event(ev.delegate());
                 false
             }
             ev => {
-                self.handle_internal_event(ev);
+                self.handle_internal_event(ev.delegate());
                 true
             }
         }
@@ -90,6 +93,9 @@ impl App {
         &mut self,
         ev: AppEvent,
     ) -> Vec<crate::app::actions::PaneStateUpdate> {
+        let delegated = ev.is_delegation();
+        let (ev, trace) = ev.into_trace();
+        let _handler = (!delegated).then(|| trace.handler());
         let mut worktree_restore_failed = false;
         let ev = match ev {
             AppEvent::WorktreeRuntimeRestoreFailed {

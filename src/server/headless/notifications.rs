@@ -298,7 +298,9 @@ impl HeadlessServer {
     /// in the headless server — use this method instead.
     ///
     /// Returns true if the event changed visual state (requiring a re-render).
-    pub(super) fn handle_internal_event_with_forwarding(&mut self, mut ev: AppEvent) -> bool {
+    pub(super) fn handle_internal_event_with_forwarding(&mut self, ev: AppEvent) -> bool {
+        let (mut ev, trace) = ev.into_trace();
+        let _handler = trace.handler_in(3);
         if self.host_shutdown_requested.load(Ordering::Acquire) {
             return false;
         }
@@ -351,7 +353,9 @@ impl HeadlessServer {
                 // Headless mode disables local sound playback separately from the
                 // sound policy so reloads can keep server-side notification policy live.
                 self.sync_foreground_client_state();
-                let pane_updates = self.app.handle_internal_event_with_pane_updates(ev);
+                let pane_updates = self
+                    .app
+                    .handle_internal_event_with_pane_updates(ev.delegate());
                 let suppress_completion = pane_updates
                     .iter()
                     .any(|update| update.pane_id == pane_id_val && update.suppress_completion);
@@ -444,7 +448,9 @@ impl HeadlessServer {
                 let prev_state = self.pane_effective_state(pane_id_val);
 
                 self.sync_foreground_client_state();
-                let pane_updates = self.app.handle_internal_event_with_pane_updates(ev);
+                let pane_updates = self
+                    .app
+                    .handle_internal_event_with_pane_updates(ev.delegate());
                 let suppress_completion = pane_updates
                     .iter()
                     .any(|update| update.pane_id == pane_id_val && update.suppress_completion);
@@ -531,7 +537,7 @@ impl HeadlessServer {
                 let version = version.clone();
                 let install_command = install_command.clone();
 
-                self.app.handle_internal_event(ev);
+                self.app.handle_internal_event(ev.delegate());
                 self.send_to_client_shells(ServerMessage::SemanticNotification(
                     protocol::SemanticNotification {
                         kind: protocol::SemanticNotificationKind::UpdateInstalled,
@@ -577,7 +583,8 @@ impl HeadlessServer {
             AppEvent::WorktreeReadFinished(result)
                 if matches!(&result.request.method, api::schema::Method::WorktreeList(_)) =>
             {
-                self.app.handle_internal_event_with_render_impact(ev)
+                self.app
+                    .handle_internal_event_with_render_impact(ev.delegate())
             }
             AppEvent::WorktreeAddFinished(_) | AppEvent::WorktreeReadFinished(_) => {
                 let deferred_request_id = match &ev {
@@ -597,7 +604,9 @@ impl HeadlessServer {
                                 == Some(request_id)
                         })
                     });
-                let changed = self.app.handle_internal_event_with_render_impact(ev);
+                let changed = self
+                    .app
+                    .handle_internal_event_with_render_impact(ev.delegate());
                 let api_focus_succeeded = super::client_views::forward_proxied_api_response(
                     focused_worktree_response.take(),
                 )
@@ -628,7 +637,9 @@ impl HeadlessServer {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let pane_updates = self.app.handle_internal_event_with_pane_updates(ev);
+                let pane_updates = self
+                    .app
+                    .handle_internal_event_with_pane_updates(ev.delegate());
                 for update in &pane_updates {
                     self.forward_semantic_agent_notification(update);
                     self.forward_pane_state_update_notifications_to_clients(update);
@@ -675,7 +686,9 @@ impl HeadlessServer {
                     }
                 }
 
-                let pane_updates = self.app.handle_internal_event_with_pane_updates(ev);
+                let pane_updates = self
+                    .app
+                    .handle_internal_event_with_pane_updates(ev.delegate());
                 for update in &pane_updates {
                     self.forward_semantic_agent_notification(update);
                     self.forward_pane_state_update_notifications_to_clients(update);
@@ -695,7 +708,9 @@ impl HeadlessServer {
 
                 true
             }
-            _ => self.app.handle_internal_event_with_render_impact(ev),
+            _ => self
+                .app
+                .handle_internal_event_with_render_impact(ev.delegate()),
         }
     }
 
@@ -715,12 +730,15 @@ impl HeadlessServer {
     }
 
     pub(super) fn drain_all_internal_events_with_forwarding(&mut self) -> bool {
+        let mut barrier =
+            crate::latency_prof::work::BatchTrace::begin("batch.begin.api_barrier", 0);
         let mut changed = false;
         loop {
-            let (had_event, batch_changed) =
-                self.drain_internal_events_with_forwarding_up_to(crate::app::APP_EVENT_DRAIN_LIMIT);
+            let (count, batch_changed) =
+                self.drain_internal_events_counted(crate::app::APP_EVENT_DRAIN_LIMIT);
             changed |= batch_changed;
-            if !had_event || self.should_quit.load(Ordering::Acquire) {
+            barrier.add(count);
+            if count == 0 || self.should_quit.load(Ordering::Acquire) {
                 break;
             }
         }
@@ -731,7 +749,13 @@ impl HeadlessServer {
         &mut self,
         limit: usize,
     ) -> (bool, bool) {
-        let mut had_event = false;
+        let (count, changed) = self.drain_internal_events_counted(limit);
+        (count != 0, changed)
+    }
+
+    fn drain_internal_events_counted(&mut self, limit: usize) -> (u64, bool) {
+        let mut batch = crate::latency_prof::work::BatchTrace::begin("batch.begin.internal", limit);
+        let mut count = 0;
         let mut changed = false;
         for _ in 0..limit {
             if self.host_shutdown_requested.load(Ordering::Acquire) {
@@ -740,9 +764,11 @@ impl HeadlessServer {
             let Ok(ev) = self.app.event_rx.try_recv() else {
                 break;
             };
-            had_event = true;
+            ev.received(self.app.event_rx.len());
+            batch.handled();
+            count += 1;
             changed |= self.handle_internal_event_with_forwarding(ev);
         }
-        (had_event, changed)
+        (count, changed)
     }
 }
