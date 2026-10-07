@@ -549,6 +549,83 @@ impl HeadlessServer {
             self.stream_host_mouse_capture_mode();
             self.stream_direct_terminal_keyboard_mode();
 
+            // Extra attempts belong to the enabled experiment only. Refresh
+            // time and pending work here: maintenance may cross the ordinary due
+            // boundary after the baseline turn's time sample.
+            if self.app.experiments.presentation
+                == crate::latency_experiments::PresentationPolicy::ActionFull
+            {
+                let decision_now = Instant::now();
+                needs_render |= self.app.render_dirty.is_pending();
+                let ordinary_due = needs_render
+                    && (self.app.can_render_now(decision_now)
+                        || (self.app.can_present_now(decision_now)
+                            && self.has_pending_presentation_work(
+                                needs_full_render,
+                                needs_graphics_render,
+                            )));
+                if !ordinary_due {
+                    let clients = &self.clients;
+                    if let Some(opportunity) = self.app.early_action_ready(decision_now, |origin| {
+                        clients.get(&origin.client_id).is_some_and(|client| {
+                            client.is_active_shell_client()
+                                && client.shell_projection_revision == origin.projection_revision
+                        })
+                    }) {
+                        let has_recipient = self
+                            .clients
+                            .values()
+                            .any(|client| client.is_active_shell_client());
+                        if has_recipient
+                            && self.app.early_presentation.admit(
+                                opportunity.id,
+                                decision_now,
+                                ordinary_due,
+                            )
+                        {
+                            let presentation = crate::latency_prof::PresentationTrace::selected(
+                                decision_now,
+                                decision_now,
+                            );
+                            #[cfg(feature = "latency-prof")]
+                            crate::latency_prof::record_context_at(
+                                "opportunity.admitted",
+                                opportunity.id,
+                                0,
+                                0,
+                                crate::latency_prof::now(),
+                                presentation.context(),
+                            );
+                            let pending_request = self.app.render_dirty.take_pending();
+                            let (_, outer_title_synced) = self.sync_terminal_title_sources(
+                                &pending_request.request.terminal_title_sources,
+                            );
+                            if !outer_title_synced {
+                                self.sync_window_title();
+                            }
+                            let outcome = self.render_and_stream_traced(presentation.context());
+                            if outcome.ordinary_work_handled {
+                                pending_request.complete();
+                                needs_render = false;
+                                needs_full_render = false;
+                            } else {
+                                drop(pending_request);
+                                // Destructive construction may have exhausted
+                                // rows before a matching enqueue. Force coherent
+                                // ordinary recovery without changing its deadline.
+                                self.app.full_redraw_pending = true;
+                                needs_render = true;
+                                needs_full_render = true;
+                            }
+                            // Both clocks still belong to ordinary cadence. Live
+                            // arrivals and recipient recovery retain their owners.
+                            needs_graphics_render = false;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // 7. Render virtually and stream frames. Hidden-only PTY work keeps a
             // bounded classification cadence without delaying presentation work
             // that joins the same coalesced request.
@@ -1024,6 +1101,7 @@ impl HeadlessServer {
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
+        self.app.early_presentation.cancel_client(client_id);
         self.disconnect_native_graphics(client_id);
         let disconnected_focus = self
             .clients

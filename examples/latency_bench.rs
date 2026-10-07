@@ -31,6 +31,7 @@ struct Client {
     input: platform::InputWriter,
     screen: Arc<Mutex<observer::Observer>>,
     completed: mpsc::Receiver<observer::Observation>,
+    deferred_observations: Mutex<Vec<observer::Observation>>,
     delay_ms: Arc<AtomicU64>,
     reader_control: Option<Arc<reader_control::ReaderControl>>,
     reader_worker: Option<std::thread::JoinHandle<()>>,
@@ -256,6 +257,7 @@ impl Session {
             input,
             screen,
             completed,
+            deferred_observations: Mutex::new(Vec::new()),
             delay_ms,
             reader_control,
             reader_worker,
@@ -280,6 +282,25 @@ impl Session {
                 return Err(format!("client {index} missing {pattern}: {text}").into());
             }
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn committed_observation(&self, index: usize, marker: &str) -> Result<u64> {
+        let client = &self.clients[index];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let observation = client
+                .completed
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| format!("client {index} missing committed phase {marker}"))?;
+            if observation.marker == marker {
+                return Ok(observation.received_ns);
+            }
+            client
+                .deferred_observations
+                .lock()
+                .map_err(|_| "observations poisoned")?
+                .push(observation);
         }
     }
 
@@ -363,6 +384,7 @@ struct Sample {
     identity: String,
     intended_ns: u64,
     injected_ns: u64,
+    phase_observed_ns: Option<u64>,
     // Successful harness input operation completion, not server/API admission.
     accepted_ns: Option<u64>,
     process_start_ns: Option<u64>,
@@ -420,6 +442,8 @@ fn main() -> Result<()> {
     let load_hz: u64 = argument("--load-hz", "60").parse()?;
     let path = argument("--path", "output");
     let load = argument("--load", "quiet");
+    let action_entry = argument("--action-entry", "tui");
+    let action_phase = argument("--action-phase", "none");
     let layout = argument("--layout", "tabs");
     if burst == 0
         || burst > 1000
@@ -437,6 +461,10 @@ fn main() -> Result<()> {
         || load_hz > 10_000
         || !matches!(layout.as_str(), "tabs" | "active")
         || (layout == "active" && load == "hidden")
+        || !matches!(action_entry.as_str(), "tui" | "json")
+        || !matches!(action_phase.as_str(), "none" | "output")
+        || (action_phase == "output"
+            && (path != "action" || action_entry != "json" || load != "quiet"))
         || !matches!(path.as_str(), "output" | "echo" | "action")
         || !matches!(load.as_str(), "quiet" | "visible" | "hidden")
     {
@@ -640,13 +668,26 @@ fn main() -> Result<()> {
             "echo" => format!("HL-I-{identity}-END"),
             _ => format!("A{sequence:06}"),
         };
-        if path == "action" {
+        if path == "action" && action_entry == "tui" {
             session.clients[0].input.write_all(b"\x02W")?;
             session.wait_text(0, "rename workspace")?;
             session.clients[0].input.write_all(b"\x03")?;
             session.clients[0].input.write_all(marker.as_bytes())?;
             session.wait_text(0, &marker)?;
         }
+        let phase_observed_ns = if action_phase == "output" {
+            let phase_identity = format!("ff{sequence:010x}");
+            let phase_marker = format!("HL-O-{phase_identity}-END");
+            session.clients[0]
+                .screen
+                .lock()
+                .map_err(|_| "screen poisoned")?
+                .expect(phase_marker.clone(), platform::monotonic_ns()?);
+            writeln!(control, "output {phase_identity}")?;
+            Some(session.committed_observation(0, &phase_marker)?)
+        } else {
+            None
+        };
         let injected = platform::monotonic_ns()?;
         session.expect_all(&marker, injected)?;
         let sample = Sample {
@@ -654,6 +695,7 @@ fn main() -> Result<()> {
             identity,
             intended_ns: intended,
             injected_ns: injected,
+            phase_observed_ns,
             accepted_ns: None,
             process_start_ns: None,
             process_end_ns: None,
@@ -679,6 +721,13 @@ fn main() -> Result<()> {
                 "echo" => session.clients[0]
                     .input
                     .write_all(format!("!{}~", sample.identity).as_bytes()),
+                _ if action_entry == "json" => session
+                    .api(
+                        "workspace.rename",
+                        json!({"workspace_id":workspace,"label":marker}),
+                    )
+                    .map(|_| ())
+                    .map_err(|error| std::io::Error::other(error.to_string())),
                 _ => session.clients[0].input.write_all(b"\r"),
             }
         };
@@ -704,7 +753,14 @@ fn main() -> Result<()> {
         positions.insert(marker, samples.len());
         samples.push(sample);
         for (index, client) in session.clients.iter().enumerate() {
-            for observation in client.completed.try_iter() {
+            let mut observations = std::mem::take(
+                &mut *client
+                    .deferred_observations
+                    .lock()
+                    .map_err(|_| "observations poisoned")?,
+            );
+            observations.extend(client.completed.try_iter());
+            for observation in observations {
                 if let Some(position) = positions.get(&observation.marker) {
                     samples[*position].observed_ns[index] = Some(observation.received_ns);
                 }
@@ -719,7 +775,14 @@ fn main() -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         for (index, client) in session.clients.iter().enumerate() {
-            for observed in client.completed.try_iter() {
+            let mut observations = std::mem::take(
+                &mut *client
+                    .deferred_observations
+                    .lock()
+                    .map_err(|_| "observations poisoned")?,
+            );
+            observations.extend(client.completed.try_iter());
+            for observed in observations {
                 if let Some(position) = positions.get(&observed.marker) {
                     samples[*position].observed_ns[index] = Some(observed.received_ns);
                 }
@@ -903,7 +966,7 @@ fn main() -> Result<()> {
         Value::Null
     };
     let mut report = json!({"run_id":run_id,"path":path,"load":load,"load_hz":load_hz,"panes":panes,"clients":clients,"samples":samples,"summary":summaries});
-    let metadata = json!({"started_ns":started_ns,"finished_ns":finished_ns,"duration_ns":finished_ns-started_ns,"warmups":warmups,"burst":burst,"max_pending":max_pending,"interval_ms":interval_ms,"seed":92341,"layout":layout,"pane_ids":pane_ids,"estimated_pane_areas":areas,"pane_layout":pane_layout,"slow_reader_ms":slow_reader_ms,"stall_ms":stall_ms,"reader_lifecycle":reader_lifecycle,"recovery_warmups":recovery_warmups});
+    let metadata = json!({"started_ns":started_ns,"finished_ns":finished_ns,"duration_ns":finished_ns-started_ns,"warmups":warmups,"burst":burst,"max_pending":max_pending,"interval_ms":interval_ms,"seed":92341,"layout":layout,"pane_ids":pane_ids,"estimated_pane_areas":areas,"pane_layout":pane_layout,"slow_reader_ms":slow_reader_ms,"stall_ms":stall_ms,"reader_lifecycle":reader_lifecycle,"recovery_warmups":recovery_warmups,"action_entry":action_entry,"action_phase":action_phase});
     let measurement = json!({"echo_legs":echo_legs,"observer_cost":observer_cost,"binary_sha256":binary_sha256,"server_pid":owned_server_pid,"client_pids":session.clients.iter().map(|client|client.child.process_id()).collect::<Vec<_>>(),"base":session.base,"fanout_spread":report::summarize(&fanout,count,20_000_000),"newest_presented_load_generation":freshness,"load_events":load_events,"presented_load":presented_load,"transport":transport_result});
     let environment = json!({"offered_samples":count,"measurement_first_intended_ns":first_intended_ns,"measurement_last_intended_ns":last_intended_ns,"percentile_method":"nearest rank; p99.9 requires 10000 completions","clock":"host monotonic; observer includes scheduling and reconstruction","platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"profiler":"tracy-client 0.19.0; Tracy 0.14.1","scheduler_evidence":"unavailable in baseline mode","clock_validation_ns":[before,helper,after],"geometry":[120,40],"endpoint":"outer-PTY committed terminal bytes","budget_ns":20_000_000,"budget_kind":"diagnostic, not production SLO","binary":session.binary,"probe":session.probe});
     for fields in [metadata, measurement, environment] {

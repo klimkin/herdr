@@ -112,6 +112,9 @@ impl App {
         let Some(ws) = self.state.workspaces.get_mut(index) else {
             return workspace_not_found(id, &params.workspace_id);
         };
+        let changed_label = self.early_presentation.actions_enabled()
+            && ws.display_name_from(&self.state.terminals, &self.terminal_runtimes) != params.label;
+        let committed_workspace_id = changed_label.then(|| ws.id.clone());
         ws.set_custom_name(params.label.clone());
         crate::latency_prof::record(
             "server.action_committed",
@@ -123,6 +126,14 @@ impl App {
             "action.event_committed",
             crate::latency_prof::bytes_id(params.label.as_bytes()),
         );
+        if let Some(workspace_id) = committed_workspace_id {
+            self.early_presentation.accepted_action(
+                workspace_id,
+                params.label.clone(),
+                id.clone(),
+                std::time::Instant::now(),
+            );
+        }
         crate::logging::workspace_renamed(&ws.id);
         self.schedule_session_save();
         self.emit_event(EventEnvelope {

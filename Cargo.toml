@@ -26,7 +26,8 @@ default-members = [".", "crates/ghostty-vt"]
 
 [features]
 # Opt-in diagnostics; release builds contain no latency instrumentation by default.
-latency-prof = ["dep:tracy-client"]
+latency-experiments = []
+latency-prof = ["dep:tracy-client", "latency-experiments"]
 
 [dependencies]
 ghostty-vt = { path = "crates/ghostty-vt" }

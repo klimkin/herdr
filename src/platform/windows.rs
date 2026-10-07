@@ -378,6 +378,11 @@ pub(crate) fn write_existing_config(
     config_backup::write_existing(target, contents)
 }
 
+/// Native Windows responsiveness experiments remain outside this implementation.
+pub(crate) fn latency_experiments_supported() -> bool {
+    false
+}
+
 #[cfg(test)]
 fn config_security_descriptor(
     path: &std::path::Path,

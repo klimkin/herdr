@@ -283,3 +283,7 @@ release $version $preview:
 # Print default config
 default-config:
     cargo run --release --locked -- --default-config
+
+# Validate authoritative actions using prebuilt owned-PTY helpers (no timing claim).
+latency-action-behavior: latency-build
+    cargo nextest run --locked --features latency-prof --run-ignored ignored-only accepted_actions_present_authoritative_labels_without_redundant_frames

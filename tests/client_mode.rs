@@ -2,6 +2,9 @@
 
 #![cfg(unix)]
 
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[path = "../examples/latency/observer.rs"]
+mod action_observer;
 pub mod support;
 #[path = "support/terminal_screen.rs"]
 mod terminal_screen;
@@ -2517,4 +2520,552 @@ fn client_receives_notify_on_agent_state_change() {
     );
 
     cleanup_spawned_herdr(spawned, base);
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[test]
+fn rapid_authoritative_actions_coalesce_without_renewing_extra_budget() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let traces = base.join("traces");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(config_home.join(app_dir_name()).join("config.toml"), "onboarding = false\n[ui]\nwindow_title = \"\"\n[update]\nversion_check = false\nmanifest_check = false\n").unwrap();
+    let trace_env = traces.to_string_lossy();
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &[
+            ("HERDR_LATENCY_TRACE_DIR", &trace_env),
+            ("HERDR_LATENCY_PRESENTATION", "action-full"),
+        ],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &runtime_dir.join("herdr-client.sock"),
+        Duration::from_secs(10),
+    );
+    let client = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    let output = spawn_pty_drain(client._master.as_ref().unwrap().try_clone_reader().unwrap());
+    let created = send_json_request(&api_socket, &serde_json::json!({"id":"action-create", "method":"workspace.create", "params":{"cwd":base,"focus":true,"label":"action-start"}}).to_string());
+    let workspace = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("created workspace");
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(10), || {
+            terminal_screen::text(&output.lock().unwrap().bytes, 80, 24).contains("action-start")
+        }),
+        "client attached before action burst: {}",
+        read_output(&output)
+    );
+    let mut input = client._master.as_ref().unwrap().take_writer().unwrap();
+    input.write_all(b"\x02W").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(5), || {
+            terminal_screen::text(&output.lock().unwrap().bytes, 80, 24)
+                .contains("rename workspace")
+        }),
+        "TUI rename preparation stays outside action timing"
+    );
+    input.write_all(b"\x03MixedOrigin\r").unwrap();
+    for sequence in 0..64 {
+        let request = serde_json::json!({"id":format!("action-burst-{sequence}"),"method":"workspace.rename","params":{"workspace_id":workspace,"label":format!("Rapid{sequence:03}")}});
+        let response = send_json_request(&api_socket, &request.to_string());
+        assert_eq!(response["id"], format!("action-burst-{sequence}"));
+        assert!(response["error"].is_null(), "{response}");
+    }
+    assert!(
+        wait_for_committed_action_label(&output, "Rapid063", 80, 24),
+        "last committed authoritative label remains visible"
+    );
+    let same = send_json_request(&api_socket, &serde_json::json!({"id":"action-noop","method":"workspace.rename","params":{"workspace_id":workspace,"label":"Rapid063"}}).to_string());
+    assert!(same["error"].is_null());
+    let rejected = send_json_request(&api_socket, &serde_json::json!({"id":"action-invalid","method":"workspace.rename","params":{"workspace_id":"missing-workspace","label":"Rejected"}}).to_string());
+    assert!(!rejected["error"].is_null());
+    let server_pid = server.child.process_id().unwrap();
+    drop(input);
+    drop(client);
+    drop(server);
+    let trace = traces.join(format!("{server_pid}.jsonl"));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || fs::read_to_string(&trace).is_ok_and(|raw| raw.contains("process.finish"))
+    ));
+    let records: Vec<Value> = fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let diagnostic_id = |text: &str| {
+        text.as_bytes()
+            .iter()
+            .fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            })
+    };
+    for request in ["action-noop", "action-invalid"] {
+        let identity = diagnostic_id(request);
+        assert!(
+            !records
+                .iter()
+                .any(
+                    |r| (r["stage"] == "opportunity.action_granted" && r["scope"] == identity)
+                        || (r["stage"] == "opportunity.superseded" && r["value"] == identity)
+                ),
+            "unchanged/rejected request grants no accepted opportunity"
+        );
+    }
+    assert!(
+        records
+            .iter()
+            .any(|r| r["stage"] == "opportunity.superseded"),
+        "rapid actions coalesce instead of one obligation per request"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r["stage"] == "opportunity.token_denied"),
+        "global extra admission budget remains bounded"
+    );
+    let admitted: Vec<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "opportunity.admitted")
+        .collect();
+    assert!(
+        admitted.len() < 64,
+        "burst cannot bypass global admission budget"
+    );
+    let origins: Vec<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "opportunity.origin")
+        .collect();
+    assert!(
+        !origins.is_empty(),
+        "shared committed work exposes explicit origin scope"
+    );
+    assert!(
+        origins.iter().any(|r| r["value"] == 0)
+            && origins
+                .iter()
+                .any(|r| r["value"].as_u64().is_some_and(|id| id != 0)),
+        "JSON actions remain origin-neutral and TUI actions retain explicit source lease"
+    );
+    let expiries: Vec<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "opportunity.expires_at")
+        .collect();
+    assert!(
+        !expiries.is_empty(),
+        "public lifecycle exposes fixed expiry"
+    );
+    let mut expiry_by_id = std::collections::HashMap::new();
+    for record in expiries {
+        let identity = record["id"].as_u64().unwrap();
+        let expires = record["value"].as_u64().unwrap();
+        if let Some(first) = expiry_by_id.insert(identity, expires) {
+            assert_eq!(first, expires, "coalescing cannot renew fixed expiry");
+        }
+    }
+    let charges: Vec<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "opportunity.charged_at")
+        .filter_map(|r| r["value"].as_u64())
+        .collect();
+    assert!(
+        !charges.is_empty(),
+        "public admission records expose actual charged policy time"
+    );
+    assert!(
+        charges
+            .windows(2)
+            .all(|times| times[1] - times[0] >= 16_000_000),
+        "one shared token refills no faster than16ms"
+    );
+    cleanup_test_base(&base);
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[test]
+fn actions_without_viewers_expire_without_creating_idle_frames() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let traces = base.join("traces");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(config_home.join(app_dir_name()).join("config.toml"), "onboarding = false\n[ui]\nwindow_title = \"\"\n[update]\nversion_check = false\nmanifest_check = false\n").unwrap();
+    let trace_env = traces.to_string_lossy();
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &[
+            ("HERDR_LATENCY_TRACE_DIR", &trace_env),
+            ("HERDR_LATENCY_PRESENTATION", "action-full"),
+        ],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &runtime_dir.join("herdr-client.sock"),
+        Duration::from_secs(10),
+    );
+    let created = send_json_request(&api_socket, &serde_json::json!({"id":"action-create", "method":"workspace.create", "params":{"cwd":base,"focus":true,"label":"action-start"}}).to_string());
+    let workspace = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("created workspace");
+    for sequence in 0..64 {
+        let response = send_json_request(&api_socket, &serde_json::json!({"id":format!("silent-{sequence}"),"method":"workspace.rename","params":{"workspace_id":workspace,"label":format!("Silent{sequence:03}")}}).to_string());
+        assert!(response["error"].is_null());
+    }
+    thread::sleep(Duration::from_millis(100));
+    let trace = traces.join(format!("{}.jsonl", server.child.process_id().unwrap()));
+    // The asynchronous diagnostic writer flushes during this existing idle
+    // interval; inspecting its public artifacts sends no server wake.
+    thread::sleep(Duration::from_millis(100));
+    let before_attach: Vec<Value> = fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!before_attach
+        .iter()
+        .any(|r| r["stage"] == "opportunity.admitted"));
+    let last_commit_ns = before_attach
+        .iter()
+        .filter(|r| r["stage"] == "server.action_committed")
+        .filter_map(|r| r["ns"].as_u64())
+        .max()
+        .unwrap();
+    assert!(
+        !before_attach
+            .iter()
+            .any(|r| r["stage"] == "server.frame_start"
+                && r["ns"]
+                    .as_u64()
+                    .is_some_and(|ns| ns > last_commit_ns + 50_000_000)),
+        "expiry creates no frame after ordinary work drains"
+    );
+    let client = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    let output = spawn_pty_drain(client._master.as_ref().unwrap().try_clone_reader().unwrap());
+    assert!(
+        wait_for_committed_action_label(&output, "Silent063", 80, 24),
+        "late viewer receives committed authoritative state through ordinary presentation"
+    );
+    drop(client);
+    drop(server);
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || fs::read_to_string(&trace).is_ok_and(|raw| raw.contains("process.finish"))
+    ));
+    let records: Vec<Value> = fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records.iter().any(|r| r["stage"] == "opportunity.expired"),
+        "existing attach service lazily expires old opportunity"
+    );
+    assert!(
+        !records.iter().any(|r| r["stage"] == "opportunity.admitted"),
+        "expired no-viewer action never claims extra admission"
+    );
+    cleanup_test_base(&base);
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[test]
+fn stalled_client_recovers_without_blocking_authoritative_actions() {
+    action_backpressure_contract(false);
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[test]
+#[ignore = "controlled early-admission experiment; ineligible setup remains a failed outcome"]
+fn early_action_with_stalled_recipient_uses_a_committed_phase() {
+    action_backpressure_contract(true);
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+fn wait_for_committed_action_label(
+    output: &SharedOutput,
+    marker: &str,
+    cols: u16,
+    rows: u16,
+) -> bool {
+    let mut observer = action_observer::Observer::new(cols, rows).unwrap();
+    observer.expect(marker.into(), 0);
+    let mut consumed = 0;
+    wait_until(Duration::from_secs(8), Duration::from_millis(5), || {
+        let captured = output.lock().unwrap();
+        let found = observer
+            .feed(&captured.bytes[consumed..], 1)
+            .unwrap()
+            .iter()
+            .any(|observation| observation.marker == marker && observation.received_ns == 1);
+        consumed = captured.bytes.len();
+        found
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+fn action_backpressure_contract(early: bool) {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let traces = base.join("traces");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(config_home.join(app_dir_name()).join("config.toml"), "onboarding = false\n[ui]\nwindow_title = \"\"\n[update]\nversion_check = false\nmanifest_check = false\n").unwrap();
+    let trace_env = traces.to_string_lossy();
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &[
+            ("HERDR_LATENCY_TRACE_DIR", &trace_env),
+            ("HERDR_LATENCY_PRESENTATION", "action-full"),
+        ],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &runtime_dir.join("herdr-client.sock"),
+        Duration::from_secs(10),
+    );
+    let mut client_a = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    client_a
+        ._master
+        .as_ref()
+        .unwrap()
+        .resize(PtySize {
+            rows: 80,
+            cols: 240,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let output_a = spawn_pty_drain(
+        client_a
+            ._master
+            .as_ref()
+            .unwrap()
+            .try_clone_reader()
+            .unwrap(),
+    );
+    let mut client_b = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    client_b
+        ._master
+        .as_ref()
+        .unwrap()
+        .resize(PtySize {
+            rows: 80,
+            cols: 240,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let output_b = spawn_pty_drain(
+        client_b
+            ._master
+            .as_ref()
+            .unwrap()
+            .try_clone_reader()
+            .unwrap(),
+    );
+    let created = send_json_request(&api_socket, &serde_json::json!({"id":"defer-create", "method":"workspace.create", "params":{"cwd":base,"focus":true,"label":"defer-start"}}).to_string());
+    let workspace = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap();
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || terminal_screen::text(&output_a.lock().unwrap().bytes, 240, 80).contains("defer-start")
+    ));
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || terminal_screen::text(&output_b.lock().unwrap().bytes, 240, 80).contains("defer-start")
+    ));
+    let healthy_pid = client_a.child.process_id().unwrap();
+    let stalled_pid = client_b.child.process_id().unwrap();
+    struct ResumeOnDrop(u32);
+    impl Drop for ResumeOnDrop {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0 as libc::pid_t, libc::SIGCONT);
+            }
+        }
+    }
+    let resume_guard = ResumeOnDrop(stalled_pid);
+    unsafe {
+        libc::kill(stalled_pid as libc::pid_t, libc::SIGSTOP);
+    }
+    send_pane_shell_command(&api_socket, pane,
+        "stty -echo; (a=$(printf '%0240d' 0 | tr 0 A); b=$(printf '%0240d' 0 | tr 0 B); i=0; while [ $i -lt 400 ]; do printf '\\033[H'; if [ $((i%2)) -eq 0 ]; then line=$a; else line=$b; fi; j=0; while [ $j -lt 80 ]; do printf '%s' \"$line\"; j=$((j+1)); done; i=$((i+1)); sleep 0.016; done) & bulk=$!");
+    // Keep real socket consumption stopped long enough for repeated coherent
+    // full surfaces to fill the bounded server slot. This is behavior evidence,
+    // not a wall-clock latency gate; the producer remains finite.
+    thread::sleep(Duration::from_secs(5));
+    if early {
+        // Observer initialization parses existing history before the phase
+        // stimulus; only new bytes contribute to phase rendezvous.
+        let mut phase_observer = action_observer::Observer::new(240, 80).unwrap();
+        let mut consumed = {
+            let bytes = output_a.lock().unwrap();
+            phase_observer.feed(&bytes.bytes, 0).unwrap();
+            bytes.bytes.len()
+        };
+        phase_observer.cancel("ACTION_DEFER_PHASE");
+        phase_observer.expect("ACTION_DEFER_PHASE".into(), 1);
+        send_pane_shell_command(&api_socket, pane, "kill \"$bulk\" 2>/dev/null; wait \"$bulk\" 2>/dev/null; printf '\\033[1;1HACTION_DEFER_PHASE'");
+        assert!(
+            wait_until(Duration::from_secs(8), Duration::from_millis(1), || {
+                let bytes = output_a.lock().unwrap();
+                let found = phase_observer
+                    .feed(&bytes.bytes[consumed..], 1)
+                    .unwrap()
+                    .iter()
+                    .any(|o| o.marker == "ACTION_DEFER_PHASE" && o.received_ns == 1);
+                consumed = bytes.bytes.len();
+                found
+            }),
+            "phase anchor requires committed outer-PTY marker"
+        );
+    }
+    let response = send_json_request(&api_socket, &serde_json::json!({"id":"defer-early-action","method":"workspace.rename","params":{"workspace_id":workspace,"label":"HealthyEarly"}}).to_string());
+    assert!(response["error"].is_null());
+    let healthy = wait_for_committed_action_label(&output_a, "HealthyEarly", 240, 80);
+    drop(resume_guard);
+    assert!(
+        healthy,
+        "healthy client presents committed action while peer stopped"
+    );
+    assert!(
+        wait_for_committed_action_label(&output_b, "HealthyEarly", 240, 80),
+        "stalled peer recovers committed action after real socket consumption resumes"
+    );
+    let server_pid = server.child.process_id().unwrap();
+    client_a.close_master();
+    client_b.close_master();
+    drop(client_a);
+    drop(client_b);
+    drop(server);
+    let trace = traces.join(format!("{server_pid}.jsonl"));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || fs::read_to_string(&trace).is_ok_and(|raw| raw.contains("process.finish"))
+    ));
+    let records: Vec<Value> = fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records.iter().any(|r| r["stage"] == "writer.deferred"),
+        "actual server render refusal validates backpressure boundary"
+    );
+    let connection_for = |pid: u32| {
+        records
+            .iter()
+            .find(|r| r["stage"] == "server.connection" && r["value"] == pid)
+            .and_then(|r| r["id"].as_u64())
+            .expect("exact connection peer PID")
+    };
+    let stalled_connection = connection_for(stalled_pid);
+    let healthy_connection = connection_for(healthy_pid);
+    assert!(
+        records.iter().any(
+            |r| r["stage"] == "server.render_deferred" && r["connection"] == stalled_connection
+        ),
+        "stalled recipient refused render enqueue"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r["stage"] == "server.enqueue" && r["connection"] == healthy_connection),
+        "healthy recipient enqueued exact bytes"
+    );
+    let early_presentations: std::collections::HashSet<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "opportunity.admitted")
+        .filter_map(|r| r["presentation"].as_u64())
+        .collect();
+    let deferred = records
+        .iter()
+        .filter(|r| r["stage"] == "writer.deferred")
+        .count();
+    eprintln!("authoritative-action recovery: server={server_pid}, stalled_client={stalled_pid}, writer_deferred={deferred}");
+    if let Some(root) = std::env::var_os("HERDR_ACTION_TEST_ARTIFACTS") {
+        let artifact = PathBuf::from(root).join(format!("backpressure-{server_pid}"));
+        fs::create_dir_all(artifact.join("traces")).unwrap();
+        for file in fs::read_dir(&traces).unwrap() {
+            let file = file.unwrap();
+            if file.file_type().unwrap().is_file() {
+                fs::copy(file.path(), artifact.join("traces").join(file.file_name())).unwrap();
+            }
+        }
+        fs::write(
+            artifact.join("client-a.pty"),
+            &output_a.lock().unwrap().bytes,
+        )
+        .unwrap();
+        fs::write(
+            artifact.join("client-b.pty"),
+            &output_b.lock().unwrap().bytes,
+        )
+        .unwrap();
+        fs::write(artifact.join("audit.json"), serde_json::to_vec_pretty(&serde_json::json!({"server_pid":server_pid,"healthy_client_pid":healthy_pid,"stalled_client_pid":stalled_pid,"healthy_connection":healthy_connection,"stalled_connection":stalled_connection,"writer_deferred":deferred,"geometry":[240,80],"stopped_seconds":5,"healthy_before_resume":healthy,"recovered":true})).unwrap()).unwrap();
+    }
+    if early {
+        assert!(
+            !early_presentations.is_empty(),
+            "post-phase committed action uses available extra token"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r["stage"] == "opportunity.action_enqueued"
+                    && r["presentation"]
+                        .as_u64()
+                        .is_some_and(|id| early_presentations.contains(&id))),
+            "healthy recipient enqueues exact early action"
+        );
+    }
+    cleanup_test_base(&base);
 }
