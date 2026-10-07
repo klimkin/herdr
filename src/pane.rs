@@ -66,6 +66,12 @@ pub(crate) struct TerminalDirtyPatchSnapshot {
     pub sgr_pixel_mouse: bool,
     pub alternate_screen_active: bool,
     pub graphics_may_have_placements: bool,
+    pub selective: Option<SelectiveTerminalSnapshot>,
+}
+
+pub(crate) struct SelectiveTerminalSnapshot {
+    pub cursor: Option<TerminalCursorState>,
+    pub synchronization_epoch: u64,
 }
 
 const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(1);
@@ -2639,7 +2645,8 @@ impl PaneRuntime {
                 observe_detection_content_change(bytes, &detection_content_seq);
                 let title_requested =
                     result.terminal_title_changed && render_dirty.request_terminal_title(pane_id);
-                let render_requested = result.request_render && render_dirty.request_pty(pane_id);
+                let render_requested = result.request_render
+                    && render_dirty.request_pty_ready(pane_id, runtime_instance, revision);
                 crate::latency_prof::runtime::notification(
                     pane_id.raw() as u64,
                     runtime_instance,
@@ -2657,7 +2664,8 @@ impl PaneRuntime {
                     let render_dirty = render_dirty.clone();
                     delay_rt.spawn(async move {
                         tokio::time::sleep(delay).await;
-                        let requested = render_dirty.request_pty(pane_id);
+                        let requested =
+                            render_dirty.request_pty_ready(pane_id, runtime_instance, revision);
                         crate::latency_prof::runtime::notification(
                             pane_id.raw() as u64,
                             runtime_instance,
@@ -2890,7 +2898,8 @@ impl PaneRuntime {
                 }
                 let title_requested =
                     result.terminal_title_changed && render_dirty.request_terminal_title(pane_id);
-                let render_requested = result.request_render && render_dirty.request_pty(pane_id);
+                let render_requested = result.request_render
+                    && render_dirty.request_pty_ready(pane_id, runtime_instance, revision);
                 crate::latency_prof::runtime::notification(
                     pane_id.raw() as u64,
                     runtime_instance,
@@ -2908,7 +2917,8 @@ impl PaneRuntime {
                     let render_dirty = render_dirty.clone();
                     rt.spawn(async move {
                         tokio::time::sleep(delay).await;
-                        let requested = render_dirty.request_pty(pane_id);
+                        let requested =
+                            render_dirty.request_pty_ready(pane_id, runtime_instance, revision);
                         crate::latency_prof::runtime::notification(
                             pane_id.raw() as u64,
                             runtime_instance,
@@ -3689,6 +3699,23 @@ impl PaneRuntime {
         area_width: u16,
         area_height: u16,
     ) -> Option<TerminalDirtyPatchSnapshot> {
+        self.collect_patch_snapshot(area_width, area_height, false)
+    }
+
+    pub(crate) fn collect_selected_patch_snapshot(
+        &self,
+        area_width: u16,
+        area_height: u16,
+    ) -> Option<TerminalDirtyPatchSnapshot> {
+        self.collect_patch_snapshot(area_width, area_height, true)
+    }
+
+    fn collect_patch_snapshot(
+        &self,
+        area_width: u16,
+        area_height: u16,
+        selective: bool,
+    ) -> Option<TerminalDirtyPatchSnapshot> {
         // PTY/resize writers announce changes before locking the terminal core.
         // Exclude them until rows and metadata have been paired with their revision.
         let _content_guard = self
@@ -3699,6 +3726,18 @@ impl PaneRuntime {
         if !revision.is_multiple_of(2) {
             return None;
         }
+        let selective = if selective {
+            let (synchronized, synchronization_epoch) = self.synchronized_output_state();
+            if synchronized {
+                return None;
+            }
+            Some(SelectiveTerminalSnapshot {
+                cursor: self.terminal.cursor_state(),
+                synchronization_epoch,
+            })
+        } else {
+            None
+        };
         let patch = self.terminal.collect_dirty_patch(area_width, area_height);
         if matches!(patch, TerminalDirtyPatchOutcome::Fallback) {
             return None;
@@ -3712,6 +3751,7 @@ impl PaneRuntime {
             alternate_screen_active: self.alternate_screen_active(),
             graphics_may_have_placements: crate::kitty_graphics::is_enabled()
                 && self.kitty_graphics_may_have_placements(),
+            selective,
         };
         (self.content_seq() == revision).then_some(snapshot)
     }

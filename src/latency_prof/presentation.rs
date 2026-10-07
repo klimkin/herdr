@@ -129,6 +129,18 @@ pub(crate) struct SerializedFrame {
     context: TraceContext,
 }
 
+/// Immutable serialization identity of the primary prepared frame. Appended
+/// native transfers carry their own identity and cannot replace this context.
+pub(crate) fn primary_context(frames: &[SerializedFrame]) -> TraceContext {
+    #[cfg(feature = "latency-prof")]
+    if let Some(frame) = frames.first() {
+        return frame.context;
+    }
+    #[cfg(not(feature = "latency-prof"))]
+    let _ = frames;
+    TraceContext::default()
+}
+
 pub(crate) fn serialized(
     msg: &crate::protocol::ServerMessage,
     framed: &[u8],

@@ -431,6 +431,14 @@ impl TerminalRuntime {
         self.0.collect_dirty_patch_snapshot(area_width, area_height)
     }
 
+    pub(crate) fn collect_selected_patch_snapshot(
+        &self,
+        width: u16,
+        height: u16,
+    ) -> Option<crate::pane::TerminalDirtyPatchSnapshot> {
+        self.0.collect_selected_patch_snapshot(width, height)
+    }
+
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.0.visible_hyperlinks(area)
     }

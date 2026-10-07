@@ -7,6 +7,8 @@ pub(crate) enum PresentationPolicy {
     #[default]
     Ordinary,
     ActionFull,
+    Target,
+    TargetAll,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -19,6 +21,8 @@ impl ExperimentConfig {
         let presentation = match std::env::var("HERDR_LATENCY_PRESENTATION").as_deref() {
             Err(std::env::VarError::NotPresent) | Ok("ordinary") => PresentationPolicy::Ordinary,
             Ok("action-full") => PresentationPolicy::ActionFull,
+            Ok("target") => PresentationPolicy::Target,
+            Ok("target-all") => PresentationPolicy::TargetAll,
             _ => return Err(invalid("unknown HERDR_LATENCY_PRESENTATION selector")),
         };
         for (name, control) in [
