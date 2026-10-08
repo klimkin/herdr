@@ -161,6 +161,17 @@ pub(crate) fn render_scrollbar_buffer(
     }
 }
 
+pub(crate) fn pane_scrollbar_style(
+    palette: &crate::app::state::Palette,
+    focused: bool,
+) -> (Color, Color, &'static str) {
+    if focused {
+        (palette.overlay0, palette.overlay1, "▐")
+    } else {
+        (palette.surface_dim, palette.overlay0, "▕")
+    }
+}
+
 pub(crate) fn render_pane_scrollbar_buffer(
     buffer: &mut Buffer,
     metrics: crate::pane::ScrollMetrics,
@@ -168,11 +179,7 @@ pub(crate) fn render_pane_scrollbar_buffer(
     palette: &crate::app::state::Palette,
     focused: bool,
 ) {
-    let (track_color, thumb_color, thumb_symbol) = if focused {
-        (palette.overlay0, palette.overlay1, "▐")
-    } else {
-        (palette.surface_dim, palette.overlay0, "▕")
-    };
+    let (track_color, thumb_color, thumb_symbol) = pane_scrollbar_style(palette, focused);
     render_scrollbar_buffer(
         buffer,
         metrics,
