@@ -160,14 +160,96 @@ impl TerminalReceipts {
                     },
                 );
             }
-            app.early_presentation.acknowledge_terminal(
+            if let Some(advance) = app.early_presentation.acknowledge_terminal(
                 &receipt.terminal_id,
                 receipt.runtime_instance,
                 receipt.revision,
                 client_id,
                 context,
-            );
+            ) {
+                if app.render_dirty.advance_target_ready(&advance) {
+                    app.render_notify.notify_one();
+                }
+            }
         }
         app.prune_terminal_feedback();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::early_presentation::{EarlyPresentation, TerminalPlacement};
+    use crate::latency_experiments::PresentationPolicy;
+
+    #[tokio::test]
+    async fn ordinary_enqueue_preserves_feedback_and_wakes_newer_pending_output() {
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("feedback"));
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane)
+            .expect("test terminal")
+            .clone();
+        let (runtime, _receiver) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        let runtime = app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("test runtime");
+        let instance = runtime.runtime_instance();
+        let now = std::time::Instant::now();
+        app.early_presentation = EarlyPresentation::new(PresentationPolicy::Target);
+        let opportunity = app
+            .early_presentation
+            .accepted_terminal(
+                terminal_id.clone(),
+                TerminalPlacement {
+                    workspace_id: app.state.workspaces[0].id.clone(),
+                    tab_root: pane,
+                    pane_id: pane,
+                    public_pane_id: "w1:p1".into(),
+                },
+                instance,
+                20,
+                None,
+                now,
+            )
+            .expect("accepted test input");
+        app.render_dirty.arm_target_ready(
+            pane,
+            instance,
+            20,
+            opportunity.expires_at,
+            opportunity.id,
+        );
+        app.render_dirty.request_pty_ready(pane, instance, 22);
+        app.render_dirty.request_pty_ready(pane, instance, 24);
+        app.render_dirty.take_pending().complete();
+        assert!(!app.render_dirty.is_pending());
+        let receipt = TerminalReceipts(vec![TargetEnqueue {
+            pane_id: "w1:p1".into(),
+            terminal_id,
+            runtime_instance: instance,
+            revision: 22,
+        }]);
+        receipt.acknowledge(&mut app, 4, crate::latency_prof::TraceContext::default());
+        assert!(app.render_dirty.has_pending_source(pane));
+        assert!(app.early_presentation.contains(opportunity.id));
+        assert!(app.early_presentation.admit(
+            opportunity.id,
+            now + std::time::Duration::from_millis(1),
+            false
+        ));
     }
 }

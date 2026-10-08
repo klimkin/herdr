@@ -1,4 +1,79 @@
 #[test]
+fn target_report_distinguishes_delivery_floor_advance_from_retirement() {
+    let script = r#"
+import copy,sys
+sys.path.insert(0,'scripts')
+from latency_target_report import target_opportunities,target_deliveries
+records=[
+ {'stage':'opportunity.terminal_granted','pid':1,'id':7,'scope':31,'value':20,'runtime_instance':50,'ns':100},
+ {'stage':'opportunity.input','pid':1,'id':9,'value':7,'service':90,'ns':100},
+ {'stage':'opportunity.input_accepted','pid':1,'id':9,'value':1,'service':90,'ns':99},
+ {'stage':'opportunity.target_pane','pid':1,'id':7,'value':41,'runtime_instance':50,'ns':100},
+ {'stage':'opportunity.terminal_presented','pid':1,'id':7,'scope':4,'value':22,'runtime_instance':50,'presentation':101,'attempt':102,'serialization':103,'ns':125},
+ {'stage':'opportunity.terminal_floor_advanced','pid':1,'id':7,'scope':4,'value':22,'runtime_instance':50,'presentation':101,'attempt':102,'serialization':103,'ns':126},
+ {'stage':'surface.content','pid':1,'id':41,'scope':777,'value':22,'runtime_instance':50,'presentation':101,'attempt':102,'serialization':103,'ns':120},
+ {'stage':'server.enqueue','pid':1,'id':777,'scope':60,'connection':30,'occurrence':6,'presentation':101,'attempt':102,'serialization':103,'ns':124},
+ {'stage':'server.connection','pid':1,'id':30,'scope':4,'value':2,'ns':90},
+ {'stage':'opportunity.expires_at','pid':1,'id':7,'value':200,'ns':100},
+ {'stage':'server.frame_start','pid':1,'id':102,'presentation':101,'attempt':102,'ns':111},
+ {'stage':'server.target_enqueued','pid':1,'id':41,'scope':4,'value':22,'runtime_instance':50,'presentation':101,'attempt':102,'serialization':103,'ns':125},
+]
+delivery=target_deliveries(records)[0]
+assert delivery['status']=='ordinary_enqueued' and delivery['revision']==22
+assert delivery['floor_advanced'] and not delivery['retired']
+window=target_opportunities(records)[0]
+assert window['status']=='pending' and window['presented_revision']==22
+# A later early admission must not invalidate an earlier ordinary delivery.
+later=[]
+for record in records:
+ if record['stage'] in ('opportunity.terminal_presented','surface.content','server.enqueue','server.frame_start','server.target_enqueued'):
+  record=copy.deepcopy(record)
+  record['ns']+=30
+  for field in ('presentation','attempt','serialization'):
+   if field in record:record[field]+=10
+  if record['stage']=='server.frame_start':record['id']+=10
+  if record['stage']=='server.enqueue':record['occurrence']+=1
+  if record['stage'] in ('opportunity.terminal_presented','surface.content','server.target_enqueued'):record['value']=24
+  later.append(record)
+later.append({'stage':'opportunity.early_terminal_admitted','pid':1,'id':7,'presentation':111,'ns':140})
+retirement=copy.deepcopy(next(r for r in later if r['stage']=='opportunity.terminal_presented'))
+retirement['stage']='opportunity.terminal_enqueued'
+later.append(retirement)
+rows=target_deliveries(records+later)
+assert [row['status'] for row in rows]==['ordinary_enqueued','early_enqueued'],rows
+assert rows[0]['floor_advanced'] and not rows[0]['retired']
+assert rows[1]['retired'] and not rows[1]['floor_advanced']
+for change in ('duplicate','missing_surface','wrong_runtime','wrong_queue','missing_success','missing_lifecycle','conflicting_lifecycle'):
+ broken=copy.deepcopy(records)
+ if change=='duplicate':broken.append(copy.deepcopy(records[4]))
+ if change=='missing_surface':broken.remove(next(r for r in broken if r['stage']=='surface.content'))
+ if change=='wrong_runtime':next(r for r in broken if r['stage']=='opportunity.terminal_presented')['runtime_instance']=51
+ if change=='wrong_queue':next(r for r in broken if r['stage']=='server.enqueue')['occurrence']=0
+ if change=='missing_success':broken.remove(next(r for r in broken if r['stage']=='server.target_enqueued'))
+ if change=='missing_lifecycle':broken.remove(next(r for r in broken if r['stage']=='opportunity.terminal_floor_advanced'))
+ if change=='conflicting_lifecycle':
+  extra=copy.deepcopy(next(r for r in broken if r['stage']=='opportunity.terminal_floor_advanced'))
+  extra['stage']='opportunity.terminal_enqueued'
+  broken.append(extra)
+ assert all(row['status']=='unassigned' for row in target_deliveries(broken)),change
+ assert target_opportunities(broken)[0]['status']=='unassigned',change
+records.append({'stage':'opportunity.expired','pid':1,'id':7,'ns':201})
+assert target_opportunities(records)[0]['status']=='expired'
+records[-1]={'stage':'opportunity.revoked','pid':1,'id':7,'ns':150}
+assert target_opportunities(records)[0]['status']=='revoked'
+"#;
+    let output = std::process::Command::new("python3")
+        .args(["-c", script])
+        .output()
+        .expect("public delivery report");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn target_report_requires_exact_accepted_runtime_revision_and_queue_occurrence() {
     let script = r#"
 import copy,sys

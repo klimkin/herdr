@@ -1639,15 +1639,26 @@ fn terminal_feedback_candidate_case(policy: &str) {
         "neutral plus all four whole echo inputs are accepted"
     );
     for outcome in admitted {
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| record["stage"] == "opportunity.input"
+        let association = records
+            .iter()
+            .filter(|record| {
+                record["stage"] == "opportunity.input"
                     && record["id"] == outcome["id"]
-                    && record["service"] == outcome["service"])
-                .count(),
+                    && record["service"] == outcome["service"]
+            })
+            .count();
+        let unavailable = records
+            .iter()
+            .filter(|record| {
+                record["stage"] == "opportunity.input_no_baseline"
+                    && record["id"] == outcome["id"]
+                    && record["service"] == outcome["service"]
+            })
+            .count();
+        assert_eq!(
+            association + unavailable,
             1,
-            "quiescent selected input has one exact event/service opportunity association"
+            "accepted input has an exact grant or explicit unavailable baseline"
         );
     }
     assert!(
@@ -1829,7 +1840,7 @@ fn selected_cursor_only_feedback_moves_committed_host_cursor() {
     assert!(
         records
             .iter()
-            .any(|record| record["stage"] == "opportunity.terminal_enqueued"
+            .any(|record| record["stage"] == "opportunity.terminal_presented"
                 && record["attempt"] == cursor_attempt["attempt"]),
         "cursor-only selected attempt owns an exact successful target enqueue"
     );
@@ -1936,7 +1947,7 @@ fn selected_unfocused_terminal_keeps_committed_focused_cursor() {
     assert!(
         records
             .iter()
-            .any(|record| record["stage"] == "opportunity.terminal_enqueued"
+            .any(|record| record["stage"] == "opportunity.terminal_presented"
                 && record["attempt"] == preserved["attempt"]),
         "selected unfocused target owns exact successful receipt on preserving attempt"
     );
