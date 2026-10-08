@@ -76,7 +76,10 @@ impl EarlyPresentation {
     }
 
     pub(crate) fn actions_enabled(&self) -> bool {
-        self.policy == PresentationPolicy::ActionFull
+        matches!(
+            self.policy,
+            PresentationPolicy::ActionFull | PresentationPolicy::ActionFullTarget
+        )
     }
 
     pub(crate) fn accepted_action(
@@ -244,7 +247,9 @@ impl EarlyPresentation {
     pub(crate) fn terminal_enabled(&self) -> bool {
         matches!(
             self.policy,
-            PresentationPolicy::Target | PresentationPolicy::TargetAll
+            PresentationPolicy::Target
+                | PresentationPolicy::TargetAll
+                | PresentationPolicy::ActionFullTarget
         )
     }
 
@@ -484,4 +489,79 @@ fn record_opportunity_times(id: u64, times: (u64, u64)) {
     let ns = crate::latency_prof::now();
     crate::latency_prof::record_at("opportunity.accepted_at", id, times.0, 0, ns);
     crate::latency_prof::record_at("opportunity.expires_at", id, times.1, 0, ns);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn placement() -> TerminalPlacement {
+        TerminalPlacement {
+            workspace_id: "w1".into(),
+            tab_root: crate::layout::PaneId::alloc(),
+            pane_id: crate::layout::PaneId::alloc(),
+            public_pane_id: "w1:p1".into(),
+        }
+    }
+
+    fn accept_both(presentation: &mut EarlyPresentation, now: Instant) -> Option<Opportunity> {
+        presentation.accepted_action("w1".into(), "label".into(), "request".into(), now);
+        presentation.accepted_terminal(
+            crate::terminal::TerminalId::alloc(),
+            placement(),
+            1,
+            2,
+            None,
+            now,
+        )
+    }
+
+    fn action_id(presentation: &mut EarlyPresentation, now: Instant) -> Option<u64> {
+        presentation
+            .oldest_ready(now, |opportunity| {
+                matches!(opportunity.work, Work::Action { .. })
+            })
+            .map(|opportunity| opportunity.id)
+    }
+
+    #[test]
+    fn single_policies_keep_the_other_kind_disabled() {
+        let now = Instant::now();
+        let mut action = EarlyPresentation::new(PresentationPolicy::ActionFull);
+        assert!(accept_both(&mut action, now).is_none());
+        assert!(action_id(&mut action, now).is_some());
+
+        let mut target = EarlyPresentation::new(PresentationPolicy::Target);
+        assert!(accept_both(&mut target, now).is_some());
+        assert!(action_id(&mut target, now).is_none());
+
+        let mut ordinary = EarlyPresentation::new(PresentationPolicy::Ordinary);
+        assert!(accept_both(&mut ordinary, now).is_none());
+        assert!(!ordinary.pending());
+    }
+
+    #[test]
+    fn combined_policy_accepts_both_kinds_under_one_admission_budget() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new(PresentationPolicy::ActionFullTarget);
+        assert!(presentation.actions_enabled() && presentation.terminal_enabled());
+        let terminal = accept_both(&mut presentation, now).expect("terminal opportunity");
+        let action = action_id(&mut presentation, now).expect("action opportunity");
+
+        assert!(presentation.admit(action, now, false));
+        // One global early frame per interval, whichever kind asked first.
+        assert!(!presentation.admit(terminal.id, now + Duration::from_millis(15), false));
+        assert!(!presentation.admit(terminal.id, now + INTERVAL, false));
+    }
+
+    #[test]
+    fn combined_policy_never_preempts_a_due_ordinary_frame() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new(PresentationPolicy::ActionFullTarget);
+        let terminal = accept_both(&mut presentation, now).expect("terminal opportunity");
+        let action = action_id(&mut presentation, now).expect("action opportunity");
+        assert!(!presentation.admit(action, now, true));
+        assert!(!presentation.admit(terminal.id, now, true));
+        assert!(presentation.admit(terminal.id, now, false));
+    }
 }

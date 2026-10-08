@@ -310,6 +310,12 @@ Neither policy changes the ordinary presentation interval or adds an expiry,
 refill, or idle timer. macOS and Windows keep native experiment support disabled.
 The default stays `ordinary`; queue selectors remain `current` and `64`.
 
+`action-full+target` enables both `action-full` and `target` together. Action
+and terminal opportunities stay separate, but they share the single global
+extra attempt per 16 ms, so the combination never adds a second early frame
+within one interval. An early action frame is a full frame and also carries any
+ready target echo.
+
 Compare both policies with the same recording-disabled binary:
 
 ```sh
