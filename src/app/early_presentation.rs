@@ -42,20 +42,44 @@ pub(crate) struct Opportunity {
     pub(crate) expires_at: Instant,
     pub(crate) origin: Option<OriginLease>,
     pub(crate) work: Work,
-    attempted: bool,
+    attempts: u8,
+    awaiting_delivery: bool,
     #[cfg(feature = "latency-prof")]
     diagnostic_times: (u64, u64),
 }
 
-/// Successful ordinary delivery advances only the matching unused ready latch.
+/// Server-local construction ownership, independent of published surface codecs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalAttempt {
+    pub(crate) opportunity: u64,
+    pub(crate) ordinal: u8,
+}
+
+/// Successful delivery advances the matching lease without renewing its budget.
 pub(crate) struct TerminalFeedbackAdvance {
     pub(crate) pane_id: crate::layout::PaneId,
     pub(crate) runtime_instance: u64,
     pub(crate) revision: u64,
     pub(crate) opportunity: u64,
+    pub(crate) wake_allowed: bool,
 }
 
 impl Opportunity {
+    fn can_attempt(&self, policy: PresentationPolicy) -> bool {
+        let limit = if matches!(self.work, Work::Terminal { .. })
+            && policy != PresentationPolicy::TargetAll
+        {
+            2
+        } else {
+            1
+        };
+        self.attempts < limit && !self.awaiting_delivery
+    }
+
+    fn expensive(&self, policy: PresentationPolicy) -> bool {
+        matches!(self.work, Work::Action { .. }) || policy == PresentationPolicy::TargetAll
+    }
+
     fn target_key(&self) -> &str {
         match &self.work {
             Work::Action { workspace_id, .. } => workspace_id,
@@ -68,7 +92,9 @@ pub(crate) struct EarlyPresentation {
     policy: PresentationPolicy,
     opportunities: Vec<Opportunity>,
     next_id: u64,
-    last_admission: Option<Instant>,
+    admissions: [Option<Instant>; 2],
+    last_expensive: Option<Instant>,
+    active_terminal_attempt: Option<TerminalAttempt>,
     pub(crate) origin: Option<OriginLease>,
 }
 
@@ -78,7 +104,9 @@ impl EarlyPresentation {
             policy,
             opportunities: Vec::new(),
             next_id: 1,
-            last_admission: None,
+            admissions: [None; 2],
+            last_expensive: None,
+            active_terminal_attempt: None,
             origin: None,
         }
     }
@@ -147,7 +175,8 @@ impl EarlyPresentation {
                 label,
                 request_id,
             },
-            attempted: false,
+            attempts: 0,
+            awaiting_delivery: false,
             #[cfg(feature = "latency-prof")]
             diagnostic_times,
         });
@@ -161,7 +190,7 @@ impl EarlyPresentation {
         self.expire(now);
         self.opportunities
             .iter()
-            .filter(|o| !o.attempted && ready(o))
+            .filter(|o| o.can_attempt(self.policy) && ready(o))
             .min_by(|left, right| {
                 left.accepted_at
                     .cmp(&right.accepted_at)
@@ -174,22 +203,41 @@ impl EarlyPresentation {
         if ordinary_due {
             return false;
         }
-        if self
-            .last_admission
-            .is_some_and(|last| now.saturating_duration_since(last) < INTERVAL)
-        {
-            crate::latency_prof::record("opportunity.token_denied", id, 0);
-            return false;
-        }
         let Some(opportunity) = self
             .opportunities
-            .iter_mut()
-            .find(|o| o.id == id && !o.attempted && now < o.expires_at)
+            .iter()
+            .find(|o| o.id == id && o.can_attempt(self.policy) && now < o.expires_at)
         else {
             return false;
         };
-        opportunity.attempted = true;
-        self.last_admission = Some(now);
+        let expensive = opportunity.expensive(self.policy);
+        if !self.capacity(now, expensive) {
+            crate::latency_prof::record("opportunity.token_denied", id, 0);
+            return false;
+        }
+        for admission in &mut self.admissions {
+            if admission.is_some_and(|last| now.saturating_duration_since(last) >= INTERVAL) {
+                *admission = None;
+            }
+        }
+        let Some(slot) = self.admissions.iter_mut().find(|slot| slot.is_none()) else {
+            return false;
+        };
+        *slot = Some(now);
+        if expensive {
+            self.last_expensive = Some(now);
+        }
+        let Some(opportunity) = self.opportunities.iter_mut().find(|o| o.id == id) else {
+            return false;
+        };
+        opportunity.attempts += 1;
+        opportunity.awaiting_delivery = true;
+        if matches!(opportunity.work, Work::Terminal { .. }) {
+            self.active_terminal_attempt = Some(TerminalAttempt {
+                opportunity: id,
+                ordinal: opportunity.attempts,
+            });
+        }
         #[cfg(feature = "latency-prof")]
         if crate::latency_prof::active() {
             let anchor = Instant::now();
@@ -202,6 +250,33 @@ impl EarlyPresentation {
             crate::latency_prof::record_at("opportunity.charged_at", id, charged_ns, 0, anchor_ns);
         }
         true
+    }
+
+    fn capacity(&self, now: Instant, expensive: bool) -> bool {
+        self.admissions
+            .iter()
+            .any(|slot| slot.is_none_or(|last| now.saturating_duration_since(last) >= INTERVAL))
+            && (!expensive
+                || self
+                    .last_expensive
+                    .is_none_or(|last| now.saturating_duration_since(last) >= INTERVAL))
+    }
+
+    pub(crate) fn terminal_attempt(
+        &self,
+        terminal: &crate::terminal::TerminalId,
+    ) -> Option<TerminalAttempt> {
+        self.active_terminal_attempt.filter(|attempt| {
+            self.opportunities.iter().any(|o| {
+                o.id == attempt.opportunity
+                    && matches!(&o.work,
+                Work::Terminal { terminal_id, .. } if terminal_id == terminal)
+            })
+        })
+    }
+
+    pub(crate) fn finish_terminal_attempt(&mut self) {
+        self.active_terminal_attempt = None;
     }
 
     pub(crate) fn acknowledge_action(
@@ -338,7 +413,8 @@ impl EarlyPresentation {
                 runtime_instance,
                 baseline_revision,
             },
-            attempted: false,
+            attempts: 0,
+            awaiting_delivery: false,
             #[cfg(feature = "latency-prof")]
             diagnostic_times,
         };
@@ -353,6 +429,7 @@ impl EarlyPresentation {
         revision: u64,
         client_id: u64,
         context: crate::latency_prof::TraceContext,
+        attempt: Option<TerminalAttempt>,
     ) -> Option<TerminalFeedbackAdvance> {
         if !self.terminal_enabled()
             || runtime_instance == 0
@@ -363,6 +440,8 @@ impl EarlyPresentation {
         }
         self.expire(Instant::now());
         let mut advance = None;
+        let policy = self.policy;
+        let capacity = self.capacity(Instant::now(), policy == PresentationPolicy::TargetAll);
         self.opportunities.retain_mut(|opportunity| {
             let Work::Terminal {
                 terminal_id: target,
@@ -379,6 +458,15 @@ impl EarlyPresentation {
             {
                 return true;
             }
+            let matching_delivery = attempt.is_some_and(|attempt| {
+                opportunity.awaiting_delivery
+                    && attempt.opportunity == opportunity.id
+                    && attempt.ordinal == opportunity.attempts
+            });
+            // An ordinary or stale saved frame cannot unlock a charged construction.
+            if (opportunity.awaiting_delivery || attempt.is_some()) && !matching_delivery {
+                return true;
+            }
             #[cfg(feature = "latency-prof")]
             crate::latency_prof::record_context_at(
                 "opportunity.terminal_presented",
@@ -391,13 +479,21 @@ impl EarlyPresentation {
                     ..context
                 },
             );
-            if !opportunity.attempted {
+            opportunity.awaiting_delivery = false;
+            let remaining = opportunity.attempts
+                < if policy == PresentationPolicy::TargetAll {
+                    1
+                } else {
+                    2
+                };
+            if remaining {
                 *baseline_revision = revision;
                 advance = Some(TerminalFeedbackAdvance {
                     pane_id: placement.pane_id,
                     runtime_instance,
                     revision,
                     opportunity: opportunity.id,
+                    wake_allowed: capacity,
                 });
                 #[cfg(feature = "latency-prof")]
                 crate::latency_prof::record_context_at(
@@ -605,8 +701,8 @@ mod tests {
         let action = action_id(&mut presentation, now).expect("action opportunity");
 
         assert!(presentation.admit(action, now, false));
-        // One global early frame per interval, whichever kind asked first.
-        assert!(!presentation.admit(terminal.id, now + Duration::from_millis(15), false));
+        // Selected work can use the second global slot after expensive work.
+        assert!(presentation.admit(terminal.id, now + Duration::from_millis(15), false));
         assert!(!presentation.admit(terminal.id, now + INTERVAL, false));
     }
 
@@ -636,6 +732,7 @@ mod tests {
             22,
             4,
             crate::latency_prof::TraceContext::default(),
+            None,
         );
         let ready = presentation
             .oldest_ready(now + Duration::from_millis(2), |opportunity| {
@@ -652,16 +749,21 @@ mod tests {
             }
         ));
         assert!(presentation.admit(ready.id, now + Duration::from_millis(2), false));
-        presentation.acknowledge_terminal(
-            &terminal_id,
-            1,
-            24,
-            4,
-            crate::latency_prof::TraceContext::default(),
-        );
+        let attempt = presentation.terminal_attempt(&terminal_id);
+        presentation.finish_terminal_attempt();
+        assert!(presentation
+            .acknowledge_terminal(
+                &terminal_id,
+                1,
+                24,
+                4,
+                crate::latency_prof::TraceContext::default(),
+                attempt
+            )
+            .is_some());
         assert!(
-            !presentation.pending(),
-            "spent feedback retires after delivery"
+            presentation.pending(),
+            "first delivery retains one follow-up"
         );
     }
 
@@ -676,19 +778,19 @@ mod tests {
             .expect("accepted input opportunity");
         let context = crate::latency_prof::TraceContext::default();
         assert!(presentation
-            .acknowledge_terminal(&terminal_id, 1, 22, 4, context)
+            .acknowledge_terminal(&terminal_id, 1, 22, 4, context, None)
             .is_some());
         assert!(presentation
-            .acknowledge_terminal(&terminal_id, 1, 22, 5, context)
+            .acknowledge_terminal(&terminal_id, 1, 22, 5, context, None)
             .is_none());
         assert!(presentation
-            .acknowledge_terminal(&terminal_id, 1, 20, 5, context)
+            .acknowledge_terminal(&terminal_id, 1, 20, 5, context, None)
             .is_none());
         assert!(presentation
-            .acknowledge_terminal(&terminal_id, 2, 24, 5, context)
+            .acknowledge_terminal(&terminal_id, 2, 24, 5, context, None)
             .is_none());
         assert!(presentation
-            .acknowledge_terminal(&terminal_id, 1, 23, 5, context)
+            .acknowledge_terminal(&terminal_id, 1, 23, 5, context, None)
             .is_none());
         let coalesced = presentation
             .accepted_terminal(
@@ -723,9 +825,15 @@ mod tests {
         assert_eq!(coalesced.id, opportunity.id);
         assert!(!presentation.admit(opportunity.id, now + Duration::from_millis(4), false));
         assert!(presentation
-            .acknowledge_terminal(&terminal_id, 1, 24, 5, context)
+            .acknowledge_terminal(&terminal_id, 1, 24, 5, context, None)
             .is_none());
-        assert!(!presentation.pending());
+        assert!(
+            presentation.pending(),
+            "ordinary delivery cannot unlock charged work"
+        );
+        assert!(presentation
+            .oldest_ready(now + Duration::from_millis(5), |_| true)
+            .is_none());
     }
 
     #[test]
@@ -740,9 +848,172 @@ mod tests {
             22,
             4,
             crate::latency_prof::TraceContext::default(),
+            None,
         );
         assert!(presentation
             .oldest_ready(now + INTERVAL, |_| true)
+            .is_none());
+        assert!(!presentation.pending());
+    }
+    #[test]
+    fn burst_requires_exact_delivery_and_rejects_stale_fanout() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new(PresentationPolicy::Target);
+        let terminal = crate::terminal::TerminalId::alloc();
+        let grant = presentation
+            .accepted_terminal(terminal.clone(), placement(), 1, 20, None, now)
+            .unwrap();
+        let context = crate::latency_prof::TraceContext::default();
+        assert!(presentation.admit(grant.id, now, false));
+        let first = presentation.terminal_attempt(&terminal).unwrap();
+        presentation.finish_terminal_attempt();
+        assert!(!presentation.admit(grant.id, now, false));
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 22, 1, context, None)
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 22, 1, context, Some(first))
+            .is_some());
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 22, 2, context, Some(first))
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 24, 1, context, None)
+            .is_some());
+        assert!(presentation.admit(grant.id, now + Duration::from_millis(1), false));
+        let second = presentation.terminal_attempt(&terminal).unwrap();
+        presentation.finish_terminal_attempt();
+        assert_eq!(second.ordinal, 2);
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 26, 2, context, Some(first))
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 26, 1, context, Some(second))
+            .is_none());
+        assert!(!presentation.contains(grant.id));
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 26, 2, context, Some(first))
+            .is_none());
+        assert!(!presentation.admit(grant.id, now + Duration::from_millis(2), false));
+    }
+
+    #[test]
+    fn rolling_budget_survives_cancellation_and_expires_at_exact_boundary() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new(PresentationPolicy::Target);
+        for offset in [0, 1] {
+            let terminal = crate::terminal::TerminalId::alloc();
+            let grant = presentation
+                .accepted_terminal(terminal.clone(), placement(), 1, 2, None, now)
+                .unwrap();
+            assert!(presentation.admit(grant.id, now + Duration::from_millis(offset), false));
+            presentation.finish_terminal_attempt();
+            presentation.cancel_terminal(&terminal);
+        }
+        let grant = presentation
+            .accepted_terminal(
+                crate::terminal::TerminalId::alloc(),
+                placement(),
+                1,
+                2,
+                None,
+                now + Duration::from_millis(2),
+            )
+            .unwrap();
+        assert!(!presentation.admit(grant.id, now + INTERVAL - Duration::from_nanos(1), false));
+        assert!(presentation.admit(grant.id, now + INTERVAL, false));
+    }
+
+    #[test]
+    fn expensive_work_keeps_its_single_rolling_allowance() {
+        let now = Instant::now();
+        for policy in [
+            PresentationPolicy::ActionFullTarget,
+            PresentationPolicy::TargetAll,
+        ] {
+            let mut presentation = EarlyPresentation::new(policy);
+            let first = presentation
+                .accepted_terminal(
+                    crate::terminal::TerminalId::alloc(),
+                    placement(),
+                    1,
+                    2,
+                    None,
+                    now,
+                )
+                .unwrap();
+            assert!(presentation.admit(first.id, now, false));
+            presentation.finish_terminal_attempt();
+            if policy == PresentationPolicy::ActionFullTarget {
+                presentation.accepted_action("w1".into(), "one".into(), "1".into(), now);
+                let action = presentation.opportunities.last().unwrap().id;
+                assert!(presentation.admit(action, now + Duration::from_millis(1), false));
+                presentation.accepted_action(
+                    "w2".into(),
+                    "two".into(),
+                    "2".into(),
+                    now + Duration::from_millis(2),
+                );
+                let second = presentation.opportunities.last().unwrap().id;
+                assert!(!presentation.admit(second, now + Duration::from_millis(15), false));
+                assert!(!presentation.admit(second, now + INTERVAL, false));
+                assert!(presentation.admit(
+                    second,
+                    now + INTERVAL + Duration::from_millis(1),
+                    false
+                ));
+            } else {
+                let second = presentation
+                    .accepted_terminal(
+                        crate::terminal::TerminalId::alloc(),
+                        placement(),
+                        1,
+                        2,
+                        None,
+                        now + Duration::from_millis(1),
+                    )
+                    .unwrap();
+                assert!(!presentation.admit(second.id, now + Duration::from_millis(1), false));
+                assert!(presentation.admit(second.id, now + INTERVAL, false));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_delivery_and_coalesced_input_cannot_refund_or_extend() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new(PresentationPolicy::Target);
+        let terminal = crate::terminal::TerminalId::alloc();
+        let where_ = placement();
+        let grant = presentation
+            .accepted_terminal(terminal.clone(), where_.clone(), 1, 20, None, now)
+            .unwrap();
+        assert!(presentation.admit(grant.id, now, false));
+        let saved = presentation.terminal_attempt(&terminal);
+        presentation.finish_terminal_attempt();
+        let coalesced = presentation
+            .accepted_terminal(
+                terminal.clone(),
+                where_,
+                1,
+                22,
+                None,
+                now + Duration::from_millis(15),
+            )
+            .unwrap();
+        assert_eq!(coalesced.id, grant.id);
+        assert_eq!(coalesced.expires_at, grant.expires_at);
+        assert!(!presentation.admit(grant.id, now + Duration::from_millis(15), false));
+        presentation.prune_terminals(now + INTERVAL, |_| true);
+        assert!(presentation
+            .acknowledge_terminal(
+                &terminal,
+                1,
+                22,
+                1,
+                crate::latency_prof::TraceContext::default(),
+                saved
+            )
             .is_none());
         assert!(!presentation.pending());
     }

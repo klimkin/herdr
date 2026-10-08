@@ -23,6 +23,13 @@ assert delivery['status']=='ordinary_enqueued' and delivery['revision']==22
 assert delivery['floor_advanced'] and not delivery['retired']
 window=target_opportunities(records)[0]
 assert window['status']=='pending' and window['presented_revision']==22
+
+burst=copy.deepcopy(records)
+burst.append({'stage':'opportunity.early_terminal_admitted','pid':1,'id':7,'presentation':101,'value':1,'ns':110})
+assert target_deliveries(burst)[0]['status']=='early_enqueued'
+invalid_first=copy.deepcopy(burst)
+invalid_first[-1]['value']=2
+assert target_deliveries(invalid_first)[0]['status']=='unassigned'
 # A later early admission must not invalidate an earlier ordinary delivery.
 later=[]
 for record in records:
@@ -39,6 +46,16 @@ later.append({'stage':'opportunity.early_terminal_admitted','pid':1,'id':7,'pres
 retirement=copy.deepcopy(next(r for r in later if r['stage']=='opportunity.terminal_presented'))
 retirement['stage']='opportunity.terminal_enqueued'
 later.append(retirement)
+
+second=copy.deepcopy(later)
+next(record for record in second if record['stage']=='opportunity.early_terminal_admitted')['value']=2
+rows_burst=target_deliveries(burst+second)
+assert [row['status'] for row in rows_burst]==['early_enqueued','early_enqueued'],rows_burst
+assert [row['admission_ordinal'] for row in rows_burst]==[1,2]
+assert target_opportunities(burst+second)[0]['status']=='early_enqueued'
+malformed=copy.deepcopy(second)
+next(record for record in malformed if record['stage']=='opportunity.early_terminal_admitted')['value']=1
+assert target_deliveries(burst+malformed)[1]['status']=='unassigned'
 rows=target_deliveries(records+later)
 assert [row['status'] for row in rows]==['ordinary_enqueued','early_enqueued'],rows
 assert rows[0]['floor_advanced'] and not rows[0]['retired']

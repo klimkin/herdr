@@ -11,6 +11,7 @@ pub(super) struct TargetEnqueue {
     terminal_id: TerminalId,
     runtime_instance: u64,
     revision: u64,
+    attempt: Option<crate::app::early_presentation::TerminalAttempt>,
 }
 
 impl TerminalReceipts {
@@ -50,7 +51,49 @@ impl TerminalReceipts {
             terminal_id: terminal_id.clone(),
             runtime_instance: runtime.runtime_instance(),
             revision,
+            attempt: app.early_presentation.terminal_attempt(terminal_id),
         });
+    }
+
+    /// A saved recipient cannot suppress another compatible viewer's urgency.
+    pub(super) fn has_ready_peer(
+        &self,
+        app: &App,
+        clients: &std::collections::HashMap<u64, super::clients::ClientConnection>,
+        excluded: u64,
+    ) -> bool {
+        clients.iter().any(|(id, client)| {
+            *id != excluded
+                && client.is_active_shell_client()
+                && client.writer.is_some()
+                && client.deferred_render() == super::clients::DeferredRender::None
+                && !client.render_state.requires_recompute()
+                && client
+                    .render_state
+                    .last_pane_surface()
+                    .is_some_and(|surface| {
+                        surface.projection_revision == client.shell_projection_revision
+                            && surface.frame.width == client.terminal_size.0
+                            && surface.frame.height == client.terminal_size.1
+                            && surface.popup.is_none()
+                            && surface.graphics.assets.is_empty()
+                            && surface.graphics.placements.is_empty()
+                            && surface.graphics.retained_assets.is_empty()
+                            && surface.frame.graphics.is_empty()
+                            && self.0.iter().any(|receipt| {
+                                app.terminal_runtimes.get(&receipt.terminal_id).is_some_and(
+                                    |runtime| {
+                                        runtime.runtime_instance() == receipt.runtime_instance
+                                            && !runtime.synchronized_output_active()
+                                            && !runtime.graphics_may_have_placements()
+                                    },
+                                ) && surface
+                                    .panes
+                                    .iter()
+                                    .any(|pane| pane.pane_id == receipt.pane_id)
+                            })
+                    })
+        })
     }
 
     pub(super) fn storage(&self) -> Option<usize> {
@@ -150,6 +193,7 @@ impl TerminalReceipts {
         app: &mut App,
         client_id: u64,
         context: crate::latency_prof::TraceContext,
+        recipient_ready: bool,
     ) {
         for receipt in &self.0 {
             if app
@@ -173,13 +217,15 @@ impl TerminalReceipts {
                     },
                 );
             }
-            if let Some(advance) = app.early_presentation.acknowledge_terminal(
+            if let Some(mut advance) = app.early_presentation.acknowledge_terminal(
                 &receipt.terminal_id,
                 receipt.runtime_instance,
                 receipt.revision,
                 client_id,
                 context,
+                receipt.attempt,
             ) {
+                advance.wake_allowed &= recipient_ready;
                 if app.render_dirty.advance_target_ready(&advance) {
                     app.render_notify.notify_one();
                 }
@@ -255,8 +301,14 @@ mod tests {
             terminal_id,
             runtime_instance: instance,
             revision: 22,
+            attempt: None,
         }]);
-        receipt.acknowledge(&mut app, 4, crate::latency_prof::TraceContext::default());
+        receipt.acknowledge(
+            &mut app,
+            4,
+            crate::latency_prof::TraceContext::default(),
+            true,
+        );
         assert!(app.render_dirty.has_pending_source(pane));
         assert!(app.early_presentation.contains(opportunity.id));
         assert!(app.early_presentation.admit(

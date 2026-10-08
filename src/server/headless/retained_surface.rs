@@ -478,6 +478,19 @@ impl HeadlessServer {
                 fallback!("terminal_snapshot");
             };
             destructive = true;
+            if !probe_only
+                && snapshot.graphics_may_have_placements
+                && self
+                    .app
+                    .state
+                    .workspaces
+                    .get(workspace_index)
+                    .and_then(|workspace| workspace.terminal_id(pane_id))
+                    .and_then(|terminal| self.app.early_presentation.terminal_attempt(terminal))
+                    .is_some()
+            {
+                fallback!("selected_graphics");
+            }
             terminal_receipts.capture(
                 &self.app,
                 workspace_index,
@@ -953,6 +966,7 @@ impl HeadlessServer {
                         &mut self.app,
                         client_id,
                         crate::latency_prof::presentation::primary_context(&frame_trace),
+                        client.deferred_render() == DeferredRender::None,
                     );
                     sent += 1;
                 }

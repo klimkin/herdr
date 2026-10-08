@@ -80,6 +80,7 @@ impl HeadlessServer {
                 };
                 if runtime.runtime_instance() != *runtime_instance
                     || runtime.synchronized_output_active()
+                    || runtime.graphics_may_have_placements()
                 {
                     return false;
                 }
@@ -90,14 +91,26 @@ impl HeadlessServer {
                 signal.has_pending_source(placement.pane_id)
                     && clients.values().any(|client| {
                         client.is_active_shell_client()
+                            && client.writer.is_some()
+                            && client.deferred_render()
+                                == crate::server::clients::DeferredRender::None
+                            && !client.render_state.requires_recompute()
                             && client
                                 .render_state
                                 .last_pane_surface()
                                 .is_some_and(|surface| {
-                                    surface
-                                        .panes
-                                        .iter()
-                                        .any(|pane| pane.pane_id == placement.public_pane_id)
+                                    surface.projection_revision == client.shell_projection_revision
+                                        && surface.frame.width == client.terminal_size.0
+                                        && surface.frame.height == client.terminal_size.1
+                                        && surface.popup.is_none()
+                                        && surface.graphics.assets.is_empty()
+                                        && surface.graphics.placements.is_empty()
+                                        && surface.graphics.retained_assets.is_empty()
+                                        && surface.frame.graphics.is_empty()
+                                        && surface
+                                            .panes
+                                            .iter()
+                                            .any(|pane| pane.pane_id == placement.public_pane_id)
                                 })
                     })
             });
@@ -120,12 +133,35 @@ impl HeadlessServer {
         {
             return false;
         }
+        let handled =
+            self.construct_early_terminal_feedback(&opportunity, source, *runtime_instance, now);
+        self.app.early_presentation.finish_terminal_attempt();
+        handled
+    }
+
+    fn construct_early_terminal_feedback(
+        &mut self,
+        opportunity: &crate::app::early_presentation::Opportunity,
+        source: crate::layout::PaneId,
+        runtime_instance: u64,
+        now: Instant,
+    ) -> bool {
+        #[cfg(not(feature = "latency-prof"))]
+        let _ = opportunity;
         let presentation = crate::latency_prof::PresentationTrace::selected(now, now);
         #[cfg(feature = "latency-prof")]
         crate::latency_prof::record_context_at(
             "opportunity.early_terminal_admitted",
             opportunity.id,
-            0,
+            u64::from(
+                self.app
+                    .early_presentation
+                    .terminal_attempt(match &opportunity.work {
+                        Work::Terminal { terminal_id, .. } => terminal_id,
+                        _ => return false,
+                    })
+                    .map_or(0, |attempt| attempt.ordinal),
+            ),
             0,
             crate::latency_prof::now(),
             presentation.context(),
@@ -139,7 +175,7 @@ impl HeadlessServer {
         {
             let material = self.prepare_target_pane_surface_traced(
                 source,
-                *runtime_instance,
+                runtime_instance,
                 presentation.context(),
             );
             if material != super::retained_surface::RetainedOutcome::Ready {
@@ -163,7 +199,7 @@ impl HeadlessServer {
             self.app.prune_terminal_feedback();
             return false;
         }
-        if self.render_target_pane_surface_traced(source, *runtime_instance, presentation.context())
+        if self.render_target_pane_surface_traced(source, runtime_instance, presentation.context())
             == super::retained_surface::RetainedOutcome::Handled
         {
             pending.request.pty_sources.remove(&source);
@@ -236,6 +272,15 @@ impl HeadlessServer {
                 .as_ref()
                 .is_some_and(|pending| pending.capture.valid(&self.app, client))
         });
+        let peer_ready = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.pending_feedback.as_ref())
+            .is_some_and(|pending| {
+                pending
+                    .receipts
+                    .has_ready_peer(&self.app, &self.clients, client_id)
+            });
         let Some(client) = self.clients.get_mut(&client_id) else {
             return false;
         };
@@ -266,9 +311,12 @@ impl HeadlessServer {
                 let context = crate::latency_prof::presentation::primary_context(&pending.trace);
                 client.render_state.commit_sent_frame(pending.prepared);
                 client.render_pending = followup;
-                pending
-                    .receipts
-                    .acknowledge(&mut self.app, client_id, context);
+                pending.receipts.acknowledge(
+                    &mut self.app,
+                    client_id,
+                    context,
+                    !followup || peer_ready,
+                );
                 if followup {
                     client.feedback_recovery = true;
                     self.feedback_recovery.insert(client_id);

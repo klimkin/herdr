@@ -1062,3 +1062,286 @@ async fn pending_feedback_full_request_waits_for_drain_without_polling() {
     );
     shutdown_test_runtimes(&mut server);
 }
+
+fn feedback_burst_fixture() -> (
+    HeadlessServer,
+    crate::layout::PaneId,
+    u64,
+    crate::app::early_presentation::Opportunity,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    use crate::app::early_presentation::{EarlyPresentation, TerminalPlacement};
+    let mut server = test_headless_server();
+    let pane = install_shared_view_test_runtime(&mut server);
+    let terminal = server.app.state.workspaces[0]
+        .terminal_id(pane)
+        .unwrap()
+        .clone();
+    let runtime = server.app.state.workspaces[0]
+        .test_runtimes
+        .remove(&pane)
+        .unwrap();
+    server.app.terminal_runtimes.insert(terminal, runtime);
+    let (control, render) = connect_matching_test_shell(&mut server, 27);
+    let _ = control.recv().unwrap();
+    server.render_and_stream();
+    let _ = render.recv().unwrap();
+    server.app.early_presentation =
+        EarlyPresentation::new(crate::latency_experiments::PresentationPolicy::Target);
+    let runtime = server
+        .app
+        .state
+        .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane)
+        .unwrap();
+    let instance = runtime.runtime_instance();
+    let revision = runtime.content_seq();
+    let now = Instant::now();
+    let grant = server
+        .app
+        .early_presentation
+        .accepted_terminal(
+            server.app.state.workspaces[0]
+                .terminal_id(pane)
+                .unwrap()
+                .clone(),
+            TerminalPlacement {
+                workspace_id: server.app.state.workspaces[0].id.clone(),
+                tab_root: pane,
+                pane_id: pane,
+                public_pane_id: server.app.public_pane_id(0, pane).unwrap(),
+            },
+            instance,
+            revision,
+            None,
+            now,
+        )
+        .unwrap();
+    server
+        .app
+        .render_dirty
+        .arm_target_ready(pane, instance, revision, grant.expires_at, grant.id);
+    server.app.render_dirty.take_pending().complete();
+    (server, pane, instance, grant, render)
+}
+
+#[tokio::test]
+async fn feedback_burst_presents_echo_after_older_first_output() {
+    let (mut server, pane, instance, grant, render) = feedback_burst_fixture();
+    let now = grant.accepted_at;
+    server.app.render_dirty.take_pending().complete();
+    write_shared_test_pane(&mut server, pane, b"\rOLDER");
+    server.app.render_dirty.request_pty_ready(
+        pane,
+        instance,
+        server
+            .app
+            .terminal_runtimes
+            .values()
+            .next()
+            .unwrap()
+            .content_seq(),
+    );
+    server.try_early_terminal_feedback(now);
+    let _ = render.recv().unwrap();
+    write_shared_test_pane(&mut server, pane, b"\rECHO ");
+    server.app.render_dirty.request_pty_ready(
+        pane,
+        instance,
+        server
+            .app
+            .terminal_runtimes
+            .values()
+            .next()
+            .unwrap()
+            .content_seq(),
+    );
+    server.try_early_terminal_feedback(now + Duration::from_millis(1));
+    assert!(
+        render.try_recv().is_ok(),
+        "echo must use the retained follow-up before cadence"
+    );
+    assert!(!server
+        .app
+        .early_presentation
+        .admit(grant.id, now + Duration::from_millis(2), false));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn feedback_burst_unchanged_output_spends_attempt_without_repeat() {
+    let (mut server, pane, instance, grant, render) = feedback_burst_fixture();
+    write_shared_test_pane(&mut server, pane, b"\rBASE");
+    server.app.render_dirty.request_pty_ready(
+        pane,
+        instance,
+        server
+            .app
+            .terminal_runtimes
+            .values()
+            .next()
+            .unwrap()
+            .content_seq(),
+    );
+    server.try_early_terminal_feedback(grant.accepted_at);
+    assert!(
+        render.try_recv().is_err(),
+        "unchanged cells cannot emit feedback"
+    );
+    assert!(server
+        .app
+        .early_presentation
+        .oldest_ready(grant.accepted_at, |_| true)
+        .is_none());
+    write_shared_test_pane(&mut server, pane, b"\rLATER");
+    server.app.render_dirty.request_pty_ready(
+        pane,
+        instance,
+        server
+            .app
+            .terminal_runtimes
+            .values()
+            .next()
+            .unwrap()
+            .content_seq(),
+    );
+    for _ in 0..10 {
+        server.try_early_terminal_feedback(grant.accepted_at);
+    }
+    assert!(
+        render.try_recv().is_err(),
+        "unsatisfied construction cannot repeat"
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn feedback_burst_blocked_recipient_cannot_spend_construction() {
+    let (mut server, pane, instance, grant, render) = feedback_burst_fixture();
+    server.clients.get_mut(&27).unwrap().defer_full_render();
+    write_shared_test_pane(&mut server, pane, b"\rECHO");
+    server.app.render_dirty.request_pty_ready(
+        pane,
+        instance,
+        server
+            .app
+            .terminal_runtimes
+            .values()
+            .next()
+            .unwrap()
+            .content_seq(),
+    );
+    for _ in 0..10 {
+        server.try_early_terminal_feedback(grant.accepted_at);
+    }
+    assert!(render.try_recv().is_err());
+    assert!(
+        server
+            .app
+            .early_presentation
+            .admit(grant.id, grant.accepted_at, false),
+        "all-blocked recipients must preserve construction budget"
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn feedback_burst_saved_first_delivery_retains_echo_and_budget() {
+    let (mut server, pane, instance, grant, _render) = feedback_burst_fixture();
+    let writer = ClientWriter::test_paused();
+    server.clients.get_mut(&27).unwrap().writer = Some(writer.clone());
+    writer
+        .render
+        .send_ordered(
+            HeadlessServer::frame_server_message(&ServerMessage::ReloadSoundConfig).unwrap(),
+        )
+        .unwrap();
+    write_shared_test_pane(&mut server, pane, b"\rOLDER");
+    server.app.render_dirty.request_pty_ready(
+        pane,
+        instance,
+        server
+            .app
+            .terminal_runtimes
+            .values()
+            .next()
+            .unwrap()
+            .content_seq(),
+    );
+    server.try_early_terminal_feedback(grant.accepted_at);
+    assert!(server.clients[&27].pending_feedback.is_some());
+    write_shared_test_pane(&mut server, pane, b"\rECHO");
+    server.app.render_dirty.request_pty_ready(
+        pane,
+        instance,
+        server
+            .app
+            .terminal_runtimes
+            .values()
+            .next()
+            .unwrap()
+            .content_seq(),
+    );
+    assert!(!server
+        .app
+        .early_presentation
+        .admit(grant.id, grant.accepted_at, false));
+    writer.test_drain();
+    server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 27 });
+    assert_eq!(
+        writer.test_drain().len(),
+        1,
+        "retry reuses saved first patch"
+    );
+    assert!(
+        server.feedback_recovery.contains(&27),
+        "newer echo retains recipient recovery"
+    );
+    assert!(server.app.render_dirty.has_pending_source(pane));
+    assert!(
+        server.app.early_presentation.admit(
+            grant.id,
+            grant.accepted_at + Duration::from_millis(1),
+            false
+        ),
+        "retry costs no second construction"
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn feedback_burst_graphics_output_keeps_ordinary_owner() {
+    let (mut server, pane, instance, grant, render) = feedback_burst_fixture();
+    write_shared_test_pane(
+        &mut server,
+        pane,
+        b"\x1b_Ga=T,f=32,s=1,v=1,i=41;/////w==\x1b\\",
+    );
+    assert!(server
+        .app
+        .terminal_runtimes
+        .values()
+        .next()
+        .unwrap()
+        .graphics_may_have_placements());
+    server.app.render_dirty.request_pty_ready(
+        pane,
+        instance,
+        server
+            .app
+            .terminal_runtimes
+            .values()
+            .next()
+            .unwrap()
+            .content_seq(),
+    );
+    server.try_early_terminal_feedback(grant.accepted_at);
+    assert!(render.try_recv().is_err());
+    assert!(
+        server
+            .app
+            .early_presentation
+            .admit(grant.id, grant.accepted_at, false),
+        "graphics must not spend selected text budget"
+    );
+    shutdown_test_runtimes(&mut server);
+}
