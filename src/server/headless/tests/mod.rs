@@ -3,6 +3,7 @@ use super::*;
 #[cfg(unix)]
 mod client_accept;
 mod event_fairness;
+mod foreground_input;
 mod native_graphics;
 #[path = "pane_move.rs"]
 mod pane_move_tests;
