@@ -9,6 +9,8 @@ pub(crate) enum PresentationPolicy {
     ActionFull,
     Target,
     TargetAll,
+    /// Action and selected-terminal early presentation share one budget.
+    ActionFullTarget,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -23,6 +25,7 @@ impl ExperimentConfig {
             Ok("action-full") => PresentationPolicy::ActionFull,
             Ok("target") => PresentationPolicy::Target,
             Ok("target-all") => PresentationPolicy::TargetAll,
+            Ok("action-full+target") => PresentationPolicy::ActionFullTarget,
             _ => return Err(invalid("unknown HERDR_LATENCY_PRESENTATION selector")),
         };
         for (name, control) in [

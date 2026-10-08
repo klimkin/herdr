@@ -553,9 +553,7 @@ impl HeadlessServer {
             // Extra attempts belong to the enabled experiment only. Refresh
             // time and pending work here: maintenance may cross the ordinary due
             // boundary after the baseline turn's time sample.
-            if self.app.experiments.presentation
-                == crate::latency_experiments::PresentationPolicy::ActionFull
-            {
+            if self.app.early_presentation.actions_enabled() {
                 let decision_now = Instant::now();
                 needs_render |= self.app.render_dirty.is_pending();
                 let ordinary_due = needs_render

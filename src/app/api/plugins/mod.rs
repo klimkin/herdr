@@ -1588,8 +1588,8 @@ platforms = ["linux", "macos"]
                 .expect("write child capture");
             }
             "print-probe" => {
-                let probe = std::env::var("HERDR_TEST_PLUGIN_PANE_CHILD_PROBE")
-                    .expect("probe child env");
+                let probe =
+                    std::env::var("HERDR_TEST_PLUGIN_PANE_CHILD_PROBE").expect("probe child env");
                 let cwd = std::env::current_dir().expect("probe child cwd");
                 let resolved = cwd.join(probe).canonicalize().expect("probe path");
                 println!("{}", resolved.display());
