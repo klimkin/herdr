@@ -658,6 +658,15 @@ impl TerminalRuntime {
         self.0.test_process_pty_bytes(bytes);
     }
 
+    pub(crate) fn test_process_pty_bytes_with_hook<T>(
+        &self,
+        bytes: &[u8],
+        during_update: impl FnOnce() -> T,
+    ) -> T {
+        self.0
+            .test_process_pty_bytes_with_hook(bytes, during_update)
+    }
+
     pub(crate) fn test_with_scrollback_bytes(
         cols: u16,
         rows: u16,
