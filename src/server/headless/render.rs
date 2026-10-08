@@ -224,7 +224,10 @@ impl HeadlessServer {
         needs_full_render: bool,
         needs_graphics_render: bool,
     ) -> bool {
-        needs_full_render || needs_graphics_render || self.app.render_dirty.has_immediate_work()
+        needs_full_render
+            || needs_graphics_render
+            || self.has_ready_feedback_recovery()
+            || self.app.render_dirty.has_immediate_work()
     }
 
     pub(super) fn sync_immediate_pty_sources(&self) {
@@ -387,14 +390,21 @@ impl HeadlessServer {
         &mut self,
         context: crate::latency_prof::TraceContext,
     ) -> FullRenderOutcome {
-        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context, false)
+        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context, false, false)
+    }
+
+    pub(super) fn render_feedback_recovery_traced(
+        &mut self,
+        context: crate::latency_prof::TraceContext,
+    ) {
+        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context, false, true);
     }
 
     pub(super) fn render_all_dirty_terminal_feedback(
         &mut self,
         context: crate::latency_prof::TraceContext,
     ) -> FullRenderOutcome {
-        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context, true)
+        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context, true, false)
     }
 
     #[cfg(all(test, unix))]
@@ -408,6 +418,7 @@ impl HeadlessServer {
             graphics_frame_limit,
             crate::latency_prof::TraceContext::default(),
             false,
+            false,
         );
     }
 
@@ -416,6 +427,7 @@ impl HeadlessServer {
         graphics_frame_limit: usize,
         context: crate::latency_prof::TraceContext,
         target_material_required: bool,
+        recovery_only: bool,
     ) -> FullRenderOutcome {
         let mut outcome = FullRenderOutcome {
             ordinary_work_handled: true,
@@ -423,7 +435,29 @@ impl HeadlessServer {
         let attempt = crate::latency_prof::AttemptTrace::begin(context, false, self.clients.len());
         crate::latency_prof::zone!("server.full_render");
         let full_started = crate::render_prof::timer();
-        let render_targets = render_targets(&self.clients, self.foreground_client_id);
+        let mut render_targets = render_targets(&self.clients, self.foreground_client_id);
+        if recovery_only {
+            render_targets.retain(|(id, _, _, _, _)| {
+                self.feedback_recovery.contains(id) && self.feedback_recovery_ready(*id)
+            });
+        }
+        render_targets.retain(|(id, _, _, _, _)| {
+            if let Some(client) = self.clients.get_mut(id) {
+                if client.pending_feedback.is_some() {
+                    client.defer_full_render();
+                    return false;
+                }
+            }
+            true
+        });
+        if render_targets.is_empty() && !self.clients.is_empty() {
+            // Pending recipients own full recovery behind their saved delivery;
+            // queue drain, rather than a global repaint flag, owns the wake.
+            if !recovery_only {
+                self.app.full_redraw_pending = false;
+            }
+            return outcome;
+        }
 
         if render_targets.is_empty() {
             let (cols, rows) = self.effective_size;
@@ -710,6 +744,7 @@ impl HeadlessServer {
                 }
                 shell_projection_revision = client.shell_projection_revision;
                 if !client.shell_surface_active {
+                    self.feedback_recovery.remove(&client_id);
                     client.clear_deferred_render();
                     continue;
                 }
@@ -858,6 +893,7 @@ impl HeadlessServer {
                     client.render_state.prepare_frame(frame)
                 };
             let Some(mut prepared) = prepared else {
+                self.feedback_recovery.remove(&client_id);
                 client.clear_deferred_render();
                 crate::render_prof::event("full_render.skip_identical");
                 continue;
@@ -994,6 +1030,7 @@ impl HeadlessServer {
                         client.shell_graphics_delivery = delivery;
                     }
                     terminal_receipts.retain_incorporated(prepared.incorporated_panes());
+                    self.feedback_recovery.remove(&client_id);
                     client.render_state.commit_sent_frame(prepared);
                     if self.app.early_presentation.actions_enabled() {
                         if let (Some(snapshot), Some(surface)) = (
@@ -1022,6 +1059,7 @@ impl HeadlessServer {
                     crate::render_prof::event("full_render.sent");
                 }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    self.feedback_recovery.remove(&client_id);
                     client.defer_full_render();
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
@@ -1040,7 +1078,9 @@ impl HeadlessServer {
         // Full-frame recovery is tracked per connection. A slow client must not
         // keep responsive peers on the global full-render path while it waits
         // for its render slot to drain.
-        self.app.full_redraw_pending = false;
+        if !recovery_only {
+            self.app.full_redraw_pending = false;
+        }
         crate::render_prof::duration_since("full_render.total", full_started);
         debug!(cols, rows, foreground_client_id = ?self.foreground_client_id, "rendered virtual frame(s)");
         outcome

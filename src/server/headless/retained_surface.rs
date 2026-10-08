@@ -184,6 +184,7 @@ fn retained_cursor(
 struct RetainedRecipient<'a> {
     client_id: u64,
     surface: &'a protocol::PaneSurfaceFrame,
+    capture: Option<super::super::feedback_delivery::FeedbackCapture>,
 }
 
 struct CollectedPanePatch {
@@ -201,6 +202,7 @@ struct CollectedPanePatch {
 struct RetainedRecipientUpdate {
     client_id: u64,
     patch: protocol::PaneSurfacePatch,
+    capture: Option<super::super::feedback_delivery::FeedbackCapture>,
     graphics: Option<(
         protocol::PaneSurfaceFrame,
         crate::kitty_graphics::surface::DeliveryCache,
@@ -417,6 +419,9 @@ impl HeadlessServer {
             recipients.push(RetainedRecipient {
                 client_id: *client_id,
                 surface,
+                capture: selected_instance.and_then(|_| {
+                    super::super::feedback_delivery::FeedbackCapture::new(&self.app, client)
+                }),
             });
         }
         if recipients.is_empty() {
@@ -515,7 +520,7 @@ impl HeadlessServer {
 
         let mut selected_recipient_skipped = false;
         let mut updates = Vec::with_capacity(recipients.len());
-        'recipients: for recipient in &recipients {
+        'recipients: for recipient in &mut recipients {
             let client_id = recipient.client_id;
             let surface = recipient.surface;
             let mut panes = surface.panes.clone();
@@ -717,9 +722,21 @@ impl HeadlessServer {
                 next_surface.graphics = graphics;
                 (next_surface, delivery, sources)
             });
+            if let Some(capture) = &mut recipient.capture {
+                for pane in &collected {
+                    if let Some(selective) = &pane.selective {
+                        capture.incorporate(
+                            &pane.pane_id,
+                            pane.content_revision,
+                            selective.synchronization_epoch,
+                        );
+                    }
+                }
+            }
             updates.push(RetainedRecipientUpdate {
                 client_id,
                 patch,
+                capture: recipient.capture.take(),
                 graphics,
             });
         }
@@ -804,6 +821,7 @@ impl HeadlessServer {
             let RetainedRecipientUpdate {
                 client_id,
                 patch,
+                capture,
                 mut graphics,
             } = update;
             if graphics.as_ref().is_some_and(|(surface, _, _)| {
@@ -885,8 +903,26 @@ impl HeadlessServer {
                 serialized.extend_from_slice(&file_frame);
             }
             crate::render_prof::counter("retained_surface.bytes", serialized.len() as u64);
+            if selected_instance.is_some()
+                && graphics_delivery.is_none()
+                && native_upload.is_none()
+                && !self.native_graphics.is_pending(client_id)
+                && capture
+                    .as_ref()
+                    .is_none_or(|capture| !capture.valid(&self.app, client))
+            {
+                client.defer_full_render();
+                client.feedback_recovery = true;
+                self.feedback_recovery.insert(client_id);
+                deferred += 1;
+                continue;
+            }
             let send = if native_upload.is_some() || self.native_graphics.is_pending(client_id) {
                 writer.render.send_ordered_traced(serialized, &frame_trace)
+            } else if selected_instance.is_some() && graphics_delivery.is_none() {
+                writer
+                    .render
+                    .send_admitted_feedback_traced(serialized, &frame_trace)
             } else {
                 writer.render.try_send_traced(serialized, &frame_trace)
             };
@@ -920,8 +956,32 @@ impl HeadlessServer {
                     );
                     sent += 1;
                 }
-                Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                    client.defer_full_render();
+                Err(std::sync::mpsc::TrySendError::Full(bytes)) => {
+                    if selected_instance.is_some()
+                        && graphics_delivery.is_none()
+                        && native_upload.is_none()
+                        && !self.native_graphics.is_pending(client_id)
+                    {
+                        let mut receipts = terminal_receipts.clone();
+                        receipts.retain_incorporated(prepared.incorporated_panes());
+                        let pending = capture.and_then(|capture| {
+                            super::super::feedback_delivery::PendingFeedback::new(
+                                capture,
+                                prepared,
+                                bytes,
+                                frame_trace,
+                                receipts,
+                            )
+                        });
+                        if client.pending_feedback.is_none() {
+                            client.pending_feedback = pending.map(Box::new);
+                        }
+                        if client.pending_feedback.is_none() {
+                            client.defer_full_render();
+                        }
+                    } else {
+                        client.defer_full_render();
+                    }
                     deferred += 1;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {

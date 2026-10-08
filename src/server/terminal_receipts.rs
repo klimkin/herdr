@@ -53,6 +53,19 @@ impl TerminalReceipts {
         });
     }
 
+    pub(super) fn storage(&self) -> Option<usize> {
+        let mut bytes = self
+            .0
+            .capacity()
+            .checked_mul(std::mem::size_of::<TargetEnqueue>())?;
+        for receipt in &self.0 {
+            bytes = bytes
+                .checked_add(receipt.pane_id.capacity())?
+                .checked_add(receipt.terminal_id.as_str().len())?;
+        }
+        Some(bytes)
+    }
+
     /// Comparator construction may follow a material probe with a newer PTY
     /// snapshot. A revision alone cannot certify changed target presentation.
     pub(super) fn retain_material(

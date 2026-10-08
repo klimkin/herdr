@@ -602,6 +602,10 @@ impl TerminalRuntime {
         self.0.current_size()
     }
 
+    pub(crate) fn graphics_may_have_placements(&self) -> bool {
+        self.0.kitty_graphics_may_have_placements()
+    }
+
     pub(crate) fn content_seq(&self) -> u64 {
         self.0.content_seq()
     }
