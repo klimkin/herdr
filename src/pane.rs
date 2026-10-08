@@ -4097,16 +4097,26 @@ impl PaneRuntime {
     }
 
     pub(crate) fn test_process_pty_bytes(&self, bytes: &[u8]) {
+        self.test_process_pty_bytes_with_hook(bytes, || ());
+    }
+
+    pub(crate) fn test_process_pty_bytes_with_hook<T>(
+        &self,
+        bytes: &[u8],
+        during_update: impl FnOnce() -> T,
+    ) -> T {
         let _content_write_guard = match self.content_write_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         self.content_seq.fetch_add(1, Ordering::AcqRel);
+        let result = during_update();
         let (tx, _rx) = mpsc::channel(1);
         let _ = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
         self.content_seq.fetch_add(1, Ordering::Release);
         observe_detection_content_change(bytes, &self.detection_content_seq);
         self.compression.wake();
+        result
     }
 
     pub(crate) fn test_with_scrollback_bytes(
