@@ -58,6 +58,7 @@ pub(crate) enum DeferredRender {
     #[default]
     None,
     Full,
+    Retained,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -159,6 +160,10 @@ pub(crate) struct ClientConnection {
     pub(crate) host_keyboard_report_all_active: Option<bool>,
     /// Whether an ordinary render was skipped because the render channel was full.
     pub(crate) render_pending: bool,
+    /// Queue-pressure recovery stays scoped to this recipient after writer drain.
+    pub(crate) feedback_recovery: bool,
+    /// One immutable admitted patch owns the baseline until enqueue or cancellation.
+    pub(crate) pending_feedback: Option<Box<super::feedback_delivery::PendingFeedback>>,
     /// Whether this connection receives pane surfaces and may affect presentation state.
     pub(crate) shell_surface_active: bool,
     /// Whether this shell wants host mouse capture without pane demand.
@@ -238,6 +243,8 @@ impl ClientConnection {
             outer_terminal_focus: None,
             host_keyboard_report_all_active: None,
             render_pending: false,
+            pending_feedback: None,
+            feedback_recovery: false,
             shell_surface_active: true,
             shell_mouse_capture: false,
             host_mouse_capture_active: None,
@@ -445,6 +452,8 @@ impl ClientConnection {
     pub(crate) fn deferred_render(&self) -> DeferredRender {
         if self.render_pending {
             DeferredRender::Full
+        } else if self.pending_feedback.is_some() {
+            DeferredRender::Retained
         } else {
             DeferredRender::None
         }
@@ -452,6 +461,8 @@ impl ClientConnection {
 
     pub(crate) fn clear_deferred_render(&mut self) {
         self.render_pending = false;
+        self.pending_feedback = None;
+        self.feedback_recovery = false;
     }
 
     pub(crate) fn defer_full_render(&mut self) {

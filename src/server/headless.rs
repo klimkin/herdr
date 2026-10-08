@@ -208,6 +208,7 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    feedback_recovery: HashSet<u64>,
     native_graphics: native_graphics::NativeGraphics,
     #[cfg(unix)]
     next_client_id: u64,
@@ -363,6 +364,7 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            feedback_recovery: HashSet::new(),
             native_graphics: Default::default(),
             #[cfg(unix)]
             next_client_id: 1,
@@ -469,7 +471,7 @@ impl HeadlessServer {
             }
 
             // 1. Check the coalesced render signal from PTY readers and generic runtime work.
-            if self.app.render_dirty.is_pending() {
+            if self.app.render_dirty.is_pending() || self.has_ready_feedback_recovery() {
                 needs_render = true;
                 crate::render_prof::event("render.request.signal");
             }
@@ -686,7 +688,11 @@ impl HeadlessServer {
                 if needs_full_render && !outer_title_synced {
                     self.sync_window_title();
                 }
-                if !needs_full_render && !needs_graphics_render && !pty_dirty {
+                if !needs_full_render
+                    && !needs_graphics_render
+                    && !pty_dirty
+                    && !self.has_ready_feedback_recovery()
+                {
                     // A synchronized-output OSC title can be the only pending work.
                     // Its deferred PTY repaint has its own signal; do not manufacture
                     // a full UI render for this client-local side effect.
@@ -694,7 +700,8 @@ impl HeadlessServer {
                     needs_render = false;
                     continue;
                 }
-                let hidden_only = pty_dirty
+                let hidden_only = !self.has_ready_feedback_recovery()
+                    && pty_dirty
                     && !needs_full_render
                     && !needs_graphics_render
                     && !self.pty_sources_visible_to_any_render_target(&render_request.pty_sources);
@@ -734,11 +741,15 @@ impl HeadlessServer {
                     crate::render_prof::event("render.skipped.hidden_sources");
                 } else if !needs_full_render
                     && !needs_graphics_render
-                    && self.render_retained_pane_surface_traced(
-                        &render_request.pty_sources,
-                        presentation.context(),
-                    )
+                    && (!pty_dirty
+                        || self.render_retained_pane_surface_traced(
+                            &render_request.pty_sources,
+                            presentation.context(),
+                        ))
                 {
+                    if self.has_ready_feedback_recovery() {
+                        self.render_feedback_recovery_traced(presentation.context());
+                    }
                     crate::render_prof::event("retained_surface.invoke");
                 } else {
                     crate::render_prof::event("full_render.invoke");
@@ -782,6 +793,7 @@ impl HeadlessServer {
                 if !needs_full_render
                     && !needs_graphics_render
                     && !self.app.render_dirty.is_pending()
+                    && !self.has_ready_feedback_recovery()
                 {
                     needs_render = false;
                 }
@@ -792,6 +804,10 @@ impl HeadlessServer {
             if self.app.state.should_quit || self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
+
+            // Recovery created in this turn owns an ordinary deadline even
+            // when selected work consumed the last shared dirty request.
+            needs_render |= self.has_ready_feedback_recovery();
 
             // 8. Wait for next event.
             let mut deadline = self.app.next_headless_deadline_selection(
@@ -1131,6 +1147,7 @@ impl HeadlessServer {
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
+        self.feedback_recovery.remove(&client_id);
         self.cancel_terminal_source_opportunities(client_id);
         self.app.early_presentation.cancel_client(client_id);
         self.app.prune_terminal_feedback();
@@ -2945,11 +2962,22 @@ impl HeadlessServer {
                 true
             }
             ServerEvent::ClientWriterDrained { client_id } => {
+                if self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|client| client.pending_feedback.is_some())
+                {
+                    return self.retry_pending_feedback(client_id);
+                }
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     #[cfg(feature = "latency-prof")]
                     crate::latency_prof::record("writer.feedback.orphaned", client_id, 0);
                     return false;
                 };
+                if client.feedback_recovery && client.render_pending {
+                    self.feedback_recovery.insert(client_id);
+                    return false;
+                }
                 let retry = client.take_deferred_render() != DeferredRender::None;
                 #[cfg(feature = "latency-prof")]
                 if let Some(writer) = &client.writer {

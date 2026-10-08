@@ -174,3 +174,116 @@ impl HeadlessServer {
         false
     }
 }
+
+impl HeadlessServer {
+    pub(super) fn has_ready_feedback_recovery(&self) -> bool {
+        self.feedback_recovery
+            .iter()
+            .any(|id| self.feedback_recovery_ready(*id))
+    }
+
+    pub(super) fn feedback_recovery_ready(&self, client_id: u64) -> bool {
+        let Some(client) = self.clients.get(&client_id) else {
+            return false;
+        };
+        if !client.is_active_shell_client() || client.writer.is_none() {
+            return false;
+        }
+        let Some(target) = self.shell_target_for_client(client_id) else {
+            return true;
+        };
+        let Some(tab) = self
+            .app
+            .state
+            .workspaces
+            .get(target.workspace_index)
+            .and_then(|workspace| workspace.tabs.get(target.tab_index))
+        else {
+            return true;
+        };
+        if self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id)
+            && self
+                .app
+                .state
+                .popup_pane
+                .as_ref()
+                .and_then(|popup| self.app.terminal_runtimes.get(&popup.terminal_id))
+                .is_some_and(|runtime| runtime.synchronized_output_active())
+        {
+            return false;
+        }
+        // A synchronized producer owns the next wake; do not poll its transaction.
+        !tab.panes
+            .keys()
+            .filter(|pane| !tab.zoomed || **pane == tab.layout.focused())
+            .any(|pane| {
+                self.app
+                    .state
+                    .runtime_for_pane_in_workspace(
+                        &self.app.terminal_runtimes,
+                        target.workspace_index,
+                        *pane,
+                    )
+                    .is_some_and(|runtime| runtime.synchronized_output_active())
+            })
+    }
+
+    /// Queue delivery reuses the original admitted construction and baseline.
+    pub(super) fn retry_pending_feedback(&mut self, client_id: u64) -> bool {
+        let valid = self.clients.get(&client_id).is_some_and(|client| {
+            client
+                .pending_feedback
+                .as_ref()
+                .is_some_and(|pending| pending.capture.valid(&self.app, client))
+        });
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        let Some(mut pending) = client.pending_feedback.take() else {
+            return false;
+        };
+        if !valid || self.handoff_in_progress {
+            client.request_recompute();
+            client.defer_full_render();
+            client.feedback_recovery = true;
+            self.feedback_recovery.insert(client_id);
+            return false;
+        }
+        let Some(writer) = client.writer.clone() else {
+            client.request_recompute();
+            client.defer_full_render();
+            client.feedback_recovery = true;
+            self.feedback_recovery.insert(client_id);
+            return false;
+        };
+        let bytes = std::mem::take(&mut pending.bytes);
+        match writer
+            .render
+            .send_admitted_feedback_traced(bytes, &pending.trace)
+        {
+            Ok(()) => {
+                let followup = client.render_pending || pending.capture.newer_output(&self.app);
+                let context = crate::latency_prof::presentation::primary_context(&pending.trace);
+                client.render_state.commit_sent_frame(pending.prepared);
+                client.render_pending = followup;
+                pending
+                    .receipts
+                    .acknowledge(&mut self.app, client_id, context);
+                if followup {
+                    client.feedback_recovery = true;
+                    self.feedback_recovery.insert(client_id);
+                }
+                false
+            }
+            Err(std::sync::mpsc::TrySendError::Full(bytes)) => {
+                pending.bytes = bytes;
+                client.pending_feedback = Some(pending);
+                false
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.remove_client_and_resize_if_needed(client_id);
+                false
+            }
+        }
+    }
+}

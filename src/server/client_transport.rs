@@ -297,6 +297,20 @@ impl ClientRenderWriter {
     ) -> Result<(), TrySendError<Vec<u8>>> {
         self.queue.send_ordered_traced(data, trace)
     }
+
+    /// An admitted text update depends on the older queued render baseline.
+    /// Keep both in order without widening ordinary render admission.
+    pub(crate) fn send_admitted_feedback_traced(
+        &self,
+        data: Vec<u8>,
+        trace: &[crate::latency_prof::SerializedFrame],
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        #[cfg(test)]
+        if let Some(sender) = &self.test_render {
+            return sender.try_send(data);
+        }
+        self.queue.send_ordered_traced(data, trace)
+    }
 }
 
 #[derive(Debug)]

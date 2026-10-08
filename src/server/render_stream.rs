@@ -21,6 +21,7 @@ pub(crate) enum ClientRenderState {
         surface_delta: bool,
         surface_scroll: bool,
         recompute_pending: bool,
+        delivery_epoch: u64,
     },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
     TerminalAnsi {
@@ -40,6 +41,7 @@ impl ClientRenderState {
                 surface_delta: false,
                 surface_scroll: false,
                 recompute_pending: false,
+                delivery_epoch: 0,
             },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
                 blit_encoder: BlitEncoder::new(),
@@ -68,6 +70,7 @@ impl ClientRenderState {
     }
 
     pub(crate) fn request_recompute(&mut self) {
+        self.invalidate_delivery();
         if let Self::Semantic {
             surface_delta: true,
             recompute_pending,
@@ -91,6 +94,7 @@ impl ClientRenderState {
     }
 
     pub(crate) fn reset_baseline(&mut self) {
+        self.invalidate_delivery();
         match self {
             Self::Semantic { last_surface, .. } => *last_surface = None,
             Self::TerminalAnsi {
@@ -105,11 +109,25 @@ impl ClientRenderState {
     }
 
     pub(crate) fn request_repaint(&mut self) {
+        self.invalidate_delivery();
         match self {
             Self::Semantic { last_surface, .. } => *last_surface = None,
             Self::TerminalAnsi {
                 repaint_pending, ..
             } => *repaint_pending = true,
+        }
+    }
+
+    fn invalidate_delivery(&mut self) {
+        if let Self::Semantic { delivery_epoch, .. } = self {
+            *delivery_epoch = delivery_epoch.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn delivery_epoch(&self) -> Option<u64> {
+        match self {
+            Self::Semantic { delivery_epoch, .. } => Some(*delivery_epoch),
+            Self::TerminalAnsi { .. } => None,
         }
     }
 
@@ -392,6 +410,60 @@ pub(crate) enum PreparedRender {
 }
 
 impl PreparedRender {
+    pub(super) fn retained_text_patch(&self) -> Option<&PaneSurfacePatch> {
+        match self {
+            Self::SemanticPatch {
+                encoded: Some(patch),
+                ..
+            } => Some(patch),
+            Self::SemanticPatch {
+                message: ServerMessage::PaneSurfacePatch(patch),
+                ..
+            } => Some(patch),
+            _ => None,
+        }
+    }
+
+    pub(super) fn retained_text_storage(&self) -> Option<usize> {
+        fn patch_bytes(patch: &PaneSurfacePatch) -> Option<usize> {
+            let mut bytes = std::mem::size_of::<PaneSurfacePatch>() + patch.boot_id.capacity();
+            bytes = bytes.checked_add(
+                patch.rows.capacity() * std::mem::size_of::<crate::protocol::PaneSurfacePatchRow>(),
+            )?;
+            for row in &patch.rows {
+                bytes = bytes.checked_add(
+                    row.cells.capacity() * std::mem::size_of::<crate::protocol::CellData>(),
+                )?;
+                for cell in &row.cells {
+                    bytes = bytes.checked_add(cell.symbol.capacity())?;
+                }
+            }
+            bytes = bytes.checked_add(
+                patch.panes.capacity() * std::mem::size_of::<crate::protocol::PaneSurfacePane>(),
+            )?;
+            for pane in &patch.panes {
+                bytes = bytes.checked_add(pane.pane_id.capacity())?;
+            }
+            Some(bytes)
+        }
+        let patch = self.retained_text_patch()?;
+        let mut bytes = patch_bytes(patch)?;
+        if let Self::SemanticPatch {
+            encoded: Some(_),
+            message,
+            ..
+        } = self
+        {
+            let ServerMessage::EndpointControl { kind, data } = message else {
+                return None;
+            };
+            bytes = bytes
+                .checked_add(kind.capacity())?
+                .checked_add(data.capacity())?;
+        }
+        Some(bytes)
+    }
+
     pub(crate) fn message(&self) -> &ServerMessage {
         match self {
             Self::Semantic { message, .. }
