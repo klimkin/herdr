@@ -201,6 +201,7 @@ pub(crate) struct GhosttyPaneCore {
     #[cfg(windows)]
     recent_fallback: windows_recent_fallback::Cache,
     pub render_state: crate::ghostty::RenderState,
+    dirty_scratch: Option<DirtyCollectionScratch>,
     pub kitty_keyboard: KittyKeyboardTracker,
     pub initial_default_foreground: Option<crate::ghostty::RgbColor>,
     pub initial_default_background: Option<crate::ghostty::RgbColor>,
@@ -216,6 +217,25 @@ pub(crate) struct GhosttyPaneCore {
     decscusr_tracker: DecscusrTracker,
     cursor_settle_state: CursorPositionSettleState,
     windows_powershell_prompt_cwd_reporting: bool,
+}
+
+/// Lazy per-terminal scratch; owned patch cells never borrow these buffers.
+struct DirtyCollectionScratch {
+    row_iterator: crate::ghostty::RowIterator,
+    row_cells: crate::ghostty::RowCells,
+    grapheme_bytes: Vec<u8>,
+    symbol: String,
+}
+
+impl DirtyCollectionScratch {
+    fn new() -> Result<Self, crate::ghostty::Error> {
+        Ok(Self {
+            row_iterator: crate::ghostty::RowIterator::new()?,
+            row_cells: crate::ghostty::RowCells::new()?,
+            grapheme_bytes: Vec::new(),
+            symbol: String::new(),
+        })
+    }
 }
 
 pub(crate) struct PaneTerminal {
@@ -1184,6 +1204,7 @@ impl GhosttyPaneTerminal {
                 #[cfg(windows)]
                 recent_fallback: windows_recent_fallback::Cache::default(),
                 render_state,
+                dirty_scratch: None,
                 kitty_keyboard: KittyKeyboardTracker::default(),
                 initial_default_foreground,
                 initial_default_background,
@@ -2678,6 +2699,7 @@ fn ghostty_collect_dirty_patch(
     let GhosttyPaneCore {
         terminal,
         render_state,
+        dirty_scratch,
         ..
     } = core;
     if render_state.update(terminal).is_err() {
@@ -2701,17 +2723,24 @@ fn ghostty_collect_dirty_patch(
         .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default));
     let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
 
-    let Ok(mut row_iterator) = crate::ghostty::RowIterator::new() else {
-        fallback!("row_iterator_new_error");
+    if dirty_scratch.is_none() {
+        let Ok(scratch) = DirtyCollectionScratch::new() else {
+            fallback!("scratch_new_error");
+        };
+        *dirty_scratch = Some(scratch);
+    }
+    let Some(DirtyCollectionScratch {
+        row_iterator,
+        row_cells,
+        grapheme_bytes,
+        symbol: symbol_scratch,
+    }) = dirty_scratch.as_mut()
+    else {
+        fallback!("scratch_missing");
     };
-    let Ok(mut row_cells) = crate::ghostty::RowCells::new() else {
-        fallback!("row_cells_new_error");
-    };
-    let Ok(mut rows) = render_state.populate_row_iterator(&mut row_iterator) else {
+    let Ok(mut rows) = render_state.populate_row_iterator(row_iterator) else {
         fallback!("populate_rows_error");
     };
-    let mut grapheme_bytes = Vec::new();
-    let mut symbol_scratch = String::new();
     let mut patch_rows = Vec::new();
     let blank = blank_cell_data(default_fg, default_bg);
     while let Some(y) = rows.next_dirty() {
@@ -2723,7 +2752,7 @@ fn ghostty_collect_dirty_patch(
             Ok(Some(_)) => fallback!("row_selection_present"),
             Err(_) => fallback!("row_selection_error"),
         }
-        let Ok(mut cells) = rows.populate_cells(&mut row_cells) else {
+        let Ok(mut cells) = rows.populate_cells(row_cells) else {
             fallback!("populate_cells_error");
         };
         let mut patch_cells = Vec::with_capacity(usize::from(area_width));
@@ -2757,8 +2786,8 @@ fn ghostty_collect_dirty_patch(
                 &cells,
                 basic.wide,
                 hide_kitty_placeholders,
-                &mut grapheme_bytes,
-                &mut symbol_scratch,
+                grapheme_bytes,
+                symbol_scratch,
             ) {
                 Ok(symbol) => symbol.to_owned(),
                 Err(_) => ghostty_blank_symbol_for_width(basic.wide).to_owned(),
@@ -2774,10 +2803,7 @@ fn ghostty_collect_dirty_patch(
     // been collected successfully, so a safety fallback leaves the next
     // collection with the same information.
     if !patch_rows.is_empty() {
-        let Ok(mut clear_row_iterator) = crate::ghostty::RowIterator::new() else {
-            fallback!("clear_row_iterator_new_error");
-        };
-        let Ok(mut clear_rows) = render_state.populate_row_iterator(&mut clear_row_iterator) else {
+        let Ok(mut clear_rows) = render_state.populate_row_iterator(row_iterator) else {
             fallback!("clear_populate_rows_error");
         };
         while let Some(y) = clear_rows.next_dirty() {
@@ -3759,6 +3785,66 @@ mod tests {
 
     fn rgb(r: u8, g: u8, b: u8) -> crate::ghostty::RgbColor {
         crate::ghostty::RgbColor { r, g, b }
+    }
+
+    #[test]
+    fn dirty_collection_survives_repeated_graphemes_resize_and_fallback() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(12, 4, 200).unwrap();
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+        for (text, first) in [
+            ("e\u{301}界", "e\u{301}"),
+            ("x", "x"),
+            ("\u{1f469}\u{200d}\u{1f4bb}", "\u{1f469}\u{200d}\u{1f4bb}"),
+            ("short", "s"),
+        ] {
+            pane.ghostty
+                .core
+                .lock()
+                .unwrap()
+                .terminal
+                .write(format!("\x1b[2J\x1b[H{text}").as_bytes());
+            let patch = match pane.collect_dirty_patch(12, 4) {
+                TerminalDirtyPatchOutcome::Patch(patch) => patch,
+                other => panic!("expected patch, got {other:?}"),
+            };
+            assert_eq!(patch.rows[0].1[0].symbol, first);
+            assert!(matches!(
+                pane.collect_dirty_patch(12, 4),
+                TerminalDirtyPatchOutcome::Clean
+            ));
+        }
+        pane.ghostty
+            .core
+            .lock()
+            .unwrap()
+            .terminal
+            .write(b"\x1b]8;;https://example.com\x1b\\link");
+        assert!(matches!(
+            pane.collect_dirty_patch(12, 4),
+            TerminalDirtyPatchOutcome::Fallback
+        ));
+        pane.ghostty
+            .core
+            .lock()
+            .unwrap()
+            .terminal
+            .write(b"\x1b]8;;\x1b\\\x1b[2J\x1b[Hfresh");
+        pane.resize(3, 8, 0, 0);
+        let patch = match pane.collect_dirty_patch(8, 3) {
+            TerminalDirtyPatchOutcome::Patch(patch) => patch,
+            other => panic!("expected recovery patch, got {other:?}"),
+        };
+        assert_eq!(patch.rows.len(), 3);
+        assert!(patch.rows.iter().all(|(_, cells)| cells.len() == 8));
+        assert_eq!(
+            patch.rows[0]
+                .1
+                .iter()
+                .map(|c| c.symbol.as_str())
+                .collect::<String>(),
+            "fresh   "
+        );
     }
 
     #[test]

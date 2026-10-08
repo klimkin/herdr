@@ -131,6 +131,10 @@ latency-smoke:
 latency-render-scale:
     cargo test --release --locked --bin herdr server::render_scale_benchmark::render_scale_profile -- --exact --ignored --nocapture --test-threads=1
 
+# Profile retained patch preparation at fixed geometry with 1 and 15 panes.
+bench-retained-costs:
+    cargo test --release --locked --bin herdr retained_frame_cost_profile -- --ignored --nocapture --test-threads=1
+
 # Check optional instrumentation and the public measurement/report contracts.
 latency-check:
     cargo clippy --all-targets --features latency-prof --locked -- -D warnings
