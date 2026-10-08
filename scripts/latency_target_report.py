@@ -167,15 +167,48 @@ def target_opportunities(records,strict=True,_index=None):
             early = index.records(pid,'opportunity.early_terminal_admitted',identity)
             same_presentation=False
             if early:
-                if len(early)!=1:row['status']='unassigned';rows.append(row);continue
-                same_presentation=early[0].get('presentation')==receipt['presentation']
-                prior_starts=index.presentation[(pid,'server.frame_start',early[0].get('presentation'))]
-                if not prior_starts or not grant['ns']<=early[0]['ns']<=min(start['ns'] for start in prior_starts)<=receipt['ns']:
+                early=sorted(early,key=lambda record:record['ns'])
+                # Legacy traces permit one admission without an ordinal. Burst
+                # traces must prove exactly two distinct ordered constructions.
+                if (len(early)==1 and early[0].get('value',0) not in (0,1)) or len(early)>2 or (len(early)==2 and (
+                    [record.get('value') for record in early]!=[1,2]
+                    or len({record.get('presentation') for record in early})!=2)):
                     row['status']='unassigned';rows.append(row);continue
+                if len(early)==2:
+                    first_delivery=[record for record in index.records(pid,'opportunity.terminal_floor_advanced',identity)
+                        if record.get('presentation')==early[0].get('presentation')
+                        and early[0]['ns']<=record['ns']<=early[1]['ns']]
+                    if len(first_delivery)!=1:
+                        row['status']='unassigned';rows.append(row);continue
+                    # Prove the first construction through the same exact
+                    # runtime/surface/queue joins, with only its admission visible.
+                    first=first_delivery[0]
+                    prior=RecordIndex([])
+                    prior.__dict__.update(index.__dict__)
+                    prior.identity=ChainMap({
+                        (pid,'opportunity.terminal_enqueued',identity):[first],
+                        (pid,'opportunity.early_terminal_admitted',identity):[early[0]],
+                    },index.identity)
+                    prior.input_opportunity=ChainMap({(pid,identity):[
+                        link for link in inputs if link['ns']<=first['ns']]},index.input_opportunity)
+                    if target_opportunities([grant],strict,_index=prior)[0]['status']!='early_enqueued':
+                        row['status']='unassigned';rows.append(row);continue
+                valid_admissions=True
+                for admission in early:
+                    starts=index.presentation[(pid,'server.frame_start',admission.get('presentation'))]
+                    if not starts or not grant['ns']<=admission['ns']<=min(start['ns'] for start in starts)<=receipt['ns']:
+                        valid_admissions=False;break
+                if not valid_admissions:
+                    row['status']='unassigned';rows.append(row);continue
+                matches=[admission for admission in early if admission.get('presentation')==receipt['presentation']]
+                same_presentation=len(matches)==1
+                selected=matches[0] if same_presentation else early[-1]
+                prior_starts=index.presentation[(pid,'server.frame_start',selected.get('presentation'))]
+                row['admission_ordinal']=selected.get('value',0)
                 if not same_presentation:
                     prior_fallback=any(index.fallback[(pid,start.get('attempt'))] for start in prior_starts)
-                    prior_residual=bool(index.presentation[(pid,'server.selected_revision_residual',early[0].get('presentation'))])
-                    row['prior_admission']={'presentation':early[0]['presentation'],'ns':early[0]['ns'],
+                    prior_residual=bool(index.presentation[(pid,'server.selected_revision_residual',selected.get('presentation'))])
+                    row['prior_admission']={'presentation':selected['presentation'],'ns':selected['ns'],
                         'outcome':'fallback' if prior_fallback else 'residual' if prior_residual else 'unassigned'}
             row.update(status='early_enqueued' if same_presentation else 'ordinary_enqueued',
                        pane=pane['value'], event=event['id'], service=event['service'], revision=receipt['value'],

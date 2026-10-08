@@ -1050,6 +1050,7 @@ impl HeadlessServer {
                         &mut self.app,
                         client_id,
                         crate::latency_prof::presentation::primary_context(&frame_trace),
+                        !shell_graphics_pending && !shell_assets_deferred,
                     );
                     if shell_graphics_pending || shell_assets_deferred {
                         client.defer_full_render();

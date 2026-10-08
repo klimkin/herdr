@@ -300,13 +300,18 @@ terminal/runtime. Its original 16 ms expiry remains fixed across coalesced
 input. Successful ordinary delivery advances the presented revision floor and
 preserves the unused early allowance. Later output newer than that floor can
 still request early presentation, including output arriving during enqueue.
-Changed target state can spend one global extra attempt
-per 16 ms. Unchanged state creates no early frame; empty/rejected input and
-release cleanup create no opportunity. Successful delivery after an early
-attempt retires the opportunity; failed attempts receive no refund.
-One successful recipient can retire a spent window while other recipients have
-deferred queues. Those recipients retain ordinary recovery and can still wait
-for its cadence.
+Changed target state can spend up to two global constructions per rolling 16 ms.
+The first construction stays immediate. Exact successful delivery advances the
+floor and retains one selected-text follow-up within the original input lease.
+Equal, older, or stale attempt receipts cannot renew the allowance. Ordinary
+frames can advance an unused or unlocked floor; they cannot unlock a construction
+still awaiting its own delivery.
+
+Unchanged or unsafe construction spends its attempt and waits for ordinary
+recovery without a refund. Empty/rejected input creates no opportunity. Saved
+patches retry delivery on writer drain without rebuilding or charging another
+construction. Blocked recipients cannot drive extra construction; healthy peers
+remain eligible. Graphics keep ordinary recovery. No activity extends the lease.
 
 `target` uses a coherent retained update for the selected terminal. Residual
 sources, titles, and generic work keep their ordinary deadline. Unsafe retained
@@ -317,10 +322,12 @@ refill, or idle timer. macOS and Windows keep native experiment support disabled
 The default stays `ordinary`; queue selectors remain `current` and `64`.
 
 `action-full+target` enables both `action-full` and `target` together. Action
-and terminal opportunities stay separate, but they share the single global
-extra attempt per 16 ms, so the combination never adds a second early frame
-within one interval. An early action frame is a full frame and also carries any
-ready target echo.
+and terminal opportunities stay separate and share the two-construction budget.
+Expensive action/full work, including `target-all`, remains limited to one
+construction per rolling 16 ms. The additional slot permits selected text only.
+An early action frame also carries ready target output; arbitrary output does not
+prove echo completion. Delayed or multipart responses can still exhaust the
+budget or outlive the fixed lease.
 
 Compare both policies with the same recording-disabled binary:
 

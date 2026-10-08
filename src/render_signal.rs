@@ -226,11 +226,15 @@ impl RenderSignal {
             }
             target.baseline_revision = advance.revision;
             let ready = target.ready_revision;
-            let wake = ready > advance.revision;
-            target.armed = !wake;
-            if wake {
+            let newer = ready > advance.revision;
+            let wake = advance.wake_allowed && newer;
+            target.armed = advance.wake_allowed && !wake;
+            // An exhausted budget suppresses urgency, never ordinary dirty work.
+            if newer {
                 state.request.pty_sources.insert(advance.pane_id);
                 self.pending.store(true, Ordering::Release);
+            }
+            if wake {
                 crate::latency_prof::record_runtime_at(
                     "render.target_ready_wake",
                     advance.pane_id.raw() as u64,
@@ -249,6 +253,7 @@ impl RenderSignal {
                 advance.runtime_instance,
                 advance.revision,
                 advance.opportunity,
+                advance.wake_allowed,
             );
             false
         }
@@ -545,6 +550,7 @@ mod tests {
             runtime_instance: 7,
             revision: 22,
             opportunity: 1,
+            wake_allowed: true,
         };
         assert!(signal.advance_target_ready(&advance));
         assert!(signal.is_pending());
@@ -590,6 +596,7 @@ mod tests {
             runtime_instance: 7,
             revision: 22,
             opportunity: 1,
+            wake_allowed: true,
         };
         assert!(signal.advance_target_ready(&advance));
         assert!(signal.has_pending_source(pane));
@@ -600,6 +607,32 @@ mod tests {
         signal.arm_target_ready(pane, 7, 20, expiry, 1);
         assert!(!signal.request_pty_ready(pane, 7, 26));
         assert!(!signal.request_pty_ready(pane, 7, 28));
+    }
+
+    #[test]
+    fn exhausted_budget_preserves_newer_output_without_urgent_wakes() {
+        use crate::app::early_presentation::TerminalFeedbackAdvance;
+        let signal = Arc::new(RenderSignal::new());
+        let pane = PaneId::from_raw(10);
+        signal.arm_target_ready(
+            pane,
+            7,
+            20,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1,
+        );
+        signal.request_pty_ready(pane, 7, 22);
+        signal.request_pty_ready(pane, 7, 24);
+        signal.take_pending().complete();
+        assert!(!signal.advance_target_ready(&TerminalFeedbackAdvance {
+            pane_id: pane,
+            runtime_instance: 7,
+            revision: 22,
+            opportunity: 1,
+            wake_allowed: false,
+        }));
+        assert!(signal.has_pending_source(pane));
+        assert!(!signal.request_pty_ready(pane, 7, 26));
     }
 
     #[test]
@@ -616,6 +649,7 @@ mod tests {
             runtime_instance: 7,
             revision: 22,
             opportunity: 2,
+            wake_allowed: true,
         };
         for advance in [
             TerminalFeedbackAdvance {
