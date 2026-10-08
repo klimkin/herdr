@@ -90,6 +90,45 @@ fn changed_rows(
     Some(rows)
 }
 
+/// Compare actual baseline pixels; palette/focus changes need no cache invalidation.
+fn retained_scrollbar_matches(
+    app: &app::App,
+    frame: &FrameData,
+    rect: protocol::SurfaceRect,
+    metrics: crate::pane::ScrollMetrics,
+    focused: bool,
+) -> Option<bool> {
+    let track = Rect::new(0, 0, 1, rect.height);
+    let Some(thumb) = crate::ui::scrollbar_thumb(metrics, track) else {
+        return Some(false);
+    };
+    let (track_color, thumb_color, thumb_symbol) =
+        crate::ui::pane_scrollbar_style(&app.state.palette, focused);
+    let track_fg = protocol::color_to_u32(track_color);
+    let thumb_fg = protocol::color_to_u32(thumb_color);
+    for offset in 0..rect.height {
+        let y = rect.y.checked_add(offset)?;
+        let index = usize::from(y) * usize::from(frame.width) + usize::from(rect.x);
+        let cell = frame.cells.get(index)?;
+        let is_thumb = offset >= thumb.top && offset < thumb.top + thumb.len;
+        let (symbol, fg) = if is_thumb {
+            (thumb_symbol, thumb_fg)
+        } else {
+            ("▕", track_fg)
+        };
+        if cell.symbol != symbol
+            || cell.fg != fg
+            || cell.bg != 0
+            || cell.modifier != 0
+            || cell.skip
+            || cell.hyperlink.is_some()
+        {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
 fn retained_scrollbar_patch(
     app: &app::App,
     frame: &FrameData,
@@ -112,6 +151,13 @@ fn retained_scrollbar_patch(
                 && rect.x < pane.rect.x.saturating_add(pane.rect.width))
             .then_some(rect)
         });
+    if let (Some(rect), Some(metrics)) = (next_rect, metrics) {
+        if pane.scrollbar_rect == Some(rect)
+            && retained_scrollbar_matches(app, frame, rect, metrics, pane.focused)?
+        {
+            return Some(Vec::new());
+        }
+    }
     let patch_rect = next_rect.or(pane.scrollbar_rect);
     pane.scrollbar_rect = next_rect;
     let Some(rect) = patch_rect else {
@@ -1101,6 +1147,87 @@ mod tests {
                 cells: vec![cell("x"), cell("z")],
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn retained_scrollbar_pixels_follow_baseline_style_and_geometry() {
+        let server = super::super::tests::test_headless_server();
+        let app = &server.app;
+        let mut frame = FrameData {
+            width: 6,
+            height: 8,
+            cells: vec![cell(" "); 48],
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let mut pane = protocol::PaneSurfacePane {
+            pane_id: "w1:p1".into(),
+            content_revision: 2,
+            rect: protocol::SurfaceRect {
+                x: 0,
+                y: 0,
+                width: 6,
+                height: 8,
+            },
+            inner_rect: protocol::SurfaceRect {
+                x: 0,
+                y: 0,
+                width: 5,
+                height: 8,
+            },
+            scrollbar_rect: None,
+            scroll: None,
+            focused: true,
+            mouse_reporting: false,
+            sgr_pixel_mouse: false,
+            alternate_screen_active: false,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let metrics = crate::pane::ScrollMetrics {
+            offset_from_bottom: 0,
+            max_offset_from_bottom: 100,
+            viewport_rows: 8,
+        };
+        let rows = retained_scrollbar_patch(app, &frame, &mut pane, false, Some(metrics)).unwrap();
+        assert_eq!(rows.len(), 8);
+        for row in rows {
+            frame.cells[usize::from(row.y) * 6 + usize::from(row.x)] = row.cells[0].clone();
+        }
+        let mut unchanged_metrics = metrics;
+        unchanged_metrics.max_offset_from_bottom += 1;
+        assert!(
+            retained_scrollbar_patch(app, &frame, &mut pane, false, Some(unchanged_metrics))
+                .unwrap()
+                .is_empty()
+        );
+        frame.cells[5].bg = protocol::color_to_u32(ratatui::style::Color::Red);
+        assert_eq!(
+            retained_scrollbar_patch(app, &frame, &mut pane, false, Some(metrics))
+                .unwrap()
+                .len(),
+            1
+        );
+        pane.focused = false;
+        assert!(
+            !retained_scrollbar_patch(app, &frame, &mut pane, false, Some(metrics))
+                .unwrap()
+                .is_empty()
+        );
+        let cleared =
+            retained_scrollbar_patch(app, &frame, &mut pane, true, Some(metrics)).unwrap();
+        assert_eq!(cleared.len(), 8);
+        assert!(cleared.iter().all(|row| row.cells[0] == cell(" ")));
+        assert_eq!(pane.scrollbar_rect, None);
+        frame.cells.truncate(5);
+        pane.scrollbar_rect = Some(protocol::SurfaceRect {
+            x: 5,
+            y: 0,
+            width: 1,
+            height: 8,
+        });
+        assert!(retained_scrollbar_patch(app, &frame, &mut pane, false, Some(metrics)).is_none());
     }
 
     #[test]
