@@ -1445,10 +1445,10 @@ async fn retained_snapshot_survives_a_writer_waiting_for_the_terminal_core() {
             .state
             .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
             .expect("runtime");
-        runtime.test_process_pty_bytes(b"\rAAAA\x1b[?1003h");
+        runtime.test_process_pty_bytes(b"\rAAAA\x1b[?1003h\x1b[5 q");
         let revision = runtime.content_seq();
         let (release, writer) =
-            runtime.test_contend_during_dirty_collection(b"\rBBBB\x1b[?1003l".to_vec());
+            runtime.test_contend_during_dirty_collection(b"\rBBBB\x1b[?1003l\x1b[2 q".to_vec());
         (release, writer, revision)
     };
     let retained = server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id]));
@@ -1467,6 +1467,7 @@ async fn retained_snapshot_survives_a_writer_waiting_for_the_terminal_core() {
     assert_eq!(patch.panes[0].content_revision, revision);
     assert!(revision.is_multiple_of(2));
     assert!(patch.panes[0].mouse_reporting);
+    assert_eq!(patch.cursor.as_ref().map(|cursor| cursor.shape), Some(5));
     let surface = server.clients[&7]
         .render_state
         .last_pane_surface()
@@ -1478,6 +1479,7 @@ async fn retained_snapshot_survives_a_writer_waiting_for_the_terminal_core() {
     let next = recv_pane_surface_patch(&render, "waiting write remains dirty");
     assert_eq!(next.panes[0].content_revision, revision + 2);
     assert!(!next.panes[0].mouse_reporting);
+    assert_eq!(next.cursor.as_ref().map(|cursor| cursor.shape), Some(2));
     let surface = server.clients[&7]
         .render_state
         .last_pane_surface()

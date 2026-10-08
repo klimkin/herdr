@@ -189,6 +189,8 @@ pub(crate) struct GhosttyPaneTerminal {
     pub core: Mutex<GhosttyPaneCore>,
     #[cfg(test)]
     pub(super) scroll_metrics_reads: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(super) cursor_reads: std::sync::atomic::AtomicUsize,
     key_encoder: Mutex<crate::ghostty::KeyEncoder>,
     pending_pty_responses: Arc<Mutex<Vec<Bytes>>>,
 }
@@ -561,12 +563,24 @@ impl PaneTerminal {
         self.ghostty.render(frame, area, show_cursor);
     }
 
+    #[cfg(test)]
     pub fn collect_dirty_patch(
         &self,
         area_width: u16,
         area_height: u16,
     ) -> TerminalDirtyPatchOutcome {
-        self.ghostty.collect_dirty_patch(area_width, area_height)
+        self.collect_dirty_patch_with_cursor(area_width, area_height, false)
+            .0
+    }
+
+    pub(crate) fn collect_dirty_patch_with_cursor(
+        &self,
+        width: u16,
+        height: u16,
+        capture_cursor: bool,
+    ) -> (TerminalDirtyPatchOutcome, Option<TerminalCursorState>) {
+        self.ghostty
+            .collect_dirty_patch_with_cursor(width, height, capture_cursor)
     }
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
@@ -1196,6 +1210,8 @@ impl GhosttyPaneTerminal {
         Ok(Self {
             #[cfg(test)]
             scroll_metrics_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            cursor_reads: std::sync::atomic::AtomicUsize::new(0),
             core: Mutex::new(GhosttyPaneCore {
                 #[cfg(test)]
                 dirty_collection_hook: None,
@@ -2039,6 +2055,9 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn cursor_state(&self) -> Option<TerminalCursorState> {
+        #[cfg(test)]
+        self.cursor_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut core = self.core.lock().ok()?;
         let current = current_cursor_state(&mut core);
         effective_cursor_state(&mut core, current)
@@ -2537,11 +2556,12 @@ impl GhosttyPaneTerminal {
         }
     }
 
-    pub fn collect_dirty_patch(
+    fn collect_dirty_patch_with_cursor(
         &self,
         area_width: u16,
         area_height: u16,
-    ) -> TerminalDirtyPatchOutcome {
+        capture_cursor: bool,
+    ) -> (TerminalDirtyPatchOutcome, Option<TerminalCursorState>) {
         self.core
             .lock()
             .ok()
@@ -2551,15 +2571,30 @@ impl GhosttyPaneTerminal {
                     .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
                     .unwrap_or(false)
                 {
-                    return TerminalDirtyPatchOutcome::Fallback;
+                    return (TerminalDirtyPatchOutcome::Fallback, None);
                 }
                 #[cfg(test)]
                 if let Some(hook) = core.dirty_collection_hook.take() {
                     hook();
                 }
-                ghostty_collect_dirty_patch(&mut core, area_width, area_height)
+                let patch = ghostty_collect_dirty_patch(&mut core, area_width, area_height);
+                let cursor = if capture_cursor
+                    && !matches!(patch, TerminalDirtyPatchOutcome::Fallback)
+                {
+                    // Collection already refreshed render_state under this core lock.
+                    let GhosttyPaneCore {
+                        render_state,
+                        decscusr_tracker,
+                        ..
+                    } = &mut *core;
+                    let current = cursor_state_from_render_state(render_state, decscusr_tracker);
+                    effective_cursor_state(&mut core, current)
+                } else {
+                    None
+                };
+                (patch, cursor)
             })
-            .unwrap_or(TerminalDirtyPatchOutcome::Fallback)
+            .unwrap_or((TerminalDirtyPatchOutcome::Fallback, None))
     }
 }
 

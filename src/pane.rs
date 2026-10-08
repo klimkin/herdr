@@ -60,6 +60,8 @@ pub use self::{
 
 pub(crate) struct TerminalDirtyPatchSnapshot {
     pub patch: TerminalDirtyPatchOutcome,
+    /// Outer None means no capture; inner None means captured cursor is absent.
+    pub cursor: Option<Option<TerminalCursorState>>,
     pub content_revision: u64,
     pub scroll_metrics: Option<ScrollMetrics>,
     pub mouse_reporting: bool,
@@ -3694,12 +3696,22 @@ impl PaneRuntime {
         self.terminal.render(frame, area, show_cursor);
     }
 
+    #[cfg(test)]
     pub(crate) fn collect_dirty_patch_snapshot(
         &self,
         area_width: u16,
         area_height: u16,
     ) -> Option<TerminalDirtyPatchSnapshot> {
-        self.collect_patch_snapshot(area_width, area_height, false)
+        self.collect_patch_snapshot(area_width, area_height, false, false)
+    }
+
+    pub(crate) fn collect_dirty_patch_snapshot_with_cursor(
+        &self,
+        width: u16,
+        height: u16,
+        capture_cursor: bool,
+    ) -> Option<TerminalDirtyPatchSnapshot> {
+        self.collect_patch_snapshot(width, height, false, capture_cursor)
     }
 
     pub(crate) fn collect_selected_patch_snapshot(
@@ -3707,7 +3719,7 @@ impl PaneRuntime {
         area_width: u16,
         area_height: u16,
     ) -> Option<TerminalDirtyPatchSnapshot> {
-        self.collect_patch_snapshot(area_width, area_height, true)
+        self.collect_patch_snapshot(area_width, area_height, true, true)
     }
 
     fn collect_patch_snapshot(
@@ -3715,6 +3727,7 @@ impl PaneRuntime {
         area_width: u16,
         area_height: u16,
         selective: bool,
+        capture_cursor: bool,
     ) -> Option<TerminalDirtyPatchSnapshot> {
         // PTY/resize writers announce changes before locking the terminal core.
         // Exclude them until rows and metadata have been paired with their revision.
@@ -3726,24 +3739,29 @@ impl PaneRuntime {
         if !revision.is_multiple_of(2) {
             return None;
         }
-        let selective = if selective {
+        let synchronization_epoch = if selective {
             let (synchronized, synchronization_epoch) = self.synchronized_output_state();
             if synchronized {
                 return None;
             }
-            Some(SelectiveTerminalSnapshot {
-                cursor: self.terminal.cursor_state(),
-                synchronization_epoch,
-            })
+            Some(synchronization_epoch)
         } else {
             None
         };
-        let patch = self.terminal.collect_dirty_patch(area_width, area_height);
+        let (patch, cursor) =
+            self.terminal
+                .collect_dirty_patch_with_cursor(area_width, area_height, capture_cursor);
         if matches!(patch, TerminalDirtyPatchOutcome::Fallback) {
             return None;
         }
+        let selective =
+            synchronization_epoch.map(|synchronization_epoch| SelectiveTerminalSnapshot {
+                cursor,
+                synchronization_epoch,
+            });
         let snapshot = TerminalDirtyPatchSnapshot {
             patch,
+            cursor: capture_cursor.then_some(cursor),
             content_revision: revision,
             scroll_metrics: self.scroll_metrics(),
             mouse_reporting: self.mouse_reporting_enabled(),
@@ -4035,6 +4053,10 @@ impl PaneRuntime {
         Self::test_with_scrollback_bytes(cols, rows, 0, bytes)
     }
 
+    pub(crate) fn test_cursor_reads(&self) -> usize {
+        self.terminal.ghostty.cursor_reads.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn test_scroll_metrics_reads(&self) -> usize {
         self.terminal
             .ghostty
@@ -4232,6 +4254,38 @@ mod tests {
             .text
             .contains("one"));
         assert!(runtime.visible_text().contains("five"));
+    }
+
+    #[tokio::test]
+    async fn captured_cursor_and_rows_keep_the_same_content_revision() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(20, 4);
+        runtime.test_process_pty_bytes(b"\x1b[2;5H\x1b[5 q");
+        let expected = runtime.terminal.cursor_state();
+        let snapshot = runtime
+            .collect_dirty_patch_snapshot_with_cursor(20, 4, true)
+            .unwrap();
+        let cursor = snapshot.cursor.expect("captured").expect("present");
+        assert_eq!(Some(cursor), expected);
+        assert_eq!(cursor.shape, 5);
+        assert_eq!(
+            runtime.test_cursor_reads(),
+            1,
+            "snapshot must not perform another cursor read"
+        );
+        runtime.test_process_pty_bytes(b"\x1b[3;9H\x1b[?25l");
+        assert!(runtime.content_seq() > snapshot.content_revision);
+        assert_eq!(snapshot.cursor.unwrap(), Some(cursor));
+        let next = runtime
+            .collect_dirty_patch_snapshot_with_cursor(20, 4, false)
+            .unwrap();
+        assert!(
+            next.cursor.is_none(),
+            "uncaptured cursor must not mean hidden"
+        );
+        runtime.test_process_pty_bytes(b"\x1b[?2026h");
+        assert!(runtime
+            .collect_dirty_patch_snapshot_with_cursor(20, 4, true)
+            .is_none());
     }
 
     #[tokio::test]

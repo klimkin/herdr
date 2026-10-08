@@ -423,12 +423,23 @@ impl TerminalRuntime {
         self.0.render(frame, area, show_cursor);
     }
 
+    #[cfg(test)]
     pub(crate) fn collect_dirty_patch_snapshot(
         &self,
         area_width: u16,
         area_height: u16,
     ) -> Option<crate::pane::TerminalDirtyPatchSnapshot> {
         self.0.collect_dirty_patch_snapshot(area_width, area_height)
+    }
+
+    pub(crate) fn collect_dirty_patch_snapshot_with_cursor(
+        &self,
+        width: u16,
+        height: u16,
+        capture_cursor: bool,
+    ) -> Option<crate::pane::TerminalDirtyPatchSnapshot> {
+        self.0
+            .collect_dirty_patch_snapshot_with_cursor(width, height, capture_cursor)
     }
 
     pub(crate) fn collect_selected_patch_snapshot(
@@ -617,6 +628,10 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    pub(crate) fn test_cursor_reads(&self) -> usize {
+        self.0.test_cursor_reads()
+    }
+
     pub(crate) fn test_scroll_metrics_reads(&self) -> usize {
         self.0.test_scroll_metrics_reads()
     }
