@@ -1571,6 +1571,34 @@ platforms = ["linux", "macos"]
     }
 
     #[cfg(windows)]
+    #[test]
+    fn windows_plugin_pane_command_child() {
+        let Some(mode) = std::env::var_os("HERDR_TEST_PLUGIN_PANE_CHILD_MODE") else {
+            return;
+        };
+        match mode.to_string_lossy().as_ref() {
+            "capture" => {
+                let name = std::env::var("HERDR_TEST_PLUGIN_PANE_CHILD_NAME")
+                    .expect("capture child name env");
+                let cwd = std::env::current_dir().expect("capture child cwd");
+                std::fs::write(
+                    cwd.join(format!("capture-{name}.txt")),
+                    format!("{name}\n{}\n", cwd.display()),
+                )
+                .expect("write child capture");
+            }
+            "print-probe" => {
+                let probe = std::env::var("HERDR_TEST_PLUGIN_PANE_CHILD_PROBE")
+                    .expect("probe child env");
+                let cwd = std::env::current_dir().expect("probe child cwd");
+                let resolved = cwd.join(probe).canonicalize().expect("probe path");
+                println!("{}", resolved.display());
+            }
+            other => panic!("unexpected plugin pane child mode: {other}"),
+        }
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn windows_plugin_pane_commands_resolve_from_plugin_root_with_cwd_override() {
         use std::os::windows::ffi::OsStrExt;
@@ -1587,14 +1615,12 @@ platforms = ["linux", "macos"]
         std::fs::create_dir_all(&child_cwd).unwrap();
         let cleanup_root = root.canonicalize().unwrap();
         let tool = root.join("tool.exe");
-        let long_where_relative = format!("bin/{}/where.exe", "x".repeat(220));
-        let long_where = root.join(&long_where_relative);
-        std::fs::create_dir_all(long_where.parent().unwrap()).unwrap();
-        let shell = std::env::var_os("ComSpec").expect("ComSpec");
-        std::fs::copy(&shell, &tool).unwrap();
-        let where_exe = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32/where.exe");
-        std::fs::copy(where_exe, &long_where).unwrap();
+        let long_tool_relative = format!("bin/{}/tool.exe", "x".repeat(220));
+        let long_tool = root.join(&long_tool_relative);
+        std::fs::create_dir_all(long_tool.parent().unwrap()).unwrap();
+        let test_exe = std::env::current_exe().expect("current test executable");
+        std::fs::copy(&test_exe, &tool).unwrap();
+        std::fs::copy(&test_exe, &long_tool).unwrap();
         let where_probe = "herdr-long-path-probe.exe";
         std::fs::write(child_cwd.join(where_probe), b"").unwrap();
         assert!(
@@ -1602,7 +1628,7 @@ platforms = ["linux", "macos"]
                 < windows_sys::Win32::Foundation::MAX_PATH as usize
         );
         assert!(
-            long_where.as_os_str().encode_wide().count()
+            long_tool.as_os_str().encode_wide().count()
                 >= windows_sys::Win32::Foundation::MAX_PATH as usize
         );
         let script = "@echo off\r\n(echo %1&cd)>capture-%1.tmp\r\nmove /y capture-%1.tmp capture-%1.txt >nul\r\n";
@@ -1621,12 +1647,12 @@ platforms = ["windows"]
 [[panes]]
 id = "explicit"
 title = "Explicit"
-command = ["./tool.exe", "/d", "/c", "slot.cmd", "explicit"]
+command = ["./tool.exe", "--exact", "app::api::plugins::tests::windows_plugin_pane_command_child", "--nocapture"]
 
 [[panes]]
 id = "bare"
 title = "Bare"
-command = ["tool.exe", "/d", "/c", "slot.cmd", "bare"]
+command = ["tool.exe", "--exact", "app::api::plugins::tests::windows_plugin_pane_command_child", "--nocapture"]
 
 [[panes]]
 id = "path"
@@ -1636,12 +1662,12 @@ command = ["cmd.exe", "/d", "/c", "slot.cmd", "path"]
 [[panes]]
 id = "absolute"
 title = "Absolute"
-command = ['{}', "/d", "/c", "slot.cmd", "absolute"]
+command = ['{}', "--exact", "app::api::plugins::tests::windows_plugin_pane_command_child", "--nocapture"]
 
 [[panes]]
 id = "long"
 title = "Long executable"
-command = ['./{}', "{}"]
+command = ['./{}', "--exact", "app::api::plugins::tests::windows_plugin_pane_command_child", "--nocapture"]
 
 [[panes]]
 id = "default"
@@ -1649,8 +1675,7 @@ title = "Default cwd"
 command = ["cmd.exe", "/d", "/c", "slot.cmd", "default"]
 "#,
                 tool.display(),
-                long_where_relative,
-                where_probe
+                long_tool_relative
             ),
         );
         link_manifest(&mut app, &root);
@@ -1664,6 +1689,30 @@ command = ["cmd.exe", "/d", "/c", "slot.cmd", "default"]
             ("default", None),
         ] {
             let expected_cwd = cwd.unwrap_or(&root);
+            let mut env = std::collections::HashMap::new();
+            match entrypoint {
+                "explicit" | "bare" | "absolute" => {
+                    env.insert(
+                        "HERDR_TEST_PLUGIN_PANE_CHILD_MODE".to_string(),
+                        "capture".to_string(),
+                    );
+                    env.insert(
+                        "HERDR_TEST_PLUGIN_PANE_CHILD_NAME".to_string(),
+                        entrypoint.to_string(),
+                    );
+                }
+                "long" => {
+                    env.insert(
+                        "HERDR_TEST_PLUGIN_PANE_CHILD_MODE".to_string(),
+                        "print-probe".to_string(),
+                    );
+                    env.insert(
+                        "HERDR_TEST_PLUGIN_PANE_CHILD_PROBE".to_string(),
+                        where_probe.to_string(),
+                    );
+                }
+                _ => {}
+            }
             let open = app.handle_api_request(Request {
                 id: format!("pane-open-{entrypoint}"),
                 method: Method::PluginPaneOpen(PluginPaneOpenParams {
@@ -1677,7 +1726,7 @@ command = ["cmd.exe", "/d", "/c", "slot.cmd", "default"]
                     direction: None,
                     cwd: cwd.map(|path| path.display().to_string()),
                     focus: false,
-                    env: std::collections::HashMap::new(),
+                    env,
                 }),
             });
             let ResponseResult::PluginPaneOpened { plugin_pane } = response_result(&open) else {
