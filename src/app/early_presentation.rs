@@ -47,6 +47,14 @@ pub(crate) struct Opportunity {
     diagnostic_times: (u64, u64),
 }
 
+/// Successful ordinary delivery advances only the matching unused ready latch.
+pub(crate) struct TerminalFeedbackAdvance {
+    pub(crate) pane_id: crate::layout::PaneId,
+    pub(crate) runtime_instance: u64,
+    pub(crate) revision: u64,
+    pub(crate) opportunity: u64,
+}
+
 impl Opportunity {
     fn target_key(&self) -> &str {
         match &self.work {
@@ -289,8 +297,12 @@ impl EarlyPresentation {
         }
         // A replacement runtime cannot share a prior counter lifetime.
         self.opportunities.retain(|opportunity| {
-            !matches!(&opportunity.work,
-            Work::Terminal { terminal_id: old, .. } if old == &terminal_id)
+            let keep = !matches!(&opportunity.work,
+            Work::Terminal { terminal_id: old, .. } if old == &terminal_id);
+            if !keep {
+                crate::latency_prof::record("opportunity.revoked", opportunity.id, 0);
+            }
+            keep
         });
         let next_id = self.next_id.checked_add(1)?;
         let id = self.next_id;
@@ -341,23 +353,23 @@ impl EarlyPresentation {
         revision: u64,
         client_id: u64,
         context: crate::latency_prof::TraceContext,
-    ) -> bool {
+    ) -> Option<TerminalFeedbackAdvance> {
         if !self.terminal_enabled()
             || runtime_instance == 0
             || revision == 0
             || !revision.is_multiple_of(2)
         {
-            return false;
+            return None;
         }
         self.expire(Instant::now());
-        let mut satisfied = false;
-        self.opportunities.retain(|opportunity| {
+        let mut advance = None;
+        self.opportunities.retain_mut(|opportunity| {
             let Work::Terminal {
                 terminal_id: target,
                 runtime_instance: instance,
                 baseline_revision,
-                ..
-            } = &opportunity.work
+                placement,
+            } = &mut opportunity.work
             else {
                 return true;
             };
@@ -367,7 +379,40 @@ impl EarlyPresentation {
             {
                 return true;
             }
-            satisfied = true;
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::record_context_at(
+                "opportunity.terminal_presented",
+                opportunity.id,
+                revision,
+                client_id,
+                crate::latency_prof::now(),
+                crate::latency_prof::TraceContext {
+                    runtime_instance,
+                    ..context
+                },
+            );
+            if !opportunity.attempted {
+                *baseline_revision = revision;
+                advance = Some(TerminalFeedbackAdvance {
+                    pane_id: placement.pane_id,
+                    runtime_instance,
+                    revision,
+                    opportunity: opportunity.id,
+                });
+                #[cfg(feature = "latency-prof")]
+                crate::latency_prof::record_context_at(
+                    "opportunity.terminal_floor_advanced",
+                    opportunity.id,
+                    revision,
+                    client_id,
+                    crate::latency_prof::now(),
+                    crate::latency_prof::TraceContext {
+                        runtime_instance,
+                        ..context
+                    },
+                );
+                return true;
+            }
             #[cfg(feature = "latency-prof")]
             crate::latency_prof::record_context_at(
                 "opportunity.terminal_enqueued",
@@ -384,18 +429,29 @@ impl EarlyPresentation {
             let _ = (client_id, context);
             false
         });
-        satisfied
+        advance
     }
 
     pub(crate) fn prune_terminals(&mut self, now: Instant, mut valid: impl FnMut(&Work) -> bool) {
         self.expire(now);
         self.opportunities.retain(|opportunity| {
-            !matches!(opportunity.work, Work::Terminal { .. }) || valid(&opportunity.work)
+            let keep =
+                !matches!(opportunity.work, Work::Terminal { .. }) || valid(&opportunity.work);
+            if !keep {
+                crate::latency_prof::record("opportunity.revoked", opportunity.id, 0);
+            }
+            keep
         });
     }
 
     pub(crate) fn cancel_terminal(&mut self, terminal_id: &crate::terminal::TerminalId) {
-        self.opportunities.retain(|opportunity| !matches!(&opportunity.work,Work::Terminal{terminal_id:target,..} if target==terminal_id));
+        self.opportunities.retain(|opportunity| {
+            let keep = !matches!(&opportunity.work,Work::Terminal{terminal_id:target,..} if target==terminal_id);
+            if !keep {
+                crate::latency_prof::record("opportunity.revoked", opportunity.id, 0);
+            }
+            keep
+        });
     }
 
     pub(crate) fn cancel_client(&mut self, client_id: u64) {
@@ -563,5 +619,131 @@ mod tests {
         assert!(!presentation.admit(action, now, true));
         assert!(!presentation.admit(terminal.id, now, true));
         assert!(presentation.admit(terminal.id, now, false));
+    }
+
+    #[test]
+    fn ordinary_target_delivery_preserves_unused_feedback_until_expiry() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new(PresentationPolicy::Target);
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let opportunity = presentation
+            .accepted_terminal(terminal_id.clone(), placement(), 1, 20, None, now)
+            .expect("accepted input opportunity");
+
+        presentation.acknowledge_terminal(
+            &terminal_id,
+            1,
+            22,
+            4,
+            crate::latency_prof::TraceContext::default(),
+        );
+        let ready = presentation
+            .oldest_ready(now + Duration::from_millis(2), |opportunity| {
+                matches!(opportunity.work, Work::Terminal { baseline_revision, .. } if 24 > baseline_revision)
+            })
+            .expect("later echo retains its unused early opportunity");
+        assert_eq!(ready.id, opportunity.id);
+        assert_eq!(ready.expires_at, now + INTERVAL);
+        assert!(matches!(
+            ready.work,
+            Work::Terminal {
+                baseline_revision: 22,
+                ..
+            }
+        ));
+        assert!(presentation.admit(ready.id, now + Duration::from_millis(2), false));
+        presentation.acknowledge_terminal(
+            &terminal_id,
+            1,
+            24,
+            4,
+            crate::latency_prof::TraceContext::default(),
+        );
+        assert!(
+            !presentation.pending(),
+            "spent feedback retires after delivery"
+        );
+    }
+
+    #[test]
+    fn duplicate_target_delivery_and_coalesced_input_cannot_renew_feedback() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new(PresentationPolicy::Target);
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let placement = placement();
+        let opportunity = presentation
+            .accepted_terminal(terminal_id.clone(), placement.clone(), 1, 20, None, now)
+            .expect("accepted input opportunity");
+        let context = crate::latency_prof::TraceContext::default();
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 1, 22, 4, context)
+            .is_some());
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 1, 22, 5, context)
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 1, 20, 5, context)
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 2, 24, 5, context)
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 1, 23, 5, context)
+            .is_none());
+        let coalesced = presentation
+            .accepted_terminal(
+                terminal_id.clone(),
+                placement.clone(),
+                1,
+                20,
+                None,
+                now + Duration::from_millis(1),
+            )
+            .expect("coalesced input");
+        assert_eq!(coalesced.id, opportunity.id);
+        assert_eq!(coalesced.expires_at, opportunity.expires_at);
+        assert!(matches!(
+            coalesced.work,
+            Work::Terminal {
+                baseline_revision: 22,
+                ..
+            }
+        ));
+        assert!(presentation.admit(opportunity.id, now + Duration::from_millis(2), false));
+        let coalesced = presentation
+            .accepted_terminal(
+                terminal_id.clone(),
+                placement,
+                1,
+                22,
+                None,
+                now + Duration::from_millis(3),
+            )
+            .expect("spent input remains coalesced");
+        assert_eq!(coalesced.id, opportunity.id);
+        assert!(!presentation.admit(opportunity.id, now + Duration::from_millis(4), false));
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 1, 24, 5, context)
+            .is_none());
+        assert!(!presentation.pending());
+    }
+
+    #[test]
+    fn ordinary_delivery_cannot_extend_feedback_expiry() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new(PresentationPolicy::Target);
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        presentation.accepted_terminal(terminal_id.clone(), placement(), 1, 20, None, now);
+        presentation.acknowledge_terminal(
+            &terminal_id,
+            1,
+            22,
+            4,
+            crate::latency_prof::TraceContext::default(),
+        );
+        assert!(presentation
+            .oldest_ready(now + INTERVAL, |_| true)
+            .is_none());
+        assert!(!presentation.pending());
     }
 }

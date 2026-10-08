@@ -3,7 +3,7 @@
 
 import argparse
 import json
-from collections import defaultdict
+from collections import ChainMap, defaultdict
 from pathlib import Path
 from latency_report import read_process_traces
 
@@ -73,10 +73,14 @@ def input_status(index,pid,event,service):
     return 'granted',link.get('value')
 
 
-def target_opportunities(records,strict=True):
+def target_opportunities(records,strict=True,_index=None):
     """Keep every grant; missing or conflicting identity stays unassigned."""
     rows = []
-    index=RecordIndex(records)
+    index=_index or RecordIndex(records)
+    deliveries=defaultdict(list)
+    if _index is None:
+        for delivery in target_deliveries(records,strict):
+            deliveries[(delivery['pid'],delivery['opportunity'])].append(delivery)
     grants = [record for record in records if record.get('stage') == 'opportunity.terminal_granted']
     for grant in grants:
         pid, identity = grant.get('pid'), grant.get('id')
@@ -85,9 +89,23 @@ def target_opportunities(records,strict=True):
                'baseline_revision': grant.get('value'), 'accepted_ns': grant.get('ns')}
         if not valid_grant(index,grant):
             row['status']='unassigned';rows.append(row);continue
+        if any(delivery['status']=='unassigned' for delivery in deliveries[(pid,identity)]):
+            row['status']='unassigned';rows.append(row);continue
         receipts=index.records(pid,'opportunity.terminal_enqueued',identity)
         if not receipts:
             row['outcomes'] = index.outcome[(pid,identity)]
+            floors=index.records(pid,'opportunity.terminal_floor_advanced',identity)
+            proven=[delivery for delivery in deliveries[(pid,identity)]
+                    if delivery['status']!='unassigned' and delivery['floor_advanced']]
+            if len(proven)==len(floors) and proven:
+                row['presented_revision']=max(delivery['revision'] for delivery in proven)
+            elif floors and _index is None:
+                row['status']='unassigned'
+            closed=[stage for stage in row['outcomes'] if stage in ('opportunity.expired','opportunity.revoked')]
+            if len(closed)==1 and row['status']!='unassigned':
+                row['status']=closed[0].removeprefix('opportunity.')
+            elif closed:
+                row['status']='unassigned'
             pane=_one(index.records(pid,'opportunity.target_pane',identity))
             admissions=index.records(pid,'opportunity.early_terminal_admitted',identity)
             if pane is not None:
@@ -169,6 +187,53 @@ def target_opportunities(records,strict=True):
     return rows
 
 
+def target_deliveries(records,strict=True):
+    """Report qualifying feedback deliveries without treating floor advances as retirement."""
+    index=RecordIndex(records)
+    deliveries=[record for record in records if record.get('stage')=='opportunity.terminal_presented']
+    rows=[]
+    for delivery in deliveries:
+        pid,identity=delivery.get('pid'),delivery.get('id')
+        selected=RecordIndex([])
+        # Reuse immutable indices; only this opportunity's receipt/input slots
+        # vary for the exact delivery being validated.
+        selected.__dict__.update(index.__dict__)
+        candidates=index.records(pid,'opportunity.terminal_presented',identity)
+        same=[record for record in candidates if all(record.get(field)==delivery.get(field)
+             for field in ('scope','runtime_instance','value','presentation','attempt','serialization'))]
+        selected.identity=ChainMap({
+            (pid,'opportunity.terminal_enqueued',identity):same,
+            (pid,'opportunity.early_terminal_admitted',identity):[
+                record for record in index.records(pid,'opportunity.early_terminal_admitted',identity)
+                if record['ns']<=delivery['ns']],
+        },index.identity)
+        selected.input_opportunity=ChainMap({(pid,identity):[
+            record for record in index.input_opportunity[(pid,identity)] if record['ns']<=delivery['ns']]},
+            index.input_opportunity)
+        granted=index.records(pid,'opportunity.terminal_granted',identity)
+        row=(target_opportunities(granted,strict,_index=selected) or
+             [{'pid':pid,'opportunity':identity,'status':'unassigned'}])[0]
+        def matches(record):
+            return all(record.get(field)==delivery.get(field)
+                       for field in ('scope','runtime_instance','value','presentation','attempt','serialization'))
+        floor=[record for record in index.records(pid,'opportunity.terminal_floor_advanced',identity)
+               if matches(record) and record['ns']>=delivery['ns']]
+        retired=[record for record in index.records(pid,'opportunity.terminal_enqueued',identity)
+                 if matches(record) and record['ns']>=delivery['ns']]
+        if len(floor)+len(retired)!=1:
+            row['status']='unassigned'
+        if floor:
+            earlier=[record for record in index.records(pid,'opportunity.terminal_floor_advanced',identity)
+                     if record['ns']<floor[0]['ns']]
+            grant=_one(index.records(pid,'opportunity.terminal_granted',identity))
+            prior=max([grant['value']] + [record.get('value',0) for record in earlier]) if grant else None
+            if prior is None or floor[0].get('value',0)<=prior:
+                row['status']='unassigned'
+        row.update(floor_advanced=len(floor)==1,retired=len(retired)==1)
+        rows.append(row)
+    return rows
+
+
 def target_inputs(records):
     """Retain real admission outcomes even if no urgency can be granted."""
     stages=INPUT_OUTCOMES
@@ -199,11 +264,12 @@ def main():
     expected={int(path.stem):['specified process'] for path in paths}
     records,audit=read_process_traces(directory,expected)
     opportunities=target_opportunities(records,strict=True)
+    deliveries=target_deliveries(records,strict=True)
     inputs=target_inputs(records)
     incomplete={process['pid'] for process in audit['processes'] if not process['complete']}
-    for row in opportunities+inputs:
+    for row in opportunities+deliveries+inputs:
         if row['pid'] in incomplete:row['status']='unassigned'
-    print(json.dumps({'opportunities':opportunities,'inputs':inputs,'integrity':audit},indent=2))
+    print(json.dumps({'opportunities':opportunities,'deliveries':deliveries,'inputs':inputs,'integrity':audit},indent=2))
 
 
 

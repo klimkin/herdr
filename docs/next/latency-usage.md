@@ -296,11 +296,17 @@ committed client presentation. Missing identities remain unassigned.
 
 Linux also supports `target` and `target-all` with the `latency-experiments`
 feature. Accepted nonempty terminal input creates one opportunity for that
-terminal/runtime. Its first content revision and 16 ms expiry remain fixed
-across coalesced input. Changed target state can spend one global extra attempt
+terminal/runtime. Its original 16 ms expiry remains fixed across coalesced
+input. Successful ordinary delivery advances the presented revision floor and
+preserves the unused early allowance. Later output newer than that floor can
+still request early presentation, including output arriving during enqueue.
+Changed target state can spend one global extra attempt
 per 16 ms. Unchanged state creates no early frame; empty/rejected input and
-release cleanup create no opportunity. Ordinary delivery can satisfy the
-opportunity first.
+release cleanup create no opportunity. Successful delivery after an early
+attempt retires the opportunity; failed attempts receive no refund.
+One successful recipient can retire a spent window while other recipients have
+deferred queues. Those recipients retain ordinary recovery and can still wait
+for its cadence.
 
 `target` uses a coherent retained update for the selected terminal. Residual
 sources, titles, and generic work keep their ordinary deadline. Unsafe retained
@@ -354,9 +360,11 @@ python3 scripts/latency_target_report.py "$latency_run"/traces/[0-9]*.jsonl \
 ```
 
 The target report preserves accepted, empty, rejected, coalesced, and unassigned
-input outcomes. Exact runtime/revision/recipient/serialization receipts establish
+input outcomes. `deliveries` separates ordinary floor advances from opportunity
+retirement; unused windows remain pending until expiry or cancellation.
+Exact runtime/revision/recipient/serialization receipts establish
 which target state reached a queue. A receipt alone does not prove controlled
 process echo or every client's committed output. Use the regular latency report
-and owned-PTY outcomes for those boundaries. Earlier unrelated target output can
+and owned-PTY outcomes for those boundaries. An earlier extra attempt can still
 consume urgency before a later echo; delayed-response tests must retain that
 outcome rather than extend expiry to hide it.

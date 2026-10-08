@@ -78,6 +78,7 @@ struct TargetReady {
     expires_at: std::time::Instant,
     opportunity: u64,
     armed: bool,
+    ready_revision: u64,
 }
 
 impl RenderSignal {
@@ -127,6 +128,9 @@ impl RenderSignal {
         if let (Some((instance, revision)), Some(target)) =
             (ready, state.target_ready.get_mut(&pane_id))
         {
+            if target.instance == instance && revision.is_multiple_of(2) {
+                target.ready_revision = target.ready_revision.max(revision);
+            }
             if target.armed && target.instance == instance {
                 if std::time::Instant::now() >= target.expires_at {
                     target.armed = false;
@@ -180,6 +184,7 @@ impl RenderSignal {
                     expires_at,
                     opportunity,
                     armed: true,
+                    ready_revision: baseline_revision,
                 },
             );
         }
@@ -191,6 +196,62 @@ impl RenderSignal {
             expires_at,
             opportunity,
         );
+    }
+
+    /// Ordinary delivery keeps unused feedback eligible for newer output.
+    /// Ready output can race before rearming, even while its source is detached.
+    pub(crate) fn advance_target_ready(
+        &self,
+        advance: &crate::app::early_presentation::TerminalFeedbackAdvance,
+    ) -> bool {
+        #[cfg(any(test, feature = "latency-experiments"))]
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(target) = state.target_ready.get_mut(&advance.pane_id) else {
+                return false;
+            };
+            if target.opportunity != advance.opportunity
+                || target.instance != advance.runtime_instance
+                || advance.revision <= target.baseline_revision
+                || !advance.revision.is_multiple_of(2)
+            {
+                return false;
+            }
+            if std::time::Instant::now() >= target.expires_at {
+                target.armed = false;
+                return false;
+            }
+            target.baseline_revision = advance.revision;
+            let ready = target.ready_revision;
+            let wake = ready > advance.revision;
+            target.armed = !wake;
+            if wake {
+                state.request.pty_sources.insert(advance.pane_id);
+                self.pending.store(true, Ordering::Release);
+                crate::latency_prof::record_runtime_at(
+                    "render.target_ready_wake",
+                    advance.pane_id.raw() as u64,
+                    ready,
+                    advance.opportunity,
+                    crate::latency_prof::now(),
+                    advance.runtime_instance,
+                );
+            }
+            wake
+        }
+        #[cfg(not(any(test, feature = "latency-experiments")))]
+        {
+            let _ = (
+                advance.pane_id,
+                advance.runtime_instance,
+                advance.revision,
+                advance.opportunity,
+            );
+            false
+        }
     }
 
     /// Policy retirement owns latch lifetime, including sources that stop output.
@@ -465,6 +526,131 @@ mod tests {
         signal.arm_target_ready(pane, 7, 24, expiry, 1);
         assert!(!signal.request_pty_ready(pane, 7, 26));
         assert_eq!(signal.take().pty_sources, HashSet::from([pane]));
+    }
+
+    #[test]
+    fn ordinary_delivery_rearms_feedback_without_losing_concurrent_ready_output() {
+        use crate::app::early_presentation::TerminalFeedbackAdvance;
+
+        let signal = Arc::new(RenderSignal::new());
+        let pane = PaneId::from_raw(10);
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        signal.arm_target_ready(pane, 7, 20, expiry, 1);
+        assert!(signal.request_pty_ready(pane, 7, 22));
+        let ordinary = signal.take_pending();
+        assert!(signal.request_pty_ready(pane, 7, 24));
+        ordinary.complete();
+        let advance = TerminalFeedbackAdvance {
+            pane_id: pane,
+            runtime_instance: 7,
+            revision: 22,
+            opportunity: 1,
+        };
+        assert!(signal.advance_target_ready(&advance));
+        assert!(signal.is_pending());
+        assert!(signal.has_pending_source(pane));
+        assert!(
+            !signal.advance_target_ready(&advance),
+            "duplicate peer receipt cannot rearm"
+        );
+        assert!(
+            !signal.request_pty_ready(pane, 7, 26),
+            "ready wake remains one-shot"
+        );
+
+        let delivered = TerminalFeedbackAdvance {
+            revision: 26,
+            ..advance
+        };
+        assert!(!signal.advance_target_ready(&delivered));
+        assert!(
+            !signal.request_pty_ready(pane, 7, 26),
+            "unchanged state cannot wake"
+        );
+        assert!(
+            signal.request_pty_ready(pane, 7, 28),
+            "later output wakes after floor advance"
+        );
+    }
+
+    #[test]
+    fn ordinary_delivery_restores_ready_output_even_after_detached_work_completes() {
+        use crate::app::early_presentation::TerminalFeedbackAdvance;
+
+        let signal = Arc::new(RenderSignal::new());
+        let pane = PaneId::from_raw(10);
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        signal.arm_target_ready(pane, 7, 20, expiry, 1);
+        assert!(signal.request_pty_ready(pane, 7, 22));
+        assert!(!signal.request_pty_ready(pane, 7, 24));
+        signal.take_pending().complete();
+        assert!(!signal.is_pending());
+        let advance = TerminalFeedbackAdvance {
+            pane_id: pane,
+            runtime_instance: 7,
+            revision: 22,
+            opportunity: 1,
+        };
+        assert!(signal.advance_target_ready(&advance));
+        assert!(signal.has_pending_source(pane));
+        assert_eq!(signal.take().pty_sources, HashSet::from([pane]));
+        assert!(!signal.advance_target_ready(&advance));
+        // Coalesced input may still carry an earlier captured baseline.
+        signal.request_pty(pane);
+        signal.arm_target_ready(pane, 7, 20, expiry, 1);
+        assert!(!signal.request_pty_ready(pane, 7, 26));
+        assert!(!signal.request_pty_ready(pane, 7, 28));
+    }
+
+    #[test]
+    fn stale_or_invalid_delivery_cannot_rearm_feedback() {
+        use crate::app::early_presentation::TerminalFeedbackAdvance;
+
+        let signal = RenderSignal::new();
+        let pane = PaneId::from_raw(10);
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        signal.arm_target_ready(pane, 7, 20, expiry, 2);
+        signal.request_pty_ready(pane, 7, 22);
+        let valid = TerminalFeedbackAdvance {
+            pane_id: pane,
+            runtime_instance: 7,
+            revision: 22,
+            opportunity: 2,
+        };
+        for advance in [
+            TerminalFeedbackAdvance {
+                opportunity: 1,
+                ..valid
+            },
+            TerminalFeedbackAdvance {
+                runtime_instance: 8,
+                ..valid
+            },
+            TerminalFeedbackAdvance {
+                revision: 23,
+                ..valid
+            },
+            TerminalFeedbackAdvance {
+                revision: 20,
+                ..valid
+            },
+        ] {
+            assert!(!signal.advance_target_ready(&advance));
+        }
+        assert!(!signal.request_pty_ready(pane, 7, 24));
+        assert!(signal.advance_target_ready(&valid));
+        assert!(!signal.advance_target_ready(&valid));
+        signal.cancel_target_ready(pane, 2);
+        assert!(!signal.advance_target_ready(&TerminalFeedbackAdvance {
+            revision: 26,
+            ..valid
+        }));
+        signal.arm_target_ready(pane, 7, 26, std::time::Instant::now(), 3);
+        assert!(!signal.advance_target_ready(&TerminalFeedbackAdvance {
+            revision: 28,
+            opportunity: 3,
+            ..valid
+        }));
     }
 
     #[test]
