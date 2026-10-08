@@ -237,6 +237,7 @@ struct CollectedPanePatch {
     pane_id: String,
     patch: crate::pane::TerminalDirtyPatch,
     content_revision: u64,
+    cursor: Option<Option<crate::pane::TerminalCursorState>>,
     scroll_metrics: Option<crate::pane::ScrollMetrics>,
     mouse_reporting: bool,
     sgr_pixel_mouse: bool,
@@ -484,6 +485,7 @@ impl HeadlessServer {
             let mut public_pane_id = None;
             let mut width = 0u16;
             let mut height = 0u16;
+            let mut capture_cursor = false;
             for recipient in &recipients {
                 let Some(pane) = recipient.surface.panes.iter().find(|pane| {
                     self.app
@@ -495,6 +497,7 @@ impl HeadlessServer {
                 public_pane_id.get_or_insert_with(|| pane.pane_id.clone());
                 width = width.max(pane.inner_rect.width);
                 height = height.max(pane.inner_rect.height);
+                capture_cursor |= pane.focused;
             }
             let Some(public_pane_id) = public_pane_id else {
                 continue;
@@ -518,7 +521,7 @@ impl HeadlessServer {
             let snapshot = if selected_instance.is_some() {
                 runtime.collect_selected_patch_snapshot(width, height)
             } else {
-                runtime.collect_dirty_patch_snapshot(width, height)
+                runtime.collect_dirty_patch_snapshot_with_cursor(width, height, capture_cursor)
             };
             let Some(snapshot) = snapshot else {
                 fallback!("terminal_snapshot");
@@ -568,6 +571,7 @@ impl HeadlessServer {
                 pane_id: public_pane_id,
                 patch,
                 content_revision: snapshot.content_revision,
+                cursor: snapshot.cursor,
                 scroll_metrics: snapshot.scroll_metrics,
                 mouse_reporting: snapshot.mouse_reporting,
                 sgr_pixel_mouse: snapshot.sgr_pixel_mouse,
@@ -700,7 +704,38 @@ impl HeadlessServer {
                     None
                 }
             } else {
-                retained_cursor(&self.app, &panes)
+                let captured = panes.iter().find(|pane| pane.focused).and_then(|focused| {
+                    let source = collected
+                        .iter()
+                        .find(|pane| pane.pane_id == focused.pane_id)?;
+                    let cursor = source.cursor?;
+                    let (workspace_index, pane_id) = self.app.parse_pane_id(&focused.pane_id)?;
+                    Some(
+                        if self
+                            .app
+                            .state
+                            .pane_exposes_host_cursor(workspace_index, pane_id)
+                        {
+                            cursor
+                                .filter(|cursor| {
+                                    cursor.x < focused.inner_rect.width
+                                        && cursor.y < focused.inner_rect.height
+                                })
+                                .map(|cursor| protocol::CursorState {
+                                    x: focused.inner_rect.x + cursor.x,
+                                    y: focused.inner_rect.y + cursor.y,
+                                    visible: cursor.visible
+                                        && source
+                                            .scroll_metrics
+                                            .is_none_or(|metrics| metrics.offset_from_bottom == 0),
+                                    shape: cursor.shape,
+                                })
+                        } else {
+                            None
+                        },
+                    )
+                });
+                captured.unwrap_or_else(|| retained_cursor(&self.app, &panes))
             };
             let cursor_changed = cursor != surface.frame.cursor;
             let patch = protocol::PaneSurfacePatch {
