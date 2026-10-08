@@ -11,7 +11,8 @@ pub fn connect_local(
     #[cfg(windows)]
     let name = path
         .to_string_lossy()
-        .to_ns_name::<interprocess::local_socket::GenericNamespaced>()?;
+        .to_ns_name::<interprocess::local_socket::GenericNamespaced>()?
+        .into_owned();
     interprocess::local_socket::Stream::connect(name)
 }
 
