@@ -244,10 +244,14 @@ opportunities after 16 ms, and creates no refill or expiry timer. Ordinary
 presentation clocks remain unchanged. Renames that change no state receive no
 opportunity; unrelated terminal output alone cannot grant one.
 
-The default remains `ordinary`. Screening found active-output action p95
+Default Linux builds use `action-full+target` when `HERDR_LATENCY_PRESENTATION`
+is unset. Set it to `ordinary` to disable both early paths. macOS, Windows,
+and builds with `--no-default-features` that omit `latency-experiments` retain
+`ordinary`.
+Historical screening found active-output action p95
 54–70% lower, but quiet latency, CPU, and one output-freshness result exceeded
-the experiment's gates. Keep `action-full` experimental; these results do not
-justify enabling it by default or claiming an idle CPU benefit.
+the experiment's gates. Those results describe the earlier experiment and
+do not establish an idle CPU benefit for the current combined policy.
 
 Build once with selectors enabled and recording disabled, then compare both
 policies using the same binary, geometry, workload, and seed:
@@ -271,9 +275,9 @@ done
 
 The benchmark records its fixed seed. Repeat pairs in reversed order.
 Capture required outcomes and CPU coverage;
-successful-response percentiles alone cannot establish acceptance. The default
-build rejects `action-full`; macOS and Windows reject this experiment. Queue
-selectors currently accept only `current` and `64`.
+successful-response percentiles alone cannot establish acceptance. Builds without
+`latency-experiments` reject early selectors; macOS and Windows reject this
+experiment. Queue selectors currently accept only `current` and `64`.
 
 For causal diagnostics, build with `just latency-build` and set
 `HERDR_LATENCY_TRACE_DIR=1` for the benchmark. After the run finishes, use the
@@ -319,7 +323,8 @@ state falls back to ordinary scheduling. `target-all` is a diagnostic comparator
 that can carry unrelated dirty sources in a full frame after target readiness.
 Neither policy changes the ordinary presentation interval or adds an expiry,
 refill, or idle timer. macOS and Windows keep native experiment support disabled.
-The default stays `ordinary`; queue selectors remain `current` and `64`.
+Default Linux builds use `action-full+target`; queue selectors remain `current`
+and `64`. `HERDR_LATENCY_PRESENTATION=ordinary` restores ordinary presentation.
 
 `action-full+target` enables both `action-full` and `target` together. Action
 and terminal opportunities stay separate and share the two-construction budget.
@@ -353,8 +358,8 @@ outcomes, actual producer progress, per-client latency, and server/client CPU.
 The local screen completed all 79,200 outputs and reduced active-15 p95 by
 67–80%, but summed client CPU exceeded the experiment's component limit in all
 active pairs. Active-1 median improved while p95 stayed near ordinary cadence.
-These results support further experiments; they do not justify default promotion
-or an idle CPU claim. Recording-on diagnostic latency differed materially from
+These historical results do not establish the current combined policy's cost
+or an idle CPU benefit. Recording-on diagnostic latency differed materially from
 recording-disabled runs, so use diagnostics to explain mechanisms and separate
 runs to judge operating cost.
 

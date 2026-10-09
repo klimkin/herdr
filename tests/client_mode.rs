@@ -138,6 +138,7 @@ fn spawn_client_process_with_args_and_env(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_LATENCY_PRESENTATION");
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -1467,17 +1468,23 @@ fn send_pane_shell_command(socket_path: &PathBuf, pane_id: &str, command: &str) 
 #[cfg(all(feature = "latency-prof", target_os = "linux"))]
 #[test]
 fn accepted_terminal_input_presents_real_echo_and_empty_input_grants_no_opportunity() {
-    terminal_feedback_candidate_case("target");
+    terminal_feedback_candidate_case(Some("target"));
 }
 
 #[cfg(all(feature = "latency-prof", target_os = "linux"))]
 #[test]
 fn all_dirty_terminal_feedback_presents_real_echo_through_exact_report() {
-    terminal_feedback_candidate_case("target-all");
+    terminal_feedback_candidate_case(Some("target-all"));
 }
 
 #[cfg(all(feature = "latency-prof", target_os = "linux"))]
-fn terminal_feedback_candidate_case(policy: &str) {
+#[test]
+fn default_presentation_presents_real_echo_without_a_selector() {
+    terminal_feedback_candidate_case(None);
+}
+
+#[cfg(all(feature = "latency-prof", target_os = "linux"))]
+fn terminal_feedback_candidate_case(policy: Option<&str>) {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -1491,15 +1498,16 @@ fn terminal_feedback_candidate_case(policy: &str) {
     )
     .unwrap();
     let trace_env = traces.to_string_lossy();
+    let mut server_env = vec![("HERDR_LATENCY_TRACE_DIR", trace_env.as_ref())];
+    if let Some(policy) = policy {
+        server_env.push(("HERDR_LATENCY_PRESENTATION", policy));
+    }
     let server = spawn_client_process_with_args_and_env(
         &config_home,
         &runtime_dir,
         &api_socket,
         &["server"],
-        &[
-            ("HERDR_LATENCY_TRACE_DIR", &trace_env),
-            ("HERDR_LATENCY_PRESENTATION", policy),
-        ],
+        &server_env,
     );
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(
@@ -1703,7 +1711,7 @@ fn terminal_feedback_candidate_case(policy: &str) {
             "ordinary service eventually incorporates revision-only residual state"
         );
     }
-    if policy == "target-all" {
+    if policy == Some("target-all") {
         let residual = records
             .iter()
             .find(|record| record["stage"] == "server.selected_revision_residual")
