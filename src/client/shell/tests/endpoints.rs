@@ -838,12 +838,10 @@ fn saved_machine_preserves_endpoint_scoped_worktree_collapses() {
     );
     assert!(matches!(
         &switch.actions[..],
-        [ClientShellAction::Endpoint { request, .. }]
-            if matches!(
-                &request.method,
-                crate::api::schema::Method::WorkspaceFocus(target)
-                    if target.workspace_id == "remote_ws_2"
-            )
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: Some(ClientEndpointFocusTarget::Workspace(workspace_id))
+        }] if endpoint_id == &remote_id && workspace_id == "remote_ws_2"
     ));
     let remote_parent = state
         .hits
