@@ -25,6 +25,12 @@ Use `--binary` and `--probe` with the standalone benchmark for build comparisons
 `just latency-build ''` builds without instrumentation; `just latency-build`
 enables the optional feature. Keep copies of both optimized binaries.
 
+Default Linux builds use `action-full+target` early presentation without
+profiling. Set `HERDR_LATENCY_PRESENTATION=ordinary` before starting the server
+to disable both early paths. macOS, Windows, and builds that omit
+`latency-experiments` with `--no-default-features` retain ordinary presentation.
+JSONL traces and Tracy remain opt-in.
+
 | Path | Start | Completion |
 |---|---|---|
 | output | Controlled process response write start | Complete matching output in outer PTY |
