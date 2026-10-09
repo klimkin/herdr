@@ -161,6 +161,9 @@ pub(crate) struct PendingEndpointActivation {
     pub(super) source_available: bool,
     pub(super) target: EndpointLease,
     pub(super) focus: Option<crate::client::shell::ClientEndpointFocusTarget>,
+    /// Set only by a retarget after target presentation synchronization began.
+    /// The inner None cancels an earlier, not-yet-sent specific focus.
+    pub(super) late_focus: Option<Option<crate::client::shell::ClientEndpointFocusTarget>>,
     pub(super) host_focused: bool,
     pub(super) resize: crate::protocol::ClientMessage,
     pub(super) phase: ActivationPhase,
