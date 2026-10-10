@@ -8,6 +8,9 @@ use tracing::{debug, error, warn};
 use crate::ipc::LocalListener;
 use crate::server::client_transport::{self, ServerEvent};
 
+/// Bounded admission keeps connection bursts from monopolizing runtime work.
+pub(crate) const CLIENT_ACCEPT_BATCH_LIMIT: usize = 32;
+
 /// Actual accept return codes, also available to the opt-in render profiler.
 #[derive(Default)]
 pub(crate) struct AcceptStats {
@@ -36,9 +39,12 @@ pub(crate) fn accept_pending_client_connections(
     should_quit: &Arc<AtomicBool>,
     server_event_tx: &mpsc::Sender<ServerEvent>,
 ) -> io::Result<AcceptStats> {
-    let mut batch = crate::latency_prof::work::BatchTrace::begin("batch.begin.accept", 0);
+    let mut batch = crate::latency_prof::work::BatchTrace::begin(
+        "batch.begin.accept",
+        CLIENT_ACCEPT_BATCH_LIMIT,
+    );
     let mut stats = AcceptStats::default();
-    loop {
+    for _ in 0..CLIENT_ACCEPT_BATCH_LIMIT {
         if should_quit.load(Ordering::Acquire) {
             break;
         }
@@ -87,9 +93,9 @@ pub(crate) fn accept_pending_client_connections(
             Err(err) => {
                 if err.kind() == io::ErrorKind::Interrupted {
                     stats.interrupted += 1;
-                } else {
-                    stats.failed += 1;
+                    continue;
                 }
+                stats.failed += 1;
                 error!(err = %err, "client listener accept failed");
                 break;
             }
@@ -106,8 +112,20 @@ pub(crate) fn accept_pending_client_connections(
 pub(crate) fn reject_pending_client_connections(
     listener: &LocalListener,
 ) -> io::Result<AcceptStats> {
+    reject_client_connections(listener, None)
+}
+
+/// Bound rejection during runtime turns so other ready work keeps progressing.
+pub(crate) fn reject_client_connection_batch(listener: &LocalListener) -> io::Result<AcceptStats> {
+    reject_client_connections(listener, Some(CLIENT_ACCEPT_BATCH_LIMIT))
+}
+
+fn reject_client_connections(
+    listener: &LocalListener,
+    attempt_limit: Option<usize>,
+) -> io::Result<AcceptStats> {
     let mut stats = AcceptStats::default();
-    loop {
+    while attempt_limit.is_none_or(|limit| stats.attempted < limit as u64) {
         stats.attempted += 1;
         match listener.accept() {
             Ok(_stream) => {
@@ -121,9 +139,9 @@ pub(crate) fn reject_pending_client_connections(
             Err(err) => {
                 if err.kind() == io::ErrorKind::Interrupted {
                     stats.interrupted += 1;
-                } else {
-                    stats.failed += 1;
+                    continue;
                 }
+                stats.failed += 1;
                 error!(err = %err, "client listener reject failed");
                 break;
             }
