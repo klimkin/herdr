@@ -23,6 +23,11 @@ pub(crate) use super::unix_common::{
     ClientStreamReader, PinnedSshControlSocket, StatusCommandGuard,
 };
 
+/// Linux supports bounded action and selected-terminal feedback.
+pub(crate) fn early_presentation_supported() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod config_file_tests;
 

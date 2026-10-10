@@ -118,6 +118,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         client_socket_path: socket_path,
         client_socket_identity,
         clients: HashMap::new(),
+        feedback_recovery: HashSet::new(),
         native_graphics: Default::default(),
         interactive_input_deadlines: HashMap::new(),
         interactive_render_budget: None,

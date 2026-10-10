@@ -131,8 +131,6 @@ pub(crate) struct SerializedFrame {
 
 /// Immutable serialization identity of the primary prepared frame. Appended
 /// native transfers carry their own identity and cannot replace this context.
-// Early-feedback delivery consumes this helper after the instrumentation prefix.
-#[allow(dead_code)]
 pub(crate) fn primary_context(frames: &[SerializedFrame]) -> TraceContext {
     #[cfg(feature = "latency-prof")]
     if let Some(frame) = frames.first() {

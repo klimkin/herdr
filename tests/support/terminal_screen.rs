@@ -72,6 +72,35 @@ pub fn text(output: &[u8], cols: u16, rows: u16) -> String {
     }
 }
 
+pub struct CommittedSnapshot {
+    pub text: String,
+    pub cursor: Option<(u16, u16, bool)>,
+}
+
+pub fn committed_snapshot(output: &[u8], cols: u16, rows: u16) -> Option<CommittedSnapshot> {
+    let mut terminal =
+        ghostty_vt::Terminal::new(cols, rows, 0).expect("committed observer terminal");
+    terminal.write(output);
+    if terminal
+        .mode_get(ghostty_vt::MODE_SYNCHRONIZED_OUTPUT)
+        .expect("observer synchronized mode")
+    {
+        return None;
+    }
+    let text = terminal
+        .read_text_viewport((0, 0), (cols - 1, u32::from(rows - 1)), true)
+        .expect("committed text");
+    let mut render = ghostty_vt::RenderState::new().expect("committed render state");
+    render.update(&terminal).expect("committed cursor update");
+    let cursor = render.cursor().expect("committed cursor");
+    Some(CommittedSnapshot {
+        text,
+        cursor: cursor
+            .viewport
+            .map(|position| (position.x, position.y, cursor.visible)),
+    })
+}
+
 #[test]
 fn screen_text_reconstructs_partial_redraws() {
     let output = b"REMOTE_SURVIVED\x1b[1;8HSTILL_SELECTED";
@@ -79,4 +108,15 @@ fn screen_text_reconstructs_partial_redraws() {
         .windows(b"REMOTE_STILL_SELECTED".len())
         .any(|part| part == b"REMOTE_STILL_SELECTED"));
     assert!(text(output, 80, 24).contains("REMOTE_STILL_SELECTED"));
+}
+
+#[test]
+fn committed_snapshot_pairs_text_and_cursor_after_synchronized_close() {
+    let partial = b"BASE\x1b[?2026h\x1b[2J\x1b[HNEW\x1b[3;5H";
+    assert!(committed_snapshot(partial, 80, 24).is_none());
+    let mut closed = partial.to_vec();
+    closed.extend_from_slice(b"\x1b[?2026l");
+    let snapshot = committed_snapshot(&closed, 80, 24).expect("committed snapshot");
+    assert!(snapshot.text.contains("NEW"));
+    assert_eq!(snapshot.cursor, Some((4, 2, true)));
 }

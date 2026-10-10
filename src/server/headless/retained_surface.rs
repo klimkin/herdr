@@ -184,6 +184,7 @@ fn retained_cursor(
 struct RetainedRecipient<'a> {
     client_id: u64,
     surface: &'a protocol::PaneSurfaceFrame,
+    capture: Option<super::super::feedback_delivery::FeedbackCapture>,
 }
 
 struct CollectedPanePatch {
@@ -195,11 +196,13 @@ struct CollectedPanePatch {
     sgr_pixel_mouse: bool,
     alternate_screen_active: bool,
     graphics_may_have_placements: bool,
+    selective: Option<crate::pane::SelectiveTerminalSnapshot>,
 }
 
 struct RetainedRecipientUpdate {
     client_id: u64,
     patch: protocol::PaneSurfacePatch,
+    capture: Option<super::super::feedback_delivery::FeedbackCapture>,
     graphics: Option<(
         protocol::PaneSurfaceFrame,
         crate::kitty_graphics::surface::DeliveryCache,
@@ -221,6 +224,13 @@ fn has_synchronized_pane(app: &app::App, surface: &protocol::PaneSurfaceFrame) -
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RetainedOutcome {
+    Handled,
+    Residual,
+    Fallback,
+}
+
 impl HeadlessServer {
     /// Applies terminal dirty rows to the committed origin-relative pane surface.
     /// Any presentation or geometry uncertainty falls back to the complete renderer.
@@ -240,16 +250,46 @@ impl HeadlessServer {
         pty_sources: &HashSet<crate::layout::PaneId>,
         context: crate::latency_prof::TraceContext,
     ) -> bool {
+        self.render_retained_pane_surface_selected(pty_sources, context, None)
+            != RetainedOutcome::Fallback
+    }
+
+    pub(super) fn render_target_pane_surface_traced(
+        &mut self,
+        source: crate::layout::PaneId,
+        instance: u64,
+        context: crate::latency_prof::TraceContext,
+    ) -> RetainedOutcome {
+        self.render_retained_pane_surface_selected(
+            &HashSet::from([source]),
+            context,
+            Some(instance),
+        )
+    }
+
+    fn render_retained_pane_surface_selected(
+        &mut self,
+        pty_sources: &HashSet<crate::layout::PaneId>,
+        context: crate::latency_prof::TraceContext,
+        selected_instance: Option<u64>,
+    ) -> RetainedOutcome {
         let attempt = crate::latency_prof::AttemptTrace::begin(context, true, self.clients.len());
         crate::latency_prof::zone!("server.retained_render");
         crate::render_prof::event("retained_surface.attempt");
         let started = crate::render_prof::timer();
+        let mut destructive = false;
+        let mut selected_revision_residual = false;
         macro_rules! fallback {
             ($reason:literal) => {{
+                if selected_instance.is_some() && destructive {
+                    // Dirty collection consumed rows. Ordinary recovery must
+                    // rebuild full state even if subsequent output stops.
+                    self.app.full_redraw_pending = true;
+                }
                 attempt.outcome(concat!("server.frame_fallback.", $reason));
                 crate::render_prof::event(concat!("retained_surface.fallback.", $reason));
                 crate::render_prof::duration_since("retained_surface.total", started);
-                return false;
+                return RetainedOutcome::Fallback;
             }};
         }
         macro_rules! success {
@@ -258,7 +298,11 @@ impl HeadlessServer {
                 crate::render_prof::event("retained_surface.success");
                 crate::render_prof::event(concat!("retained_surface.success.", $reason));
                 crate::render_prof::duration_since("retained_surface.total", started);
-                return true;
+                return if selected_revision_residual {
+                    RetainedOutcome::Residual
+                } else {
+                    RetainedOutcome::Handled
+                };
             }};
         }
 
@@ -277,6 +321,22 @@ impl HeadlessServer {
                     .get(client_id)
                     .is_some_and(|client| client.shell_surface_active)
         });
+        if selected_instance.is_some() {
+            targets.retain(|(client_id, _, _, _, mode)| {
+                matches!(mode, ClientConnectionMode::ClientShell)
+                    && self
+                        .clients
+                        .get(client_id)
+                        .and_then(|client| client.render_state.last_pane_surface())
+                        .is_some_and(|surface| {
+                            surface.panes.iter().any(|pane| {
+                                self.app
+                                    .parse_pane_id(&pane.pane_id)
+                                    .is_some_and(|(_, pane_id)| pty_sources.contains(&pane_id))
+                            })
+                        })
+            });
+        }
         if targets.is_empty() {
             success!("no_active_surface");
         }
@@ -297,11 +357,25 @@ impl HeadlessServer {
                 continue;
             }
             if client.render_state.requires_recompute() {
+                if selected_instance.is_some() {
+                    self.app.full_redraw_pending = true;
+                    crate::render_prof::event("retained_surface.selected_recipient_recompute");
+                    continue;
+                }
                 fallback!("recompute_pending");
             }
             let Some(surface) = client.render_state.last_pane_surface() else {
                 fallback!("no_baseline");
             };
+            if selected_instance.is_some()
+                && !surface.panes.iter().any(|pane| {
+                    self.app
+                        .parse_pane_id(&pane.pane_id)
+                        .is_some_and(|(_, pane_id)| pty_sources.contains(&pane_id))
+                })
+            {
+                continue;
+            }
             if surface.boot_id != self.client_shell_boot_id
                 || surface.projection_revision != client.shell_projection_revision
                 || surface.frame.width != *cols
@@ -310,22 +384,39 @@ impl HeadlessServer {
                 || !surface.graphics.assets.is_empty()
                 || !surface.frame.graphics.is_empty()
             {
+                if selected_instance.is_some() {
+                    self.app.full_redraw_pending = true;
+                    crate::render_prof::event("retained_surface.selected_recipient_baseline");
+                    continue;
+                }
                 fallback!("baseline_mismatch");
             }
             if has_synchronized_pane(&self.app, surface) {
+                if selected_instance.is_some() {
+                    self.app.full_redraw_pending = true;
+                    crate::render_prof::event("retained_surface.selected_recipient_synchronized");
+                    continue;
+                }
                 fallback!("synchronized_visible");
             }
             recipients.push(RetainedRecipient {
                 client_id: *client_id,
                 surface,
+                capture: selected_instance.and_then(|_| {
+                    super::super::feedback_delivery::FeedbackCapture::new(&self.app, client)
+                }),
             });
         }
         if recipients.is_empty() {
+            if selected_instance.is_some() {
+                fallback!("selected_no_safe_recipient");
+            }
             success!("all_recipients_deferred");
         }
 
         let mut collected = Vec::with_capacity(pty_sources.len());
         let mut diagnostic_sources = crate::latency_prof::runtime::PaneSources::default();
+        let mut terminal_receipts = super::super::terminal_receipts::TerminalReceipts::default();
         for source in pty_sources {
             let mut public_pane_id = None;
             let mut width = 0u16;
@@ -355,9 +446,39 @@ impl HeadlessServer {
             ) else {
                 fallback!("runtime_missing");
             };
-            let Some(snapshot) = runtime.collect_dirty_patch_snapshot(width, height) else {
+            if selected_instance.is_some_and(|instance| instance != runtime.runtime_instance()) {
+                fallback!("runtime_replaced");
+            }
+            // Collection can consume rows before reporting a conservative
+            // terminal fallback; retain full recovery even on that return.
+            destructive = selected_instance.is_some();
+            let snapshot = if selected_instance.is_some() {
+                runtime.collect_selected_patch_snapshot(width, height)
+            } else {
+                runtime.collect_dirty_patch_snapshot(width, height)
+            };
+            let Some(snapshot) = snapshot else {
                 fallback!("terminal_snapshot");
             };
+            destructive = true;
+            if snapshot.graphics_may_have_placements
+                && self
+                    .app
+                    .state
+                    .workspaces
+                    .get(workspace_index)
+                    .and_then(|workspace| workspace.terminal_id(pane_id))
+                    .and_then(|terminal| self.app.early_presentation.terminal_attempt(terminal))
+                    .is_some()
+            {
+                fallback!("selected_graphics");
+            }
+            terminal_receipts.capture(
+                &self.app,
+                workspace_index,
+                pane_id,
+                snapshot.content_revision,
+            );
             if crate::latency_prof::active() {
                 diagnostic_sources.insert(&public_pane_id, runtime.runtime_instance());
                 crate::latency_prof::record_runtime_at(
@@ -388,11 +509,13 @@ impl HeadlessServer {
                 sgr_pixel_mouse: snapshot.sgr_pixel_mouse,
                 alternate_screen_active: snapshot.alternate_screen_active,
                 graphics_may_have_placements: snapshot.graphics_may_have_placements,
+                selective: snapshot.selective,
             });
         }
 
+        let mut selected_recipient_skipped = false;
         let mut updates = Vec::with_capacity(recipients.len());
-        for recipient in &recipients {
+        'recipients: for recipient in &mut recipients {
             let client_id = recipient.client_id;
             let surface = recipient.surface;
             let mut panes = surface.panes.clone();
@@ -401,6 +524,7 @@ impl HeadlessServer {
             let mut changed_panes = Vec::with_capacity(collected.len());
             let mut patch_rows = Vec::new();
             let mut metadata_changed = false;
+            let mut material_changed = false;
             let mut refresh_graphics = !surface.graphics.placements.is_empty()
                 || !surface.graphics.retained_assets.is_empty();
             for collected_pane in &collected {
@@ -414,6 +538,10 @@ impl HeadlessServer {
                 // a scrollbar gutter. Recompute layout and resize the runtime
                 // through the complete renderer before retaining further rows.
                 if pane.alternate_screen_active != collected_pane.alternate_screen_active {
+                    if selected_instance.is_some() {
+                        selected_recipient_skipped = true;
+                        continue 'recipients;
+                    }
                     fallback!("alternate_screen_geometry");
                 }
                 if patch_intersects_hyperlinks(
@@ -421,6 +549,10 @@ impl HeadlessServer {
                     pane.inner_rect,
                     &collected_pane.patch,
                 ) {
+                    if selected_instance.is_some() {
+                        selected_recipient_skipped = true;
+                        continue 'recipients;
+                    }
                     fallback!("hyperlink");
                 }
                 refresh_graphics |= collected_pane.graphics_may_have_placements;
@@ -428,6 +560,10 @@ impl HeadlessServer {
                 let Some(rows) =
                     changed_rows(&surface.frame, pane.inner_rect, &collected_pane.patch)
                 else {
+                    if selected_instance.is_some() {
+                        selected_recipient_skipped = true;
+                        continue 'recipients;
+                    }
                     fallback!("invalid_patch");
                 };
                 patch_rows.extend(rows);
@@ -438,10 +574,13 @@ impl HeadlessServer {
                     collected_pane.alternate_screen_active,
                     collected_pane.scroll_metrics,
                 ) else {
+                    if selected_instance.is_some() {
+                        selected_recipient_skipped = true;
+                        continue 'recipients;
+                    }
                     fallback!("scrollbar_patch");
                 };
                 patch_rows.extend(scrollbar_rows);
-                pane.content_revision = collected_pane.content_revision;
                 pane.mouse_reporting = collected_pane.mouse_reporting;
                 pane.sgr_pixel_mouse = collected_pane.sgr_pixel_mouse;
                 pane.alternate_screen_active = collected_pane.alternate_screen_active;
@@ -452,11 +591,53 @@ impl HeadlessServer {
                         viewport_rows: metrics.viewport_rows as u64,
                     }
                 });
+                material_changed |= *pane != previous_pane;
+                pane.content_revision = collected_pane.content_revision;
                 metadata_changed |= *pane != previous_pane;
                 changed_panes.push(pane.clone());
             }
 
-            let cursor = retained_cursor(&self.app, &panes);
+            let cursor = if selected_instance.is_some() {
+                if let Some(focused) = panes.iter().find(|pane| pane.focused) {
+                    if let Some(selected) = collected
+                        .iter()
+                        .find(|pane| pane.pane_id == focused.pane_id)
+                    {
+                        selected
+                            .selective
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.cursor)
+                            .filter(|cursor| {
+                                cursor.x < focused.inner_rect.width
+                                    && cursor.y < focused.inner_rect.height
+                            })
+                            .map(|cursor| protocol::CursorState {
+                                x: focused.inner_rect.x + cursor.x,
+                                y: focused.inner_rect.y + cursor.y,
+                                visible: cursor.visible
+                                    && selected
+                                        .scroll_metrics
+                                        .is_none_or(|metrics| metrics.offset_from_bottom == 0),
+                                shape: cursor.shape,
+                            })
+                    } else {
+                        #[cfg(feature = "latency-prof")]
+                        crate::latency_prof::record_context_at(
+                            "server.unselected_cursor_preserved",
+                            crate::latency_prof::bytes_id(focused.pane_id.as_bytes()),
+                            0,
+                            client_id,
+                            crate::latency_prof::now(),
+                            attempt.context(),
+                        );
+                        surface.frame.cursor.clone()
+                    }
+                } else {
+                    None
+                }
+            } else {
+                retained_cursor(&self.app, &panes)
+            };
             let cursor_changed = cursor != surface.frame.cursor;
             let patch = protocol::PaneSurfacePatch {
                 boot_id: self.client_shell_boot_id.clone(),
@@ -467,7 +648,22 @@ impl HeadlessServer {
                 panes: changed_panes,
                 cursor,
             };
+            #[cfg(feature = "latency-prof")]
+            if selected_instance.is_some() && patch.rows.is_empty() && cursor_changed {
+                crate::latency_prof::record_context_at(
+                    "server.selected_cursor_only",
+                    0,
+                    0,
+                    client_id,
+                    crate::latency_prof::now(),
+                    attempt.context(),
+                );
+            }
             let mut graphics_changed = false;
+            if selected_instance.is_some() && refresh_graphics {
+                selected_recipient_skipped = true;
+                continue 'recipients;
+            }
             let graphics = if refresh_graphics {
                 let Some(target) = self.shell_target_for_client(client_id) else {
                     fallback!("graphics_target");
@@ -493,22 +689,101 @@ impl HeadlessServer {
             if patch.rows.is_empty() && !cursor_changed && !metadata_changed && !graphics_changed {
                 continue;
             }
+            if selected_instance.is_some()
+                && patch.rows.is_empty()
+                && !cursor_changed
+                && !material_changed
+            {
+                selected_revision_residual = true;
+                #[cfg(feature = "latency-prof")]
+                for pane in &collected {
+                    crate::latency_prof::record_context_at(
+                        "server.selected_revision_residual",
+                        crate::latency_prof::bytes_id(pane.pane_id.as_bytes()),
+                        pane.content_revision,
+                        client_id,
+                        crate::latency_prof::now(),
+                        crate::latency_prof::TraceContext {
+                            runtime_instance: selected_instance.unwrap_or(0),
+                            ..attempt.context()
+                        },
+                    );
+                }
+                continue;
+            }
             let graphics = graphics.map(|(graphics, delivery, sources)| {
                 let mut next_surface = surface.clone();
                 crate::server::render_stream::apply_pane_surface_patch(&mut next_surface, &patch);
                 next_surface.graphics = graphics;
                 (next_surface, delivery, sources)
             });
+            if let Some(capture) = &mut recipient.capture {
+                for pane in &collected {
+                    if let Some(selective) = &pane.selective {
+                        capture.incorporate(
+                            &pane.pane_id,
+                            pane.content_revision,
+                            selective.synchronization_epoch,
+                        );
+                    }
+                }
+            }
             updates.push(RetainedRecipientUpdate {
                 client_id,
                 patch,
+                capture: recipient.capture.take(),
                 graphics,
             });
         }
+        if selected_recipient_skipped {
+            // A healthy peer can commit its staged selected patch. Peers whose
+            // rows were collected need an ordinary full rebuild at the same
+            // retained deadline, even if output stops afterward.
+            self.app.full_redraw_pending = true;
+        }
         if updates.is_empty() {
+            if selected_recipient_skipped {
+                fallback!("selected_recipient_recovery");
+            }
             success!("unchanged");
         }
-        if recipients
+        for selected in collected.iter().filter(|pane| pane.selective.is_some()) {
+            let Some((workspace_index, pane_id)) = self.app.parse_pane_id(&selected.pane_id) else {
+                fallback!("selected_placement");
+            };
+            let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
+                &self.app.terminal_runtimes,
+                workspace_index,
+                pane_id,
+            ) else {
+                fallback!("selected_runtime");
+            };
+            let (synchronized, epoch) = runtime.synchronized_output_state();
+            if synchronized
+                || selected
+                    .selective
+                    .as_ref()
+                    .is_some_and(|snapshot| epoch != snapshot.synchronization_epoch)
+            {
+                fallback!("selected_transaction");
+            }
+        }
+        if selected_instance.is_some() {
+            updates.retain(|update| {
+                let synchronized = self
+                    .clients
+                    .get(&update.client_id)
+                    .and_then(|client| client.render_state.last_pane_surface())
+                    .is_some_and(|surface| has_synchronized_pane(&self.app, surface));
+                if synchronized {
+                    self.app.full_redraw_pending = true;
+                }
+                !synchronized
+            });
+            if updates.is_empty() {
+                fallback!("selected_synchronized_recovery");
+            }
+        } else if recipients
             .iter()
             .any(|recipient| has_synchronized_pane(&self.app, recipient.surface))
         {
@@ -522,6 +797,7 @@ impl HeadlessServer {
             let RetainedRecipientUpdate {
                 client_id,
                 patch,
+                capture,
                 mut graphics,
             } = update;
             if graphics.as_ref().is_some_and(|(surface, _, _)| {
@@ -603,8 +879,26 @@ impl HeadlessServer {
                 serialized.extend_from_slice(&file_frame);
             }
             crate::render_prof::counter("retained_surface.bytes", serialized.len() as u64);
+            if selected_instance.is_some()
+                && graphics_delivery.is_none()
+                && native_upload.is_none()
+                && !self.native_graphics.is_pending(client_id)
+                && capture
+                    .as_ref()
+                    .is_none_or(|capture| !capture.valid(&self.app, client))
+            {
+                client.defer_full_render();
+                client.feedback_recovery = true;
+                self.feedback_recovery.insert(client_id);
+                deferred += 1;
+                continue;
+            }
             let send = if native_upload.is_some() || self.native_graphics.is_pending(client_id) {
                 writer.render.send_ordered_traced(serialized, &frame_trace)
+            } else if selected_instance.is_some() && graphics_delivery.is_none() {
+                writer
+                    .render
+                    .send_admitted_feedback_traced(serialized, &frame_trace)
             } else {
                 writer.render.try_send_traced(serialized, &frame_trace)
             };
@@ -628,11 +922,43 @@ impl HeadlessServer {
                     } else {
                         client.clear_deferred_render();
                     }
+                    let mut incorporated = terminal_receipts.clone();
+                    incorporated.retain_incorporated(prepared.incorporated_panes());
                     client.render_state.commit_sent_frame(prepared);
+                    incorporated.acknowledge(
+                        &mut self.app,
+                        client_id,
+                        crate::latency_prof::presentation::primary_context(&frame_trace),
+                        client.deferred_render() == DeferredRender::None,
+                    );
                     sent += 1;
                 }
-                Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                    client.defer_full_render();
+                Err(std::sync::mpsc::TrySendError::Full(bytes)) => {
+                    if selected_instance.is_some()
+                        && graphics_delivery.is_none()
+                        && native_upload.is_none()
+                        && !self.native_graphics.is_pending(client_id)
+                    {
+                        let mut receipts = terminal_receipts.clone();
+                        receipts.retain_incorporated(prepared.incorporated_panes());
+                        let pending = capture.and_then(|capture| {
+                            super::super::feedback_delivery::PendingFeedback::new(
+                                capture,
+                                prepared,
+                                bytes,
+                                frame_trace,
+                                receipts,
+                            )
+                        });
+                        if client.pending_feedback.is_none() {
+                            client.pending_feedback = pending.map(Box::new);
+                        }
+                        if client.pending_feedback.is_none() {
+                            client.defer_full_render();
+                        }
+                    } else {
+                        client.defer_full_render();
+                    }
                     deferred += 1;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {

@@ -36,6 +36,11 @@ pub(crate) use shutdown::monitor_host_shutdown;
 mod power;
 pub(crate) use power::monitor_host_power;
 
+/// macOS retains cadence-based presentation.
+pub(crate) fn early_presentation_supported() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod config_file_tests;
 

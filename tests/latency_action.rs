@@ -107,6 +107,94 @@ for change in ('missing_commit','duplicate_commit','late_commit','wrong_label','
     assert!(status.success());
 }
 
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[test]
+#[ignore = "build optimized owned-PTY helpers first; run just latency-action-behavior"]
+fn accepted_actions_present_authoritative_labels_without_redundant_frames() {
+    let target = std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into());
+    let release = std::path::PathBuf::from(target).join("release");
+    let bench = std::env::var_os("HERDR_ACTION_TEST_BENCH")
+        .unwrap_or_else(|| release.join("examples/latency_bench").into());
+    let probe = std::env::var_os("HERDR_ACTION_TEST_PROBE")
+        .unwrap_or_else(|| release.join("examples/latency_probe").into());
+    let binary = std::env::var_os("HERDR_ACTION_TEST_BINARY")
+        .unwrap_or_else(|| release.join("herdr").into());
+    let base = std::env::temp_dir().join(format!("herdr-action-contract-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("owned artifacts");
+    let output = std::process::Command::new(bench)
+        .env("HERDR_LATENCY_TRACE_DIR", "enabled")
+        .args(["--binary"])
+        .arg(binary)
+        .args(["--probe"])
+        .arg(probe)
+        .args(["--output"])
+        .arg(&base)
+        .args([
+            "--path",
+            "action",
+            "--load",
+            "quiet",
+            "--samples",
+            "8",
+            "--warmups",
+            "0",
+            "--interval-ms",
+            "40",
+            "--action-entry",
+            "json",
+            "--action-phase",
+            "output",
+        ])
+        .output()
+        .expect("owned server/TUI benchmark");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = std::fs::read_dir(&base)
+        .expect("run artifacts")
+        .next()
+        .expect("one run")
+        .expect("run path")
+        .path();
+    let samples: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run.join("samples.json")).expect("public samples"))
+            .expect("sample JSON");
+    assert_eq!(samples["summary"][0]["completed"], 8);
+    assert_eq!(samples["summary"][0]["missing"], 0);
+    let mut records = Vec::<serde_json::Value>::new();
+    for file in std::fs::read_dir(run.join("traces")).expect("public traces") {
+        let raw = std::fs::read_to_string(file.expect("trace file").path()).expect("trace text");
+        records.extend(
+            raw.lines()
+                .map(|line| serde_json::from_str(line).expect("trace JSON")),
+        );
+    }
+    assert!(records.iter().any(|r| r["stage"] == "opportunity.admitted"));
+    let admitted: std::collections::HashSet<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "opportunity.admitted")
+        .filter_map(|r| r["presentation"].as_u64())
+        .collect();
+    for receipt in records.iter().filter(|r| {
+        r["stage"] == "opportunity.action_enqueued"
+            && r["presentation"]
+                .as_u64()
+                .is_some_and(|id| admitted.contains(&id))
+    }) {
+        let enqueue = receipt["ns"].as_u64().expect("enqueue time");
+        assert!(
+            !records.iter().any(|r| r["stage"] == "server.frame_start"
+                && r["ns"]
+                    .as_u64()
+                    .is_some_and(|ns| enqueue < ns && ns < enqueue + 20_000_000)),
+            "delivered action leaves redundant ordinary construction"
+        );
+    }
+    std::fs::remove_dir_all(base).expect("owned artifact cleanup");
+}
+
 #[test]
 fn committed_action_report_rejects_malformed_and_pregrant_frames() {
     let script = r#"
