@@ -3024,27 +3024,66 @@ fn ghostty_recent_text_for_terminal(
     terminal: &crate::ghostty::Terminal,
     lines: usize,
 ) -> Result<String, crate::ghostty::Error> {
-    let Some((start, end, _)) = ghostty_recent_read_range(terminal, lines)? else {
+    ghostty_recent_text_with_row_reader(terminal, lines, |row, text| {
+        ghostty_screen_row_into(terminal, row as u32, text)
+    })
+}
+
+fn ghostty_recent_text_with_row_reader(
+    terminal: &crate::ghostty::Terminal,
+    lines: usize,
+    mut read_row: impl FnMut(usize, &mut String) -> Result<(), crate::ghostty::Error>,
+) -> Result<String, crate::ghostty::Error> {
+    let mut inspected_row = String::new();
+    let Some(range) = ghostty_recent_read_range_with_row_reader(
+        terminal,
+        lines,
+        &mut inspected_row,
+        &mut read_row,
+    )?
+    else {
         return Ok(String::new());
     };
-    let mut rows = Vec::with_capacity(end.saturating_sub(start).saturating_add(1));
-    for y in start..=end {
-        rows.push(ghostty_screen_row(terminal, y as u32)?);
+
+    // The primary-screen range probe already read the blank suffix and its
+    // preceding content row. Reuse that evidence without reading either again.
+    let Some(end) = range
+        .blank_suffix_start
+        .checked_sub(1)
+        .map(|last| last.min(range.end))
+        .filter(|&end| end >= range.start)
+    else {
+        return Ok(String::new());
+    };
+    let row_count = end - range.start + 1;
+    let mut text = String::with_capacity((usize::from(range.cols) + 1).saturating_mul(row_count));
+    let mut last_content_end = 0;
+    for row in range.start..=end {
+        let row_start = text.len();
+        if Some(row) == range.last_content_row {
+            text.push_str(&inspected_row);
+        } else {
+            read_row(row, &mut text)?;
+        }
+        text.push('\n');
+        if text.len() > row_start + 1 {
+            last_content_end = text.len();
+        }
     }
-    trim_trailing_blank_rows(&mut rows);
-    Ok(recent_text_from_rows(&rows, lines))
+    text.truncate(last_content_end);
+    Ok(text)
 }
 
 fn ghostty_recent_text_unwrapped_for_terminal(
     terminal: &crate::ghostty::Terminal,
     lines: usize,
 ) -> Result<String, crate::ghostty::Error> {
-    let Some((start, end, cols)) = ghostty_recent_read_range(terminal, lines)? else {
+    let Some(range) = ghostty_recent_read_range(terminal, lines)? else {
         return Ok(String::new());
     };
     terminal.read_text_screen(
-        (0, start as u32),
-        (cols.saturating_sub(1), end as u32),
+        (0, range.start as u32),
+        (range.cols.saturating_sub(1), range.end as u32),
         false,
     )
 }
@@ -3054,21 +3093,43 @@ fn ghostty_recent_ansi_for_terminal(
     lines: usize,
     unwrap: bool,
 ) -> Result<String, crate::ghostty::Error> {
-    let Some((start, end, cols)) = ghostty_recent_read_range(terminal, lines)? else {
+    let Some(range) = ghostty_recent_read_range(terminal, lines)? else {
         return Ok(String::new());
     };
     terminal.read_ansi_screen(
-        (0, start as u32),
-        (cols.saturating_sub(1), end as u32),
+        (0, range.start as u32),
+        (range.cols.saturating_sub(1), range.end as u32),
         false,
         unwrap,
     )
 }
 
+struct GhosttyRecentReadRange {
+    start: usize,
+    end: usize,
+    cols: u16,
+    last_content_row: Option<usize>,
+    blank_suffix_start: usize,
+}
+
 fn ghostty_recent_read_range(
     terminal: &crate::ghostty::Terminal,
     lines: usize,
-) -> Result<Option<(usize, usize, u16)>, crate::ghostty::Error> {
+) -> Result<Option<GhosttyRecentReadRange>, crate::ghostty::Error> {
+    ghostty_recent_read_range_with_row_reader(
+        terminal,
+        lines,
+        &mut String::new(),
+        &mut |row, text| ghostty_screen_row_into(terminal, row as u32, text),
+    )
+}
+
+fn ghostty_recent_read_range_with_row_reader(
+    terminal: &crate::ghostty::Terminal,
+    lines: usize,
+    inspected_row: &mut String,
+    read_row: &mut impl FnMut(usize, &mut String) -> Result<(), crate::ghostty::Error>,
+) -> Result<Option<GhosttyRecentReadRange>, crate::ghostty::Error> {
     let total_rows = terminal.total_rows()?;
     let cols = terminal.cols()?;
     if total_rows == 0 || cols == 0 || lines == 0 {
@@ -3078,7 +3139,13 @@ fn ghostty_recent_read_range(
     let physical_end = total_rows.saturating_sub(1);
     if terminal.active_screen()? != crate::ghostty::ActiveScreen::Primary {
         let start = physical_end.saturating_add(1).saturating_sub(lines);
-        return Ok(Some((start, physical_end, cols)));
+        return Ok(Some(GhosttyRecentReadRange {
+            start,
+            end: physical_end,
+            cols,
+            last_content_row: None,
+            blank_suffix_start: total_rows,
+        }));
     }
 
     let rows = usize::from(terminal.rows()?);
@@ -3090,8 +3157,11 @@ fn ghostty_recent_read_range(
         .saturating_add(usize::from(terminal.cursor_y()?))
         .min(total_rows.saturating_sub(1));
     let mut last_content_row = None;
+    inspected_row.reserve(usize::from(cols));
     for row in (viewport_start..total_rows).rev() {
-        if !ghostty_screen_row(terminal, row as u32)?.trim().is_empty() {
+        inspected_row.clear();
+        read_row(row, inspected_row)?;
+        if !inspected_row.is_empty() {
             last_content_row = Some(row);
             break;
         }
@@ -3100,7 +3170,13 @@ fn ghostty_recent_read_range(
         .map(|row| row.max(cursor_row))
         .unwrap_or_else(|| total_rows.saturating_sub(1));
     let start = end.saturating_add(1).saturating_sub(lines);
-    Ok(Some((start, end, cols)))
+    Ok(Some(GhosttyRecentReadRange {
+        start,
+        end,
+        cols,
+        last_content_row,
+        blank_suffix_start: last_content_row.map_or(viewport_start, |row| row + 1),
+    }))
 }
 
 fn ghostty_set_scroll_offset_from_bottom(
@@ -3129,11 +3205,12 @@ fn ghostty_extract_selection(
         .read_text_screen((start_col, start_row), (end_col, end_row), false)
 }
 
-fn ghostty_screen_row(
+fn ghostty_screen_row_into(
     terminal: &crate::ghostty::Terminal,
     y: u32,
-) -> Result<String, crate::ghostty::Error> {
-    let mut line = String::new();
+    line: &mut String,
+) -> Result<(), crate::ghostty::Error> {
+    let start = line.len();
     // Keep one page lookup per row and reuse grapheme storage across its cells.
     terminal.for_each_screen_row_cell(y, |wide, graphemes| {
         if wide == crate::ghostty::CellWide::SpacerTail {
@@ -3151,7 +3228,8 @@ fn ghostty_screen_row(
             }
         }
     })?;
-    Ok(line.trim_end().to_string())
+    line.truncate(start + line[start..].trim_end().len());
+    Ok(())
 }
 
 fn ghostty_line_from_cells(
@@ -3647,16 +3725,6 @@ fn lines_to_text(lines: Vec<String>) -> String {
 pub(super) fn trim_trailing_blank_rows(rows: &mut Vec<String>) {
     while rows.last().is_some_and(|row| row.trim().is_empty()) {
         rows.pop();
-    }
-}
-
-fn recent_text_from_rows(rows: &[String], lines: usize) -> String {
-    let start = rows.len().saturating_sub(lines);
-    let text = rows[start..].join("\n");
-    if text.is_empty() {
-        text
-    } else {
-        format!("{text}\n")
     }
 }
 
@@ -5955,6 +6023,78 @@ mod tests {
     }
 
     #[test]
+    fn recent_primary_rows_anchor_at_cursor_and_content_below_cursor() {
+        let mut terminal = crate::ghostty::Terminal::new(20, 8, 100).unwrap();
+        terminal.write(b"seed\x1b[6;1H");
+        assert_eq!(ghostty_recent_text_for_terminal(&terminal, 3).unwrap(), "");
+        assert_eq!(
+            ghostty_recent_text_for_terminal(&terminal, 6).unwrap(),
+            "seed\n"
+        );
+
+        terminal.write(b"\x1b[5;1Htail\x1b[2;1H");
+        assert_eq!(
+            ghostty_recent_text_for_terminal(&terminal, 2).unwrap(),
+            "\ntail\n"
+        );
+    }
+
+    #[test]
+    fn recent_rows_trim_unicode_whitespace_and_keep_interior_blank_rows() {
+        let mut terminal = crate::ghostty::Terminal::new(20, 6, 100).unwrap();
+        terminal.write("seed\r\n \u{a0}\u{2003}\r\nkeep \u{a0}\u{2003}  ".as_bytes());
+        assert_eq!(
+            ghostty_recent_text_for_terminal(&terminal, 6).unwrap(),
+            "seed\n\nkeep\n"
+        );
+
+        terminal.write(b"\x1b[2J\x1b[H");
+        assert_eq!(ghostty_recent_text_for_terminal(&terminal, 6).unwrap(), "");
+        assert_eq!(ghostty_recent_text_for_terminal(&terminal, 0).unwrap(), "");
+        terminal.write(b"\x1b[?1049h");
+        assert_eq!(ghostty_recent_text_for_terminal(&terminal, 6).unwrap(), "");
+    }
+
+    #[test]
+    fn recent_rows_can_reach_history_above_a_cleared_primary_screen() {
+        let mut terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        terminal.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\x1b[2J\x1b[H");
+        assert_eq!(ghostty_recent_text_for_terminal(&terminal, 3).unwrap(), "");
+        assert_eq!(
+            ghostty_recent_text_for_terminal(&terminal, 5).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn recent_text_reads_each_selected_or_probed_row_once() {
+        for input in [
+            b"seed".as_slice(),
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix".as_slice(),
+            b"seed\x1b[6;1H".as_slice(),
+            b"\x1b[?1049hone\x1b[6;1Hsix".as_slice(),
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\x1b[2J\x1b[H".as_slice(),
+        ] {
+            let mut terminal = crate::ghostty::Terminal::new(20, 6, 10_000).unwrap();
+            terminal.write(input);
+            let mut reads = vec![0; terminal.total_rows().unwrap()];
+            let text = ghostty_recent_text_with_row_reader(&terminal, 8, |row, text| {
+                reads[row] += 1;
+                ghostty_screen_row_into(&terminal, row as u32, text)
+            })
+            .unwrap();
+            assert_eq!(
+                text,
+                ghostty_recent_text_for_terminal(&terminal, 8).unwrap()
+            );
+            assert!(
+                reads.iter().all(|&count| count == 1),
+                "each required row should be read once, got {reads:?} for {input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn recent_unwrapped_text_ignores_soft_wraps() {
         let (tx, _rx) = mpsc::channel(4);
         let mut terminal = crate::ghostty::Terminal::new(5, 3, 100).unwrap();
@@ -6605,6 +6745,78 @@ mod tests {
             ]
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn process_pty_bytes_skips_inert_ascii_query_dispatch_and_preserves_followup_reply() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let mut ordinary_output = [b'x'; 8192];
+        for line in ordinary_output.chunks_mut(80) {
+            *line.last_mut().unwrap() = b'\r';
+        }
+
+        let result = pane.process_pty_bytes(pane_id, 0, &ordinary_output, &tx);
+        assert!(result.terminal_responses.is_empty());
+        assert_eq!(
+            pane.core
+                .lock()
+                .unwrap()
+                .c1_xtgettcap_tracker
+                .state_machine_dispatches(),
+            0,
+            "ordinary ASCII/CR cannot change capability-query state"
+        );
+
+        let query = b"\x90+q5463\x9c";
+        let result = pane.process_pty_bytes(pane_id, 0, query, &tx);
+        assert_eq!(
+            result.terminal_responses,
+            vec![expected_xtgettcap_response("5463", None)]
+        );
+        assert_eq!(
+            pane.core
+                .lock()
+                .unwrap()
+                .c1_xtgettcap_tracker
+                .state_machine_dispatches(),
+            query.len(),
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn process_pty_bytes_preserves_native_cancellation_after_inert_output() {
+        for cancellation in [b"\x18".as_slice(), b"\x1a", b"\x1b"] {
+            for chunk_size in [1, 7, 128] {
+                let (tx, mut rx) = mpsc::channel(4);
+                let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+                let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+                let pane_id = PaneId::from_raw(1);
+                let mut bytes = b"\x1bP+q5463;524742\x9cordinary output\r\n".to_vec();
+                bytes.extend_from_slice(cancellation);
+                bytes.extend_from_slice(b"\x1bP+q5375\x1b\\");
+                let mut replies = Vec::new();
+                for chunk in bytes.chunks(chunk_size) {
+                    replies.extend(
+                        pane.process_pty_bytes(pane_id, 0, chunk, &tx)
+                            .terminal_responses,
+                    );
+                }
+                assert_eq!(
+                    replies,
+                    vec![
+                        expected_xtgettcap_response("5463", None),
+                        expected_xtgettcap_response("524742", Some(b"8")),
+                        expected_xtgettcap_response("5375", None),
+                    ],
+                    "cancellation={cancellation:?}, chunk_size={chunk_size}"
+                );
+                assert!(rx.try_recv().is_err());
+            }
+        }
     }
 
     #[test]
