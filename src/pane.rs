@@ -21,6 +21,8 @@ use tracing::{error, info, warn};
 use crate::detect::{Agent, AgentState};
 use crate::events::AppEvent;
 use crate::layout::PaneId;
+#[cfg(unix)]
+use crate::pty::actor::PtyForegroundObserver;
 use crate::pty::actor::{PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadResult};
 use crate::render_signal::RenderSignal;
 
@@ -924,22 +926,37 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 }
 
 #[cfg(unix)]
-// Handoff detection needs both the write-bracketed text revision and detection epoch.
-#[allow(clippy::too_many_arguments)]
-fn spawn_basic_detection_task(
+struct BasicDetectionTaskConfig {
     pane_id: PaneId,
     child_pid: Arc<AtomicU32>,
+    foreground_observer: Option<PtyForegroundObserver>,
     terminal: Arc<PaneTerminal>,
     content_seq: Arc<AtomicU64>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     self_reported_agent_active: Arc<AtomicBool>,
     state_events: mpsc::Sender<AppEvent>,
+}
+
+#[cfg(unix)]
+fn spawn_basic_detection_task(
+    config: BasicDetectionTaskConfig,
 ) -> (
     tokio::task::AbortHandle,
     Arc<Notify>,
     Arc<Mutex<Option<PendingAgentRelease>>>,
 ) {
+    let BasicDetectionTaskConfig {
+        pane_id,
+        child_pid,
+        foreground_observer,
+        terminal,
+        content_seq,
+        detection_content_seq,
+        full_lifecycle_authority_active,
+        self_reported_agent_active,
+        state_events,
+    } = config;
     let detect_reset_notify = Arc::new(Notify::new());
     let detect_reset = detect_reset_notify.clone();
     let pending_release = Arc::new(Mutex::new(None));
@@ -1026,7 +1043,16 @@ fn spawn_basic_detection_task(
             )
             .await;
             let foreground_pgid = (pid > 0)
-                .then(|| crate::detect::foreground_process_group_id(pid))
+                .then(|| {
+                    #[cfg(unix)]
+                    if let Some(pgid) = foreground_observer
+                        .as_ref()
+                        .and_then(PtyForegroundObserver::foreground_process_group_id)
+                    {
+                        return Some(pgid);
+                    }
+                    crate::detect::foreground_process_group_id(pid)
+                })
                 .flatten();
             let process_group_changed =
                 foreground_group_changed(foreground_pgid, last_foreground_pgid);
@@ -1551,6 +1577,15 @@ impl PaneRuntimeIo {
             PaneRuntimeIo::TestChannel { .. } => {
                 Err(std::io::Error::other("test runtime has no PTY master fd"))
             }
+        }
+    }
+
+    #[cfg(unix)]
+    fn foreground_observer(&self) -> Option<PtyForegroundObserver> {
+        match self {
+            PaneRuntimeIo::Actor(actor) => Some(actor.foreground_observer()),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => None,
         }
     }
 
@@ -2703,16 +2738,18 @@ impl PaneRuntime {
 
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         let self_reported_agent_active = Arc::new(AtomicBool::new(false));
-        let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
-            pane_id,
-            child_pid.clone(),
-            terminal.clone(),
-            content_seq.clone(),
-            detection_content_seq.clone(),
-            full_lifecycle_authority_active.clone(),
-            self_reported_agent_active.clone(),
-            events,
-        );
+        let (detect_handle, detect_reset_notify, pending_release) =
+            spawn_basic_detection_task(BasicDetectionTaskConfig {
+                pane_id,
+                child_pid: child_pid.clone(),
+                foreground_observer: io.foreground_observer(),
+                terminal: terminal.clone(),
+                content_seq: content_seq.clone(),
+                detection_content_seq: detection_content_seq.clone(),
+                full_lifecycle_authority_active: full_lifecycle_authority_active.clone(),
+                self_reported_agent_active: self_reported_agent_active.clone(),
+                state_events: events,
+            });
 
         Ok(Self {
             pane_id,
@@ -2953,6 +2990,8 @@ impl PaneRuntime {
             const TICK_IDENTIFIED: Duration = Duration::from_millis(300);
             const TICK_PENDING_RELEASE: Duration = Duration::from_millis(50);
 
+            #[cfg(unix)]
+            let foreground_observer = io.foreground_observer();
             let child_pid = child_pid.clone();
             let terminal = terminal.clone();
             let state_events = events.clone();
@@ -3089,7 +3128,19 @@ impl PaneRuntime {
                     let foreground_observation_due = true;
                     let foreground_pgid = match (pid, foreground_observation_due) {
                         (0, _) => None,
-                        (_, true) => detect::foreground_process_group_id(pid),
+                        (_, true) => {
+                            #[cfg(unix)]
+                            if let Some(pgid) = foreground_observer
+                                .as_ref()
+                                .and_then(PtyForegroundObserver::foreground_process_group_id)
+                            {
+                                Some(pgid)
+                            } else {
+                                detect::foreground_process_group_id(pid)
+                            }
+                            #[cfg(not(unix))]
+                            detect::foreground_process_group_id(pid)
+                        }
                         _ => last_foreground_pgid,
                     };
                     #[cfg(windows)]
@@ -4032,16 +4083,17 @@ impl PaneRuntime {
             handle.abort();
         }
         let (events, receiver) = mpsc::channel(8);
-        let (handle, reset, release) = spawn_basic_detection_task(
-            self.pane_id,
-            self.child_pid.clone(),
-            self.terminal.clone(),
-            self.content_seq.clone(),
-            self.detection_content_seq.clone(),
-            self.full_lifecycle_authority_active.clone(),
-            self.self_reported_agent_active.clone(),
-            events,
-        );
+        let (handle, reset, release) = spawn_basic_detection_task(BasicDetectionTaskConfig {
+            pane_id: self.pane_id,
+            child_pid: self.child_pid.clone(),
+            foreground_observer: self.io.foreground_observer(),
+            terminal: self.terminal.clone(),
+            content_seq: self.content_seq.clone(),
+            detection_content_seq: self.detection_content_seq.clone(),
+            full_lifecycle_authority_active: self.full_lifecycle_authority_active.clone(),
+            self_reported_agent_active: self.self_reported_agent_active.clone(),
+            state_events: events,
+        });
         self.detect_handle = Some(handle);
         self.detect_reset_notify = reset;
         self.pending_release = release;
