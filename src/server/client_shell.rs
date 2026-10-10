@@ -275,6 +275,7 @@ pub(super) struct RenderedPaneSurface {
     pub(super) graphics: protocol::SurfaceGraphicsScene,
     pub(super) graphics_delivery: crate::kitty_graphics::surface::DeliveryCache,
     pub(super) graphics_sources: crate::kitty_graphics::surface::SourceFiles,
+    pub(super) diagnostic_sources: crate::latency_prof::runtime::PaneSources,
 }
 
 #[derive(Debug)]
@@ -341,6 +342,7 @@ pub(super) fn render_pane_surface(
             layout,
             area,
         );
+    let mut diagnostic_sources = crate::latency_prof::runtime::PaneSources::default();
     let panes = target
         .map(|target| {
             let workspace_index = target.workspace_index;
@@ -378,6 +380,18 @@ pub(super) fn render_pane_surface(
                                 after | 1
                             }
                         });
+                        if crate::latency_prof::active() {
+                            let instance = runtime.map_or(0, |runtime| runtime.runtime_instance());
+                            diagnostic_sources.insert(&pane_id, instance);
+                            crate::latency_prof::record_runtime_at(
+                                "pane.identity",
+                                pane.id.raw() as u64,
+                                crate::latency_prof::bytes_id(pane_id.as_bytes()),
+                                0,
+                                crate::latency_prof::now(),
+                                instance,
+                            );
+                        }
                         protocol::PaneSurfacePane {
                             pane_id,
                             content_revision,
@@ -491,6 +505,7 @@ pub(super) fn render_pane_surface(
         graphics,
         graphics_delivery: next_graphics_delivery,
         graphics_sources,
+        diagnostic_sources,
     })
 }
 

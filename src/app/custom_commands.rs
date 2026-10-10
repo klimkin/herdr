@@ -759,7 +759,9 @@ mod tests {
         let success: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(success.result, crate::api::schema::ResponseResult::Ok {});
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !path.exists() && std::time::Instant::now() < deadline {
+        while !matches!(std::fs::read_to_string(&path).as_deref(), Ok("invoked"))
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "invoked");

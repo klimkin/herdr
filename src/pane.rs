@@ -1173,7 +1173,10 @@ fn spawn_basic_detection_task(
             }
 
             let content_changed = last_detection_text
-                .refresh(agent, &content_seq, || terminal.detection_text_for_cache());
+                .refresh(agent, &content_seq, || {
+                    crate::render_prof::event("detection.snapshot");
+                    terminal.detection_text_for_cache()
+                });
             let content = &last_detection_text.text;
             last_screen_scan_detection_content_seq = current_detection_content_seq;
             let osc_title = terminal.agent_osc_title();
@@ -1499,6 +1502,7 @@ async fn run_terminal_compression_task(
 /// compression step may finish before releasing its terminal reference.
 pub struct PaneRuntime {
     pane_id: PaneId,
+    runtime_instance: u64,
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
     current_size: Cell<(u16, u16, u32, u32)>,
@@ -2196,7 +2200,11 @@ fn publish_terminal_bells(pane_id: PaneId, count: u16, events: &mpsc::Sender<App
     if count == 0 {
         return;
     }
-    if let Err(err) = events.try_send(AppEvent::TerminalBell { pane_id, count }) {
+    if let Err(err) = AppEvent::try_send_traced(
+        events,
+        AppEvent::TerminalBell { pane_id, count },
+        "event.class.terminal_bell",
+    ) {
         warn!(
             pane = pane_id.raw(),
             count,
@@ -2221,7 +2229,11 @@ fn publish_reported_cwd(
         }
         *current = Some(cwd.clone());
     }
-    if let Err(err) = events.try_send(AppEvent::TerminalCwdReported { pane_id, cwd }) {
+    if let Err(err) = AppEvent::try_send_traced(
+        events,
+        AppEvent::TerminalCwdReported { pane_id, cwd },
+        "event.class.terminal_cwd",
+    ) {
         warn!(
             pane = pane_id.raw(),
             err = %err,
@@ -2527,6 +2539,7 @@ impl PaneRuntime {
         use std::os::fd::FromRawFd;
 
         let master_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(master_fd) };
+        let runtime_instance = crate::terminal::runtime_instance::allocate()?;
 
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
@@ -2578,7 +2591,9 @@ impl PaneRuntime {
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
             let delay_rt = rt.clone();
+            let mut diagnostic_stimuli = crate::latency_prof::Stimuli::default();
             let on_read = Box::new(move |bytes: &[u8]| {
+                let diagnostic_ids = diagnostic_stimuli.observe(bytes);
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
@@ -2587,14 +2602,41 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
-                content_seq.fetch_add(1, Ordering::Release);
+                let revision = content_seq.fetch_add(1, Ordering::Release) + 1;
                 drop(_content_write_guard);
+                crate::latency_prof::record_runtime_at(
+                    "terminal.content_ready",
+                    pane_id.raw() as u64,
+                    revision,
+                    0,
+                    crate::latency_prof::now(),
+                    runtime_instance,
+                );
+                for id in diagnostic_ids {
+                    crate::latency_prof::record_runtime_at(
+                        "terminal.stimulus",
+                        id,
+                        revision,
+                        pane_id.raw() as u64,
+                        crate::latency_prof::now(),
+                        runtime_instance,
+                    );
+                }
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
                 observe_detection_content_change(bytes, &detection_content_seq);
                 let title_requested =
                     result.terminal_title_changed && render_dirty.request_terminal_title(pane_id);
                 let render_requested = result.request_render && render_dirty.request_pty(pane_id);
+                crate::latency_prof::runtime::notification(
+                    pane_id.raw() as u64,
+                    runtime_instance,
+                    revision,
+                    result.terminal_title_changed,
+                    result.request_render,
+                    title_requested || render_requested,
+                    false,
+                );
                 if title_requested || render_requested {
                     render_notify.notify_one();
                 }
@@ -2603,7 +2645,17 @@ impl PaneRuntime {
                     let render_dirty = render_dirty.clone();
                     delay_rt.spawn(async move {
                         tokio::time::sleep(delay).await;
-                        if render_dirty.request_pty(pane_id) {
+                        let requested = render_dirty.request_pty(pane_id);
+                        crate::latency_prof::runtime::notification(
+                            pane_id.raw() as u64,
+                            runtime_instance,
+                            revision,
+                            false,
+                            true,
+                            requested,
+                            true,
+                        );
+                        if requested {
                             render_notify.notify_one();
                         }
                     });
@@ -2612,7 +2664,11 @@ impl PaneRuntime {
                     publish_reported_cwd(pane_id, cwd, &reported_cwd, &read_events);
                 }
                 for content in result.clipboard_writes {
-                    if let Err(err) = read_events.try_send(AppEvent::ClipboardWrite { content }) {
+                    if let Err(err) = AppEvent::try_send_traced(
+                        &read_events,
+                        AppEvent::ClipboardWrite { content },
+                        "event.class.clipboard",
+                    ) {
                         warn!(
                             pane = pane_id.raw(),
                             err = %err,
@@ -2660,6 +2716,7 @@ impl PaneRuntime {
 
         Ok(Self {
             pane_id,
+            runtime_instance,
             terminal,
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
@@ -2699,6 +2756,7 @@ impl PaneRuntime {
         initial_state: SpawnInitialState<'_>,
         agent_detection: AgentDetection,
     ) -> std::io::Result<Self> {
+        let runtime_instance = crate::terminal::runtime_instance::allocate()?;
         crate::logging::pane_spawn_started(pane_id.raw(), rows, cols, scrollback_limit_bytes);
 
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
@@ -2781,7 +2839,9 @@ impl PaneRuntime {
             let reported_cwd = reported_cwd.clone();
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
+            let mut diagnostic_stimuli = crate::latency_prof::Stimuli::default();
             let on_read = Box::new(move |bytes: &[u8]| {
+                let diagnostic_ids = diagnostic_stimuli.observe(bytes);
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
@@ -2790,8 +2850,26 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
-                content_seq.fetch_add(1, Ordering::Release);
+                let revision = content_seq.fetch_add(1, Ordering::Release) + 1;
                 drop(_content_write_guard);
+                crate::latency_prof::record_runtime_at(
+                    "terminal.content_ready",
+                    pane_id.raw() as u64,
+                    revision,
+                    0,
+                    crate::latency_prof::now(),
+                    runtime_instance,
+                );
+                for id in diagnostic_ids {
+                    crate::latency_prof::record_runtime_at(
+                        "terminal.stimulus",
+                        id,
+                        revision,
+                        pane_id.raw() as u64,
+                        crate::latency_prof::now(),
+                        runtime_instance,
+                    );
+                }
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
                 if agent_detection == AgentDetection::Enabled {
@@ -2800,6 +2878,15 @@ impl PaneRuntime {
                 let title_requested =
                     result.terminal_title_changed && render_dirty.request_terminal_title(pane_id);
                 let render_requested = result.request_render && render_dirty.request_pty(pane_id);
+                crate::latency_prof::runtime::notification(
+                    pane_id.raw() as u64,
+                    runtime_instance,
+                    revision,
+                    result.terminal_title_changed,
+                    result.request_render,
+                    title_requested || render_requested,
+                    false,
+                );
                 if title_requested || render_requested {
                     render_notify.notify_one();
                 }
@@ -2808,7 +2895,17 @@ impl PaneRuntime {
                     let render_dirty = render_dirty.clone();
                     rt.spawn(async move {
                         tokio::time::sleep(delay).await;
-                        if render_dirty.request_pty(pane_id) {
+                        let requested = render_dirty.request_pty(pane_id);
+                        crate::latency_prof::runtime::notification(
+                            pane_id.raw() as u64,
+                            runtime_instance,
+                            revision,
+                            false,
+                            true,
+                            requested,
+                            true,
+                        );
+                        if requested {
                             render_notify.notify_one();
                         }
                     });
@@ -2817,7 +2914,11 @@ impl PaneRuntime {
                     publish_reported_cwd(pane_id, cwd, &reported_cwd, &events);
                 }
                 for content in result.clipboard_writes {
-                    if let Err(err) = events.try_send(AppEvent::ClipboardWrite { content }) {
+                    if let Err(err) = AppEvent::try_send_traced(
+                        &events,
+                        AppEvent::ClipboardWrite { content },
+                        "event.class.clipboard",
+                    ) {
                         warn!(
                             pane = pane_id.raw(),
                             err = %err,
@@ -3180,6 +3281,7 @@ impl PaneRuntime {
 
                     let content_changed =
                         last_detection_text.refresh(agent, &text_content_seq, || {
+                            crate::render_prof::event("detection.snapshot");
                             terminal.detection_text_for_cache()
                         });
                     let content = &last_detection_text.text;
@@ -3273,6 +3375,7 @@ impl PaneRuntime {
 
         Ok(Self {
             pane_id,
+            runtime_instance,
             terminal,
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
@@ -3335,6 +3438,10 @@ impl PaneRuntime {
 
     pub(crate) fn content_seq(&self) -> u64 {
         self.content_seq.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn runtime_instance(&self) -> u64 {
+        self.runtime_instance
     }
 
     /// Resize if the dimensions actually changed.
@@ -4063,6 +4170,8 @@ impl PaneRuntime {
         (
             Self {
                 pane_id,
+                runtime_instance: crate::terminal::runtime_instance::allocate()
+                    .expect("test runtime instance"),
                 terminal,
                 io: PaneRuntimeIo::TestChannel {
                     sender: tx,
@@ -5418,6 +5527,8 @@ mod tests {
             cwd_process_exited: Arc::new(AtomicBool::new(false)),
             persistence_cwd: Mutex::new(None),
             pane_id,
+            runtime_instance: crate::terminal::runtime_instance::allocate()
+                .expect("test runtime instance"),
             terminal,
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
@@ -5458,6 +5569,8 @@ mod tests {
             cwd_process_exited: Arc::new(AtomicBool::new(false)),
             persistence_cwd: Mutex::new(None),
             pane_id,
+            runtime_instance: crate::terminal::runtime_instance::allocate()
+                .expect("test runtime instance"),
             terminal,
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,

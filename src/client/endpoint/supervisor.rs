@@ -455,12 +455,14 @@ fn connect_once(
     }
     let (mut stream, lifetime): (_, Box<dyn Send>) = match target {
         ConnectTarget::Local(path) => {
-            let stream = crate::ipc::connect_local_stream_cancellable(
+            let connect_trace = crate::latency_prof::connect::ConnectTrace::begin();
+            let connection = crate::ipc::connect_local_stream_cancellable(
                 path,
                 &cancelled,
                 Instant::now() + super::super::handshake::LOCAL_HANDSHAKE_READ_TIMEOUT,
-            )
-            .map_err(|error| {
+            );
+            connect_trace.complete(&connection);
+            let stream = connection.map_err(|error| {
                 // An absent Local socket is transient, unlike a missing SSH install.
                 if error.kind() == std::io::ErrorKind::NotFound {
                     std::io::Error::new(
