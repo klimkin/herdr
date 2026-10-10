@@ -1134,6 +1134,13 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
     ));
 
     support::stop_spawned_herdr(&mut *local.child);
+    // A bound API socket may still serve shutdown errors until this process exits.
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+            local.child.try_wait().unwrap().is_some()
+        }),
+        "Local server must finish shutdown before its socket can identify a restart"
+    );
     local.close_master();
     drop(local);
     assert!(
@@ -1161,7 +1168,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         })
         .to_string(),
     );
-    assert_eq!(created["result"]["type"], "workspace_created");
+    assert_eq!(created["result"]["type"], "workspace_created", "{created}");
     assert!(
         wait_until(Duration::from_secs(12), Duration::from_millis(20), || {
             screen_text().contains("local-returned")
