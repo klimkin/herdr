@@ -909,6 +909,26 @@ impl HeadlessServer {
         changed
     }
 
+    /// Input updates activity; an unchanged owner keeps its synchronized state.
+    /// Resize, focus and other client mutations still use full promotion.
+    fn record_client_input_activity(&mut self, client_id: u64) -> bool {
+        if self.foreground_client_id != Some(client_id) {
+            return self.promote_client_to_foreground(client_id);
+        }
+        let stamp = self.allocate_activity_stamp();
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        if !client.shell_surface_active {
+            return false;
+        }
+        client.last_activity = stamp;
+        if client.outer_terminal_focus == Some(true) {
+            self.app.state.mark_active_tab_seen();
+        }
+        false
+    }
+
     fn promote_latest_remaining_client(&mut self) -> bool {
         let next_foreground = latest_shell_client(&self.clients);
         let changed = next_foreground != self.foreground_client_id;
@@ -1208,7 +1228,7 @@ impl HeadlessServer {
                 {
                     return false;
                 }
-                let foreground_changed = self.promote_client_to_foreground(client_id);
+                let foreground_changed = self.record_client_input_activity(client_id);
                 let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
@@ -1248,7 +1268,7 @@ impl HeadlessServer {
                 {
                     return false;
                 }
-                let foreground_changed = self.promote_client_to_foreground(client_id);
+                let foreground_changed = self.record_client_input_activity(client_id);
                 let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
                     return foreground_changed | geometry_changed;
@@ -2428,7 +2448,7 @@ impl HeadlessServer {
                         .track_shell_input(ClientShellInputTarget::Pane(pane_id.clone()), &events);
                 }
                 let foreground_changed =
-                    interaction && self.promote_client_to_foreground(client_id);
+                    interaction && self.record_client_input_activity(client_id);
                 let geometry_changed =
                     interaction && self.claim_shell_tab_geometry(client_id, false);
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
@@ -2521,7 +2541,7 @@ impl HeadlessServer {
                     );
                 }
                 let foreground_changed =
-                    interaction && self.promote_client_to_foreground(client_id);
+                    interaction && self.record_client_input_activity(client_id);
                 let geometry_changed =
                     interaction && self.claim_shell_tab_geometry(client_id, false);
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
