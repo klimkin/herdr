@@ -1,0 +1,304 @@
+//! Bounded selected-terminal presentation after whole accepted input.
+
+use super::*;
+use crate::app::early_presentation::Work;
+
+impl HeadlessServer {
+    pub(super) fn cancel_terminal_source_opportunities(&mut self, client_id: u64) {
+        if !self.app.early_presentation.enabled() || !self.app.early_presentation.pending() {
+            return;
+        }
+        let targets: Vec<_> = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.render_state.last_pane_surface())
+            .into_iter()
+            .flat_map(|surface| &surface.panes)
+            .filter_map(|pane| self.app.parse_pane_id(&pane.pane_id))
+            .filter_map(|(workspace_index, pane_id)| {
+                self.app
+                    .state
+                    .workspaces
+                    .get(workspace_index)
+                    .and_then(|workspace| workspace.terminal_id(pane_id))
+                    .cloned()
+            })
+            .collect();
+        for target in targets {
+            let another_active_viewer =
+                self.clients.iter().any(|(other_id, client)| {
+                    *other_id != client_id
+                        && client.is_active_shell_client()
+                        && client
+                            .render_state
+                            .last_pane_surface()
+                            .is_some_and(|surface| {
+                                surface.panes.iter().any(|pane| {
+                                    self.app
+                                        .parse_pane_id(&pane.pane_id)
+                                        .and_then(|(workspace_index, pane_id)| {
+                                            self.app.state.workspaces.get(workspace_index).and_then(
+                                                |workspace| workspace.terminal_id(pane_id),
+                                            )
+                                        })
+                                        .is_some_and(|id| id == &target)
+                                })
+                            })
+                });
+            if !another_active_viewer {
+                self.app.early_presentation.cancel_terminal(&target);
+            }
+        }
+        self.app.prune_terminal_feedback();
+    }
+
+    pub(super) fn try_early_terminal_feedback(&mut self, now: Instant) {
+        if !self.app.early_presentation.pending() {
+            self.app.prune_terminal_feedback();
+            return;
+        }
+        self.app.prune_terminal_feedback();
+        let clients = &self.clients;
+        let runtimes = &self.app.terminal_runtimes;
+        let signal = &self.app.render_dirty;
+        let opportunity = self
+            .app
+            .early_presentation
+            .oldest_ready(now, |opportunity| {
+                let Work::Terminal {
+                    terminal_id,
+                    runtime_instance,
+                    baseline_revision,
+                    placement,
+                } = &opportunity.work
+                else {
+                    return false;
+                };
+                let Some(runtime) = runtimes.get(terminal_id) else {
+                    return false;
+                };
+                if runtime.runtime_instance() != *runtime_instance
+                    || runtime.synchronized_output_active()
+                    || runtime.graphics_may_have_placements()
+                {
+                    return false;
+                }
+                let revision = runtime.content_seq();
+                if !revision.is_multiple_of(2) || revision <= *baseline_revision {
+                    return false;
+                }
+                signal.has_pending_source(placement.pane_id)
+                    && clients.values().any(|client| {
+                        client.is_active_shell_client()
+                            && client.writer.is_some()
+                            && client.deferred_render()
+                                == crate::server::clients::DeferredRender::None
+                            && !client.render_state.requires_recompute()
+                            && client
+                                .render_state
+                                .last_pane_surface()
+                                .is_some_and(|surface| {
+                                    surface.projection_revision == client.shell_projection_revision
+                                        && surface.frame.width == client.terminal_size.0
+                                        && surface.frame.height == client.terminal_size.1
+                                        && surface.popup.is_none()
+                                        && surface.graphics.assets.is_empty()
+                                        && surface.graphics.placements.is_empty()
+                                        && surface.graphics.retained_assets.is_empty()
+                                        && surface.frame.graphics.is_empty()
+                                        && surface
+                                            .panes
+                                            .iter()
+                                            .any(|pane| pane.pane_id == placement.public_pane_id)
+                                })
+                    })
+            });
+        let Some(opportunity) = opportunity else {
+            return;
+        };
+        let Work::Terminal {
+            runtime_instance,
+            placement,
+            ..
+        } = &opportunity.work
+        else {
+            return;
+        };
+        let source = placement.pane_id;
+        if !self
+            .app
+            .early_presentation
+            .admit(opportunity.id, now, false)
+        {
+            return;
+        }
+        self.construct_early_terminal_feedback(&opportunity, source, *runtime_instance, now);
+        self.app.early_presentation.finish_terminal_attempt();
+    }
+
+    fn construct_early_terminal_feedback(
+        &mut self,
+        opportunity: &crate::app::early_presentation::Opportunity,
+        source: crate::layout::PaneId,
+        runtime_instance: u64,
+        now: Instant,
+    ) {
+        #[cfg(not(feature = "latency-prof"))]
+        let _ = opportunity;
+        let presentation = crate::latency_prof::PresentationTrace::selected(now, now);
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::record_context_at(
+            "opportunity.early_terminal_admitted",
+            opportunity.id,
+            u64::from(
+                self.app
+                    .early_presentation
+                    .terminal_attempt(match &opportunity.work {
+                        Work::Terminal { terminal_id, .. } => terminal_id,
+                        _ => return,
+                    })
+                    .map_or(0, |attempt| attempt.ordinal),
+            ),
+            0,
+            crate::latency_prof::now(),
+            presentation.context(),
+        );
+        let mut pending = self.app.render_dirty.take_pending();
+        if !pending.request.pty_sources.contains(&source) {
+            return;
+        }
+        if self.render_target_pane_surface_traced(source, runtime_instance, presentation.context())
+            == super::retained_surface::RetainedOutcome::Handled
+        {
+            pending.request.pty_sources.remove(&source);
+        }
+        // Restore unrelated work without changing ordinary clocks or waking.
+        drop(pending);
+        self.app.prune_terminal_feedback();
+    }
+}
+
+impl HeadlessServer {
+    pub(super) fn has_ready_feedback_recovery(&self) -> bool {
+        self.feedback_recovery
+            .iter()
+            .any(|id| self.feedback_recovery_ready(*id))
+    }
+
+    pub(super) fn feedback_recovery_ready(&self, client_id: u64) -> bool {
+        let Some(client) = self.clients.get(&client_id) else {
+            return false;
+        };
+        if !client.is_active_shell_client() || client.writer.is_none() {
+            return false;
+        }
+        let Some(target) = self.shell_target_for_client(client_id) else {
+            return true;
+        };
+        let Some(tab) = self
+            .app
+            .state
+            .workspaces
+            .get(target.workspace_index)
+            .and_then(|workspace| workspace.tabs.get(target.tab_index))
+        else {
+            return true;
+        };
+        if self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id)
+            && self
+                .app
+                .state
+                .popup_pane
+                .as_ref()
+                .and_then(|popup| self.app.terminal_runtimes.get(&popup.terminal_id))
+                .is_some_and(|runtime| runtime.synchronized_output_active())
+        {
+            return false;
+        }
+        // A synchronized producer owns the next wake; do not poll its transaction.
+        !tab.panes
+            .keys()
+            .filter(|pane| !tab.zoomed || **pane == tab.layout.focused())
+            .any(|pane| {
+                self.app
+                    .state
+                    .runtime_for_pane_in_workspace(
+                        &self.app.terminal_runtimes,
+                        target.workspace_index,
+                        *pane,
+                    )
+                    .is_some_and(|runtime| runtime.synchronized_output_active())
+            })
+    }
+
+    /// Queue delivery reuses the original admitted construction and baseline.
+    pub(super) fn retry_pending_feedback(&mut self, client_id: u64) -> bool {
+        let valid = self.clients.get(&client_id).is_some_and(|client| {
+            client
+                .pending_feedback
+                .as_ref()
+                .is_some_and(|pending| pending.capture.valid(&self.app, client))
+        });
+        let peer_ready = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.pending_feedback.as_ref())
+            .is_some_and(|pending| {
+                pending
+                    .receipts
+                    .has_ready_peer(&self.app, &self.clients, client_id)
+            });
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        let Some(mut pending) = client.pending_feedback.take() else {
+            return false;
+        };
+        if !valid || self.handoff_in_progress {
+            client.request_recompute();
+            client.defer_full_render();
+            client.feedback_recovery = true;
+            self.feedback_recovery.insert(client_id);
+            return false;
+        }
+        let Some(writer) = client.writer.clone() else {
+            client.request_recompute();
+            client.defer_full_render();
+            client.feedback_recovery = true;
+            self.feedback_recovery.insert(client_id);
+            return false;
+        };
+        let bytes = std::mem::take(&mut pending.bytes);
+        match writer
+            .render
+            .send_admitted_feedback_traced(bytes, &pending.trace)
+        {
+            Ok(()) => {
+                let followup = client.render_pending || pending.capture.newer_output(&self.app);
+                let context = crate::latency_prof::presentation::primary_context(&pending.trace);
+                client.render_state.commit_sent_frame(pending.prepared);
+                client.render_pending = followup;
+                pending.receipts.acknowledge(
+                    &mut self.app,
+                    client_id,
+                    context,
+                    !followup || peer_ready,
+                );
+                if followup {
+                    client.feedback_recovery = true;
+                    self.feedback_recovery.insert(client_id);
+                }
+                false
+            }
+            Err(std::sync::mpsc::TrySendError::Full(bytes)) => {
+                pending.bytes = bytes;
+                client.pending_feedback = Some(pending);
+                false
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.remove_client_and_resize_if_needed(client_id);
+                false
+            }
+        }
+    }
+}

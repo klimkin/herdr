@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -64,6 +65,17 @@ pub(crate) struct RenderSignal {
 struct RenderSignalState {
     request: RenderRequest,
     immediate_pty_sources: HashSet<PaneId>,
+    target_ready: HashMap<PaneId, TargetReady>,
+}
+
+#[derive(Debug)]
+struct TargetReady {
+    instance: u64,
+    baseline_revision: u64,
+    expires_at: std::time::Instant,
+    opportunity: u64,
+    armed: bool,
+    ready_revision: u64,
 }
 
 impl RenderSignal {
@@ -87,6 +99,16 @@ impl RenderSignal {
 
     /// Returns true when the signal becomes pending or visible PTY work joins it.
     pub(crate) fn request_pty(&self, pane_id: PaneId) -> bool {
+        self.publish_pty(pane_id, None)
+    }
+
+    /// Publishes only renderable state through the existing PTY signal. An
+    /// accepted input may wake once even if bulk output already owns the source.
+    pub(crate) fn request_pty_ready(&self, pane_id: PaneId, instance: u64, revision: u64) -> bool {
+        self.publish_pty(pane_id, Some((instance, revision)))
+    }
+
+    fn publish_pty(&self, pane_id: PaneId, ready: Option<(u64, u64)>) -> bool {
         crate::latency_prof::record("render.state_ready", pane_id.raw() as u64, 0);
         let mut state = self
             .state
@@ -94,8 +116,149 @@ impl RenderSignal {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_added = state.request.pty_sources.insert(pane_id);
         let wake_for_source = source_added && state.immediate_pty_sources.contains(&pane_id);
+        // No registered target means no clock read, terminal access or allocation.
+
+        let mut wake_for_target = false;
+
+        if let (Some((instance, revision)), Some(target)) =
+            (ready, state.target_ready.get_mut(&pane_id))
+        {
+            if target.instance == instance && revision.is_multiple_of(2) {
+                target.ready_revision = target.ready_revision.max(revision);
+            }
+            if target.armed && target.instance == instance {
+                if std::time::Instant::now() >= target.expires_at {
+                    target.armed = false;
+                } else if revision.is_multiple_of(2) && revision > target.baseline_revision {
+                    target.armed = false;
+                    wake_for_target = true;
+                    crate::latency_prof::record_runtime_at(
+                        "render.target_ready_wake",
+                        pane_id.raw() as u64,
+                        revision,
+                        target.opportunity,
+                        crate::latency_prof::now(),
+                        instance,
+                    );
+                }
+            }
+        }
+
         let became_pending = !self.pending.swap(true, Ordering::AcqRel);
-        became_pending || wake_for_source
+        became_pending || wake_for_source || wake_for_target
+    }
+
+    /// Repeated input shares the first expiry and cannot rearm consumed output.
+    pub(crate) fn arm_target_ready(
+        &self,
+        pane_id: PaneId,
+        instance: u64,
+        baseline_revision: u64,
+        expires_at: std::time::Instant,
+        opportunity: u64,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .target_ready
+            .get(&pane_id)
+            .is_some_and(|target| target.opportunity == opportunity)
+        {
+            return;
+        }
+        state.target_ready.insert(
+            pane_id,
+            TargetReady {
+                instance,
+                baseline_revision,
+                expires_at,
+                opportunity,
+                armed: true,
+                ready_revision: baseline_revision,
+            },
+        );
+    }
+
+    /// Ordinary delivery keeps unused feedback eligible for newer output.
+    /// Ready output can race before rearming, even while its source is detached.
+    pub(crate) fn advance_target_ready(
+        &self,
+        advance: &crate::app::early_presentation::TerminalFeedbackAdvance,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(target) = state.target_ready.get_mut(&advance.pane_id) else {
+            return false;
+        };
+        if target.opportunity != advance.opportunity
+            || target.instance != advance.runtime_instance
+            || advance.revision <= target.baseline_revision
+            || !advance.revision.is_multiple_of(2)
+        {
+            return false;
+        }
+        if std::time::Instant::now() >= target.expires_at {
+            target.armed = false;
+            return false;
+        }
+        target.baseline_revision = advance.revision;
+        let ready = target.ready_revision;
+        let newer = ready > advance.revision;
+        let wake = advance.wake_allowed && newer;
+        target.armed = advance.wake_allowed && !wake;
+        // An exhausted budget suppresses urgency, never ordinary dirty work.
+        if newer {
+            state.request.pty_sources.insert(advance.pane_id);
+            self.pending.store(true, Ordering::Release);
+        }
+        if wake {
+            crate::latency_prof::record_runtime_at(
+                "render.target_ready_wake",
+                advance.pane_id.raw() as u64,
+                ready,
+                advance.opportunity,
+                crate::latency_prof::now(),
+                advance.runtime_instance,
+            );
+        }
+        wake
+    }
+
+    /// Policy retirement owns latch lifetime, including sources that stop output.
+    #[cfg(test)]
+    pub(crate) fn cancel_target_ready(&self, pane_id: PaneId, opportunity: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .target_ready
+            .get(&pane_id)
+            .is_some_and(|target| target.opportunity == opportunity)
+        {
+            state.target_ready.remove(&pane_id);
+        }
+    }
+
+    pub(crate) fn prune_target_ready(&self, mut keep: impl FnMut(u64) -> bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .target_ready
+            .retain(|_, target| keep(target.opportunity));
+    }
+
+    pub(crate) fn has_pending_source(&self, pane_id: PaneId) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request
+            .pty_sources
+            .contains(&pane_id)
     }
 
     pub(crate) fn set_immediate_pty_sources(&self, sources: HashSet<PaneId>) {
@@ -323,5 +486,193 @@ mod tests {
         assert!(newest.request.terminal_title_sources.is_empty());
         newest.complete();
         assert!(!signal.is_pending());
+    }
+
+    #[test]
+    fn accepted_input_wakes_already_pending_target_once_after_new_ready_state() {
+        let signal = RenderSignal::new();
+        let pane = PaneId::from_raw(10);
+        assert!(signal.request_pty(pane));
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        signal.arm_target_ready(pane, 7, 20, expiry, 1);
+        assert!(!signal.request_pty_ready(pane, 7, 20));
+        assert!(!signal.request_pty_ready(pane, 8, 22));
+        assert!(signal.request_pty_ready(pane, 7, 22));
+        assert!(!signal.request_pty_ready(pane, 7, 24));
+        // Repeated accepted input shares the same opportunity, never rearming
+        // the one ready wake already consumed by output.
+        signal.arm_target_ready(pane, 7, 24, expiry, 1);
+        assert!(!signal.request_pty_ready(pane, 7, 26));
+        assert_eq!(signal.take().pty_sources, HashSet::from([pane]));
+    }
+
+    #[test]
+    fn ordinary_delivery_rearms_feedback_without_losing_concurrent_ready_output() {
+        use crate::app::early_presentation::TerminalFeedbackAdvance;
+
+        let signal = Arc::new(RenderSignal::new());
+        let pane = PaneId::from_raw(10);
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        signal.arm_target_ready(pane, 7, 20, expiry, 1);
+        assert!(signal.request_pty_ready(pane, 7, 22));
+        let ordinary = signal.take_pending();
+        assert!(signal.request_pty_ready(pane, 7, 24));
+        ordinary.complete();
+        let advance = TerminalFeedbackAdvance {
+            pane_id: pane,
+            runtime_instance: 7,
+            revision: 22,
+            opportunity: 1,
+            wake_allowed: true,
+        };
+        assert!(signal.advance_target_ready(&advance));
+        assert!(signal.is_pending());
+        assert!(signal.has_pending_source(pane));
+        assert!(
+            !signal.advance_target_ready(&advance),
+            "duplicate peer receipt cannot rearm"
+        );
+        assert!(
+            !signal.request_pty_ready(pane, 7, 26),
+            "ready wake remains one-shot"
+        );
+
+        let delivered = TerminalFeedbackAdvance {
+            revision: 26,
+            ..advance
+        };
+        assert!(!signal.advance_target_ready(&delivered));
+        assert!(
+            !signal.request_pty_ready(pane, 7, 26),
+            "unchanged state cannot wake"
+        );
+        assert!(
+            signal.request_pty_ready(pane, 7, 28),
+            "later output wakes after floor advance"
+        );
+    }
+
+    #[test]
+    fn ordinary_delivery_restores_ready_output_even_after_detached_work_completes() {
+        use crate::app::early_presentation::TerminalFeedbackAdvance;
+
+        let signal = Arc::new(RenderSignal::new());
+        let pane = PaneId::from_raw(10);
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        signal.arm_target_ready(pane, 7, 20, expiry, 1);
+        assert!(signal.request_pty_ready(pane, 7, 22));
+        assert!(!signal.request_pty_ready(pane, 7, 24));
+        signal.take_pending().complete();
+        assert!(!signal.is_pending());
+        let advance = TerminalFeedbackAdvance {
+            pane_id: pane,
+            runtime_instance: 7,
+            revision: 22,
+            opportunity: 1,
+            wake_allowed: true,
+        };
+        assert!(signal.advance_target_ready(&advance));
+        assert!(signal.has_pending_source(pane));
+        assert_eq!(signal.take().pty_sources, HashSet::from([pane]));
+        assert!(!signal.advance_target_ready(&advance));
+        // Coalesced input may still carry an earlier captured baseline.
+        signal.request_pty(pane);
+        signal.arm_target_ready(pane, 7, 20, expiry, 1);
+        assert!(!signal.request_pty_ready(pane, 7, 26));
+        assert!(!signal.request_pty_ready(pane, 7, 28));
+    }
+
+    #[test]
+    fn exhausted_budget_preserves_newer_output_without_urgent_wakes() {
+        use crate::app::early_presentation::TerminalFeedbackAdvance;
+        let signal = Arc::new(RenderSignal::new());
+        let pane = PaneId::from_raw(10);
+        signal.arm_target_ready(
+            pane,
+            7,
+            20,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1,
+        );
+        signal.request_pty_ready(pane, 7, 22);
+        signal.request_pty_ready(pane, 7, 24);
+        signal.take_pending().complete();
+        assert!(!signal.advance_target_ready(&TerminalFeedbackAdvance {
+            pane_id: pane,
+            runtime_instance: 7,
+            revision: 22,
+            opportunity: 1,
+            wake_allowed: false,
+        }));
+        assert!(signal.has_pending_source(pane));
+        assert!(!signal.request_pty_ready(pane, 7, 26));
+    }
+
+    #[test]
+    fn stale_or_invalid_delivery_cannot_rearm_feedback() {
+        use crate::app::early_presentation::TerminalFeedbackAdvance;
+
+        let signal = RenderSignal::new();
+        let pane = PaneId::from_raw(10);
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        signal.arm_target_ready(pane, 7, 20, expiry, 2);
+        signal.request_pty_ready(pane, 7, 22);
+        let valid = TerminalFeedbackAdvance {
+            pane_id: pane,
+            runtime_instance: 7,
+            revision: 22,
+            opportunity: 2,
+            wake_allowed: true,
+        };
+        for advance in [
+            TerminalFeedbackAdvance {
+                opportunity: 1,
+                ..valid
+            },
+            TerminalFeedbackAdvance {
+                runtime_instance: 8,
+                ..valid
+            },
+            TerminalFeedbackAdvance {
+                revision: 23,
+                ..valid
+            },
+            TerminalFeedbackAdvance {
+                revision: 20,
+                ..valid
+            },
+        ] {
+            assert!(!signal.advance_target_ready(&advance));
+        }
+        assert!(!signal.request_pty_ready(pane, 7, 24));
+        assert!(signal.advance_target_ready(&valid));
+        assert!(!signal.advance_target_ready(&valid));
+        signal.cancel_target_ready(pane, 2);
+        assert!(!signal.advance_target_ready(&TerminalFeedbackAdvance {
+            revision: 26,
+            ..valid
+        }));
+        signal.arm_target_ready(pane, 7, 26, std::time::Instant::now(), 3);
+        assert!(!signal.advance_target_ready(&TerminalFeedbackAdvance {
+            revision: 28,
+            opportunity: 3,
+            ..valid
+        }));
+    }
+
+    #[test]
+    fn expired_or_canceled_input_does_not_wake_pending_output() {
+        let signal = RenderSignal::new();
+        let pane = PaneId::from_raw(10);
+        signal.request_pty(pane);
+        signal.arm_target_ready(pane, 7, 20, std::time::Instant::now(), 1);
+        assert!(!signal.request_pty_ready(pane, 7, 22));
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        signal.arm_target_ready(pane, 7, 22, expiry, 2);
+        signal.cancel_target_ready(pane, 1);
+        assert!(signal.request_pty_ready(pane, 7, 24));
+        signal.arm_target_ready(pane, 7, 24, expiry, 3);
+        signal.cancel_target_ready(pane, 3);
+        assert!(!signal.request_pty_ready(pane, 7, 26));
     }
 }

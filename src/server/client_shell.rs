@@ -268,6 +268,7 @@ pub(super) fn snapshot_with_completions(
 }
 
 pub(super) struct RenderedPaneSurface {
+    pub(super) terminal_receipts: super::terminal_receipts::TerminalReceipts,
     pub(super) frame: FrameData,
     pub(super) panes: Vec<protocol::PaneSurfacePane>,
     pub(super) splits: Vec<protocol::PaneSurfaceSplit>,
@@ -343,6 +344,7 @@ pub(super) fn render_pane_surface(
             area,
         );
     let mut diagnostic_sources = crate::latency_prof::runtime::PaneSources::default();
+    let mut terminal_receipts = super::terminal_receipts::TerminalReceipts::default();
     let panes = target
         .map(|target| {
             let workspace_index = target.workspace_index;
@@ -380,6 +382,7 @@ pub(super) fn render_pane_surface(
                                 after | 1
                             }
                         });
+                        terminal_receipts.capture(app, workspace_index, pane.id, content_revision);
                         if crate::latency_prof::active() {
                             let instance = runtime.map_or(0, |runtime| runtime.runtime_instance());
                             diagnostic_sources.insert(&pane_id, instance);
@@ -498,6 +501,7 @@ pub(super) fn render_pane_surface(
         }
     }
     Ok(RenderedPaneSurface {
+        terminal_receipts,
         frame: FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &hyperlinks),
         panes,
         splits,

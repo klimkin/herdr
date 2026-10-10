@@ -431,6 +431,14 @@ impl TerminalRuntime {
         self.0.collect_dirty_patch_snapshot(area_width, area_height)
     }
 
+    pub(crate) fn collect_selected_patch_snapshot(
+        &self,
+        width: u16,
+        height: u16,
+    ) -> Option<crate::pane::TerminalDirtyPatchSnapshot> {
+        self.0.collect_selected_patch_snapshot(width, height)
+    }
+
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.0.visible_hyperlinks(area)
     }
@@ -598,6 +606,10 @@ impl TerminalRuntime {
         self.0.current_size()
     }
 
+    pub(crate) fn graphics_may_have_placements(&self) -> bool {
+        self.0.kitty_graphics_may_have_placements()
+    }
+
     pub(crate) fn content_seq(&self) -> u64 {
         self.0.content_seq()
     }
@@ -663,6 +675,15 @@ impl TerminalRuntime {
 
     pub(crate) fn test_process_pty_bytes(&self, bytes: &[u8]) {
         self.0.test_process_pty_bytes(bytes);
+    }
+
+    pub(crate) fn test_process_pty_bytes_with_hook<T>(
+        &self,
+        bytes: &[u8],
+        during_update: impl FnOnce() -> T,
+    ) -> T {
+        self.0
+            .test_process_pty_bytes_with_hook(bytes, during_update)
     }
 
     pub(crate) fn test_with_scrollback_bytes(

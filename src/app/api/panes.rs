@@ -1920,9 +1920,14 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let baseline = self.terminal_input_baseline(ws_idx, pane_id);
+        let accepted = !params.text.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
+            self.rejected_terminal_input();
             return encode_error(id, "pane_send_failed", err.to_string());
         }
+
+        self.accepted_terminal_input(baseline, accepted, None);
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -1944,14 +1949,23 @@ impl App {
             &params.keys,
         ) {
             Ok(bytes) => bytes,
-            Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
+            Err(key) => {
+                self.rejected_terminal_input();
+                return encode_error(id, "invalid_key", format!("unsupported key {key}"));
+            }
         };
         if let Err(err) = runtime.validate_input_submission(&bytes) {
+            self.rejected_terminal_input();
             return encode_error(id, "pane_send_failed", err.to_string());
         }
+        let baseline = self.terminal_input_baseline(ws_idx, pane_id);
+        let accepted = !bytes.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+            self.rejected_terminal_input();
             return encode_error(id, "pane_send_failed", err.to_string());
         }
+
+        self.accepted_terminal_input(baseline, accepted, None);
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -2045,13 +2059,21 @@ impl App {
         };
         let encoded_keys = match encode_api_keys(runtime, &params.keys) {
             Ok(encoded_keys) => encoded_keys,
-            Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
+            Err(key) => {
+                self.rejected_terminal_input();
+                return encode_error(id, "invalid_key", format!("unsupported key {key}"));
+            }
         };
+        let baseline = self.terminal_input_baseline(ws_idx, pane_id);
+        let accepted = encoded_keys.iter().any(|bytes| !bytes.is_empty());
         for bytes in encoded_keys.into_iter().filter(|bytes| !bytes.is_empty()) {
             if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+                self.rejected_terminal_input();
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
         }
+
+        self.accepted_terminal_input(baseline, accepted, None);
 
         encode_success(id, ResponseResult::Ok {})
     }

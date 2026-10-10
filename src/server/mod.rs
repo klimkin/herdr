@@ -9,6 +9,7 @@ pub(crate) mod client_shell_graphics;
 pub(crate) mod client_transport;
 pub(crate) mod clients;
 pub(crate) mod clipboard_image;
+mod feedback_delivery;
 #[cfg(unix)]
 pub(crate) mod handoff;
 pub mod headless;
@@ -21,3 +22,4 @@ pub(crate) mod render_stream;
 pub(crate) mod shutdown;
 pub mod socket_paths;
 pub(crate) mod terminal_attach;
+mod terminal_receipts;

@@ -25,6 +25,11 @@ Use `--binary` and `--probe` with the standalone benchmark for build comparisons
 `just latency-build ''` builds without instrumentation; `just latency-build`
 enables the optional feature. Keep copies of both optimized binaries.
 
+Linux builds use bounded action and selected-terminal early presentation,
+independent of profiling or Cargo default features. macOS and Windows retain
+cadence-based presentation. Server queues keep fixed ordering and 64-message
+batches. JSONL traces and Tracy remain opt-in.
+
 | Path | Start | Completion |
 |---|---|---|
 | output | Controlled process response write start | Complete matching output in outer PTY |

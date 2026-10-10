@@ -436,13 +436,19 @@ impl App {
         let encoded = match super::super::api_helpers::encode_api_keys(runtime, &params.keys) {
             Ok(encoded) => encoded,
             Err(key) => {
+                self.rejected_terminal_input();
                 return encode_error(id, "invalid_key", format!("unsupported key {key}"));
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
+        let baseline = self.terminal_input_baseline(resolved.ws_idx, resolved.pane_id);
+        let accepted = !bytes.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+            self.rejected_terminal_input();
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
+
+        self.accepted_terminal_input(baseline, accepted, None);
 
         encode_success(id, ResponseResult::Ok {})
     }
