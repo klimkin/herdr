@@ -1,3 +1,8 @@
+// Native high-resolution Windows deadline integration remains out of scope.
+// Stub: preserve Tokio sleeping; future waitable-timer integration must cancel
+// on drop and avoid process-wide timer-resolution changes or idle polling.
+pub(super) use super::PortableDeadlineWaiter as NativeDeadlineWaiter;
+
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
