@@ -146,9 +146,19 @@ impl ClientShellState {
                 .snapshot
                 .as_deref()
                 .and_then(|snapshot| snapshot.focused_workspace_id.as_deref());
-            let current = workspaces.iter().position(|(endpoint_id, workspace_id)| {
-                endpoint_id == &self.active_endpoint_id && Some(workspace_id.as_str()) == focused
-            });
+            let intended = self.intent_workspace_id();
+            let current = intended
+                .and_then(|(endpoint_id, workspace_id)| {
+                    workspaces
+                        .iter()
+                        .position(|entry| &entry.0 == endpoint_id && entry.1 == workspace_id)
+                })
+                .or_else(|| {
+                    workspaces.iter().position(|(endpoint_id, workspace_id)| {
+                        endpoint_id == &self.active_endpoint_id
+                            && Some(workspace_id.as_str()) == focused
+                    })
+                });
             let next = match (current, action) {
                 (Some(index), KeybindAction::PreviousWorkspace) => {
                     (index + workspaces.len() - 1) % workspaces.len()
@@ -190,10 +200,19 @@ impl ClientShellState {
                         .snapshot
                         .as_deref()
                         .and_then(|snapshot| snapshot.focused_pane_id.as_deref());
-                    let current = agents.iter().position(|target| {
-                        target.endpoint_id == self.active_endpoint_id
-                            && Some(target.pane_id.as_str()) == focused
-                    });
+                    let current = self
+                        .intent_agent_id()
+                        .and_then(|(endpoint_id, pane_id)| {
+                            agents.iter().position(|target| {
+                                &target.endpoint_id == endpoint_id && target.pane_id == pane_id
+                            })
+                        })
+                        .or_else(|| {
+                            agents.iter().position(|target| {
+                                target.endpoint_id == self.active_endpoint_id
+                                    && Some(target.pane_id.as_str()) == focused
+                            })
+                        });
                     match (current, action) {
                         (Some(index), KeybindAction::PreviousAgent) => {
                             (index + agents.len() - 1) % agents.len()
@@ -248,12 +267,14 @@ impl ClientShellState {
     ) -> bool {
         self.pending_workspace_highlight = None;
         self.pending_agent_reveal = None;
+        self.clear_endpoint_focus_intent();
         let online = self.endpoint_is_online(&endpoint_id);
         if !online && !endpoint_id.is_local() {
             self.select_unready_machine(&endpoint_id, outcome);
             return false;
         }
-        if (endpoint_id.is_local() && (self.multi_endpoint_active() || !online))
+        if self.multi_endpoint_active()
+            || (endpoint_id.is_local() && !online)
             || endpoint_id != self.active_endpoint_id
         {
             outcome.actions.push(ClientShellAction::ActivateEndpoint {
@@ -281,10 +302,14 @@ impl ClientShellState {
             self.select_unready_machine(&endpoint_id, outcome);
             return false;
         }
+        if self.multi_endpoint_active() {
+            self.record_endpoint_focus_intent(&endpoint_id, &target);
+        }
         // Local can still be displayed while a remote activation is pending.
         // Route explicit selections through the runtime so they can cancel that handoff.
         if endpoint_id == self.active_endpoint_id
-            && !(endpoint_id.is_local() && (self.multi_endpoint_active() || !online))
+            && !self.multi_endpoint_active()
+            && (online || !endpoint_id.is_local())
         {
             let method = match target {
                 ClientEndpointFocusTarget::Workspace(workspace_id) => {

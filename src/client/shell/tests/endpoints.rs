@@ -74,7 +74,7 @@ fn state_with_remote() -> (ClientShellState, ClientEndpointId) {
 }
 
 #[test]
-fn workspace_navigation_waits_for_the_target_presentation_fence() {
+fn workspace_focus_waits_for_the_target_presentation_fence() {
     use crate::client::endpoint::{EndpointNegotiation, EndpointRegistry};
     use crate::client::endpoint_commands::EndpointCommands;
 
@@ -86,16 +86,12 @@ fn workspace_navigation_waits_for_the_target_presentation_fence() {
         }
     }
 
-    for (key, focused, expected, surface_active) in [
-        (KeyCode::Down, "ws_1", "ws_2", true),
-        (KeyCode::Up, "ws_2", "ws_1", true),
-        (KeyCode::Down, "ws_1", "ws_2", false),
+    for (focused, expected, surface_active) in [
+        ("ws_1", "ws_2", true),
+        ("ws_2", "ws_1", true),
+        ("ws_1", "ws_2", false),
     ] {
         let (mut state, remote) = state_with_remote();
-        let config: Config =
-            toml::from_str("[keys]\nnext_workspace = 'ctrl+down'\nprevious_workspace = 'ctrl+up'")
-                .unwrap();
-        state.config = ClientShellConfig::from_config(&config);
         let mut projection = snapshot();
         projection.boot_id = "remote-boot".into();
         let mut second = projection.workspaces[0].clone();
@@ -122,9 +118,11 @@ fn workspace_navigation_waits_for_the_target_presentation_fence() {
         endpoints.set_surface_active(&remote, surface_active);
         // Activation publishes this coherent target before releasing its effects fence.
         endpoints.freeze_input();
-        let outcome = state.handle_raw_events(vec![RawInputEvent::Key(
-            crate::input::TerminalKey::new(key, KeyModifiers::CONTROL),
-        )]);
+        // The activation runtime resolves an already-active endpoint selection
+        // into this direct focus request. Cross-machine tests drive key routing
+        // through activation and its presentation fence end to end.
+        let outcome =
+            state.focus_endpoint_target(ClientEndpointFocusTarget::Workspace(expected.into()));
         assert!(matches!(outcome.actions.as_slice(),
             [ClientShellAction::Endpoint { request, .. }]
             if matches!(&request.method, crate::api::schema::Method::WorkspaceFocus(target)
@@ -1120,12 +1118,10 @@ fn saved_machine_preserves_endpoint_scoped_worktree_collapses() {
     );
     assert!(matches!(
         &switch.actions[..],
-        [ClientShellAction::Endpoint { request, .. }]
-            if matches!(
-                &request.method,
-                crate::api::schema::Method::WorkspaceFocus(target)
-                    if target.workspace_id == "remote_ws_2"
-            )
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: Some(ClientEndpointFocusTarget::Workspace(workspace_id))
+        }] if endpoint_id == &remote_id && workspace_id == "remote_ws_2"
     ));
     let remote_parent = state
         .hits

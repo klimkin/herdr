@@ -234,6 +234,7 @@ fn machine() -> PendingEndpointActivation {
         source_available: true,
         target: lease(endpoint(), 7, "remote-boot"),
         focus: None,
+        late_focus: None,
         host_focused: true,
         resize: resize(),
         phase: ActivationPhase::ActivatingTarget {
@@ -259,6 +260,7 @@ fn source_off_request_is_distinct_and_precedes_target_on_phase() {
         source_available: true,
         target: lease(endpoint(), 7, "remote-boot"),
         focus: None,
+        late_focus: None,
         host_focused: true,
         resize: resize(),
         phase: ActivationPhase::ReleasingSource {
