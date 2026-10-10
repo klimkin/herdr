@@ -36,12 +36,16 @@ mod state;
 mod terminal;
 mod xtgettcap;
 
+#[cfg(test)]
+use self::agent_detection::DetectionTextCache;
+#[cfg(windows)]
+use self::agent_detection::TICK_IDENTIFIED;
 use self::agent_detection::{
-    codex_prompt_ready, decide_detection_screen_read, decide_screen_detection_publish,
+    codex_prompt_ready, decide_screen_detection_publish, detection_poll_interval,
     detection_update_for_publish_with_osc, mark_detection_content_changed,
-    observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
-    DetectionScreenReadInput, DetectionTextCache, PendingIdleConfirmation,
-    ScreenDetectionPublishInput, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
+    observe_detection_content_change, DetectionPublishDecision, DetectionScreenCache,
+    DetectionScreenSnapshot, PendingIdleConfirmation, ScreenDetectionPublishInput,
+    AGENT_STARTUP_GRACE_WINDOW,
 };
 use self::background_agent::{AgentJobStatus, AgentJobTracker};
 #[cfg(test)]
@@ -308,6 +312,59 @@ async fn publish_agent_process_detected_event(
             "failed to deliver AgentProcessDetected event"
         );
     }
+}
+
+#[cfg(test)]
+fn read_detection_screen_snapshot(
+    terminal: &PaneTerminal,
+    agent: Option<Agent>,
+) -> DetectionScreenSnapshot {
+    read_detection_screen_snapshot_for_cache(terminal, agent).0
+}
+
+fn read_detection_screen_snapshot_for_cache(
+    terminal: &PaneTerminal,
+    agent: Option<Agent>,
+) -> (DetectionScreenSnapshot, bool) {
+    crate::render_prof::event("detection.snapshot");
+    let (content, reusable) = terminal.detection_text_for_cache();
+    let detection = detection_update_for_publish_with_osc(
+        agent,
+        &content,
+        &terminal.agent_osc_title(),
+        &terminal.agent_osc_progress(),
+        false,
+    );
+    (DetectionScreenSnapshot { content, detection }, reusable)
+}
+
+fn observe_detection_screen(
+    cache: &mut DetectionScreenCache,
+    terminal: &PaneTerminal,
+    agent: Option<Agent>,
+    content_seq: &AtomicU64,
+    detection_content_seq: &AtomicU64,
+    process_exited: bool,
+) -> self::agent_detection::DetectionScreenObservation {
+    let before = content_seq.load(Ordering::Acquire);
+    let mut reusable = true;
+    let observation = cache.observe(
+        agent,
+        detection_content_seq.load(Ordering::Relaxed),
+        process_exited,
+        || {
+            let (snapshot, can_reuse) = read_detection_screen_snapshot_for_cache(terminal, agent);
+            reusable = can_reuse;
+            snapshot
+        },
+    );
+    let after = content_seq.load(Ordering::Acquire);
+    // A snapshot overlapping a terminal writer cannot bless a reusable revision.
+    // Empty snapshots also need retries because terminal reads can fail empty.
+    if !reusable || before != after || !before.is_multiple_of(2) || cache.content().is_empty() {
+        cache.invalidate();
+    }
+    observation
 }
 
 async fn publish_codex_prompt_observation(
@@ -977,8 +1034,7 @@ fn spawn_basic_detection_task(
         let mut pending_foreground_shell_clear = false;
         let mut foreground_shell_exit_reported = false;
         let mut release_was_active = false;
-        let mut last_detection_text = DetectionTextCache::default();
-        let mut last_screen_scan_detection_content_seq = None;
+        let mut screen_cache = DetectionScreenCache::default();
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
         let mut last_codex_prompt_ready = false;
@@ -986,11 +1042,12 @@ fn spawn_basic_detection_task(
         let mut agent_job = AgentJobTracker::default();
 
         loop {
-            let sleep_duration = if pending_idle.active() {
-                AGENT_PENDING_IDLE_RECHECK
-            } else {
-                std::time::Duration::from_millis(300)
-            };
+            let sleep_duration = detection_poll_interval(
+                agent_presence.current_agent(),
+                pending_idle.active(),
+                active_pending_release(&pending_release_for_task, std::time::Instant::now())
+                    .is_some(),
+            );
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = detect_reset.notified() => {
@@ -1012,8 +1069,7 @@ fn spawn_basic_detection_task(
                     pending_foreground_shell_clear = false;
                     foreground_shell_exit_reported = false;
                     release_was_active = false;
-                    last_detection_text.clear();
-                    last_screen_scan_detection_content_seq = None;
+                    screen_cache = DetectionScreenCache::default();
                     agent_startup_grace_until = None;
                     pending_idle.clear();
                     agent_job = AgentJobTracker::default();
@@ -1127,7 +1183,7 @@ fn spawn_basic_detection_task(
                     if agent_changed {
                         pending_idle.clear();
                         last_codex_prompt_ready = false;
-                        last_screen_scan_detection_content_seq = None;
+                        screen_cache.invalidate();
                         // A replacement agent must not inherit OSC evidence
                         // from the previous process; a first acquisition keeps
                         // the evidence its own process already emitted.
@@ -1174,56 +1230,33 @@ fn spawn_basic_detection_task(
                         continue;
                     }
                     agent_startup_grace_until = None;
-                    last_screen_scan_detection_content_seq = None;
+                    screen_cache.invalidate();
                     pending_idle.clear();
                     continue;
                 }
             }
 
-            let current_detection_content_seq = if agent.is_some() {
-                Some(detection_content_seq.load(Ordering::Relaxed))
-            } else {
-                None
-            };
-            match decide_detection_screen_read(DetectionScreenReadInput {
-                state,
+            let observation = observe_detection_screen(
+                &mut screen_cache,
+                &terminal,
                 agent,
-                pending_idle_active: pending_idle.active(),
-                agent_changed,
-                process_exited,
-                current_detection_content_seq,
-                last_screen_scan_detection_content_seq,
-            }) {
-                DetectionScreenReadDecision::Read => {}
-                DetectionScreenReadDecision::Skip => continue,
-            }
-
-            let content_changed = last_detection_text
-                .refresh(agent, &content_seq, || {
-                    crate::render_prof::event("detection.snapshot");
-                    terminal.detection_text_for_cache()
-                });
-            let content = &last_detection_text.text;
-            last_screen_scan_detection_content_seq = current_detection_content_seq;
-            let osc_title = terminal.agent_osc_title();
-            let osc_progress = terminal.agent_osc_progress();
-            let screen_detection = detection_update_for_publish_with_osc(
-                agent,
-                content,
-                &osc_title,
-                &osc_progress,
+                &content_seq,
+                &detection_content_seq,
                 process_exited,
             );
-            publish_codex_prompt_observation(
-                &state_events,
-                pane_id,
-                agent,
-                content,
-                screen_detection.as_ref(),
-                process_exited,
-                &mut last_codex_prompt_ready,
-            )
-            .await;
+            let screen_detection = observation.detection;
+            if observation.refreshed || process_exited {
+                publish_codex_prompt_observation(
+                    &state_events,
+                    pane_id,
+                    agent,
+                    screen_cache.content(),
+                    screen_detection.as_ref(),
+                    process_exited,
+                    &mut last_codex_prompt_ready,
+                )
+                .await;
+            }
             let Some(screen_detection) = screen_detection else {
                 pending_idle.clear();
                 continue;
@@ -1232,7 +1265,7 @@ fn spawn_basic_detection_task(
                 agent_presence.current_agent(),
                 suppressed_agent,
                 process_group_changed,
-                content_changed,
+                observation.content_changed,
                 now,
                 &mut acquisition_started_at,
                 &mut last_content_change_at,
@@ -2986,10 +3019,6 @@ impl PaneRuntime {
             use crate::detect;
             use std::time::{Duration, Instant};
 
-            const TICK_UNIDENTIFIED: Duration = Duration::from_millis(500);
-            const TICK_IDENTIFIED: Duration = Duration::from_millis(300);
-            const TICK_PENDING_RELEASE: Duration = Duration::from_millis(50);
-
             #[cfg(unix)]
             let foreground_observer = io.foreground_observer();
             let child_pid = child_pid.clone();
@@ -3025,8 +3054,7 @@ impl PaneRuntime {
                 let mut last_visible_blocker = false;
                 let mut last_visible_working = false;
                 let mut last_visible_signal_refresh = None;
-                let mut last_detection_text = DetectionTextCache::default();
-                let mut last_screen_scan_detection_content_seq = None;
+                let mut screen_cache = DetectionScreenCache::default();
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
                 let mut last_codex_prompt_ready = false;
@@ -3037,18 +3065,12 @@ impl PaneRuntime {
 
                 loop {
                     let now_for_tick = Instant::now();
-                    let tick = if active_pending_release(&pending_release_for_task, now_for_tick)
-                        .is_some()
-                        || terminal.has_transient_default_color_override()
-                    {
-                        TICK_PENDING_RELEASE
-                    } else if pending_idle.active() {
-                        AGENT_PENDING_IDLE_RECHECK
-                    } else if agent_presence.current_agent().is_none() {
-                        TICK_UNIDENTIFIED
-                    } else {
-                        TICK_IDENTIFIED
-                    };
+                    let tick = detection_poll_interval(
+                        agent_presence.current_agent(),
+                        pending_idle.active(),
+                        active_pending_release(&pending_release_for_task, now_for_tick).is_some()
+                            || terminal.has_transient_default_color_override(),
+                    );
                     tokio::select! {
                         _ = tokio::time::sleep(tick) => {}
                         _ = detect_reset.notified() => {
@@ -3070,8 +3092,7 @@ impl PaneRuntime {
                             last_visible_blocker = false;
                             last_visible_working = false;
                             last_visible_signal_refresh = None;
-                            last_detection_text.clear();
-                            last_screen_scan_detection_content_seq = None;
+                            screen_cache = DetectionScreenCache::default();
                             agent_startup_grace_until = None;
                             pending_idle.clear();
                             agent_job = AgentJobTracker::default();
@@ -3224,7 +3245,7 @@ impl PaneRuntime {
                                 {
                                     pending_idle.clear();
                                     last_codex_prompt_ready = false;
-                                    last_screen_scan_detection_content_seq = None;
+                                    screen_cache.invalidate();
                                     // A replacement agent must not inherit OSC
                                     // evidence from the previous process; a first
                                     // acquisition keeps the evidence its own
@@ -3299,7 +3320,7 @@ impl PaneRuntime {
                     if let Some(until) = agent_startup_grace_until {
                         if process_exited {
                             agent_startup_grace_until = None;
-                            last_screen_scan_detection_content_seq = None;
+                            screen_cache.invalidate();
                             pending_idle.clear();
                         } else {
                             if now < until {
@@ -3307,55 +3328,33 @@ impl PaneRuntime {
                                 continue;
                             }
                             agent_startup_grace_until = None;
+                            screen_cache.invalidate();
                             pending_idle.clear();
                             continue;
                         }
                     }
 
-                    let current_detection_content_seq = if agent.is_some() {
-                        Some(detection_content_seq.load(Ordering::Relaxed))
-                    } else {
-                        None
-                    };
-                    match decide_detection_screen_read(DetectionScreenReadInput {
-                        state,
+                    let observation = observe_detection_screen(
+                        &mut screen_cache,
+                        &terminal,
                         agent,
-                        pending_idle_active: pending_idle.active(),
-                        agent_changed,
-                        process_exited,
-                        current_detection_content_seq,
-                        last_screen_scan_detection_content_seq,
-                    }) {
-                        DetectionScreenReadDecision::Read => {}
-                        DetectionScreenReadDecision::Skip => continue,
-                    }
-
-                    let content_changed =
-                        last_detection_text.refresh(agent, &text_content_seq, || {
-                            crate::render_prof::event("detection.snapshot");
-                            terminal.detection_text_for_cache()
-                        });
-                    let content = &last_detection_text.text;
-                    last_screen_scan_detection_content_seq = current_detection_content_seq;
-                    let osc_title = terminal.agent_osc_title();
-                    let osc_progress = terminal.agent_osc_progress();
-                    let screen_detection = detection_update_for_publish_with_osc(
-                        agent,
-                        content,
-                        &osc_title,
-                        &osc_progress,
+                        &text_content_seq,
+                        &detection_content_seq,
                         process_exited,
                     );
-                    publish_codex_prompt_observation(
-                        &state_events,
-                        pane_id,
-                        agent,
-                        content,
-                        screen_detection.as_ref(),
-                        process_exited,
-                        &mut last_codex_prompt_ready,
-                    )
-                    .await;
+                    let screen_detection = observation.detection;
+                    if observation.refreshed || process_exited {
+                        publish_codex_prompt_observation(
+                            &state_events,
+                            pane_id,
+                            agent,
+                            screen_cache.content(),
+                            screen_detection.as_ref(),
+                            process_exited,
+                            &mut last_codex_prompt_ready,
+                        )
+                        .await;
+                    }
                     let Some(screen_detection) = screen_detection else {
                         pending_idle.clear();
                         continue;
@@ -3364,7 +3363,7 @@ impl PaneRuntime {
                         agent_presence.current_agent(),
                         suppressed_agent,
                         process_group_changed,
-                        content_changed,
+                        observation.content_changed,
                         now,
                         &mut acquisition_started_at,
                         &mut last_content_change_at,
@@ -4187,6 +4186,7 @@ impl PaneRuntime {
         let (tx, _rx) = mpsc::channel(1);
         let result = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
         self.content_seq.fetch_add(1, Ordering::Release);
+        observe_detection_content_change(bytes, &self.detection_content_seq);
         self.compression.wake();
         result.terminal_responses
     }
@@ -6498,6 +6498,153 @@ mod tests {
             elapsed_since_process_check: PROCESS_ACQUISITION_SLOW_RECHECK,
             ..process_probe_input()
         }));
+    }
+
+    #[tokio::test]
+    async fn detection_cache_retries_a_snapshot_during_an_announced_write() {
+        let runtime = PaneRuntime::test_with_screen_bytes(20, 4, b"retained");
+        let mut cache = DetectionScreenCache::default();
+        let observe = |cache: &mut DetectionScreenCache| {
+            observe_detection_screen(
+                cache,
+                &runtime.terminal,
+                None,
+                &runtime.content_seq,
+                &runtime.detection_content_seq,
+                false,
+            )
+        };
+        runtime.content_seq.store(1, Ordering::Release);
+        assert!(observe(&mut cache).refreshed);
+        assert!(observe(&mut cache).refreshed);
+        runtime.content_seq.store(2, Ordering::Release);
+        assert!(observe(&mut cache).refreshed);
+        assert!(!observe(&mut cache).refreshed);
+        runtime.test_process_pty_bytes(b" new");
+        assert!(observe(&mut cache).refreshed);
+        assert!(cache.content().contains("retained new"));
+    }
+
+    #[tokio::test]
+    async fn detection_cache_preserves_semantic_acquisition_and_quiet_expiry() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, b"bottom evidence\r\n");
+        let mut cache = DetectionScreenCache::default();
+        let mut acquisition_started_at = None;
+        let mut last_content_change_at = None;
+        let mut snapshots = 0;
+        let now = std::time::Instant::now();
+
+        for (bytes, elapsed, expected_change, expected_snapshots) in [
+            (&b""[..], std::time::Duration::ZERO, true, 1),
+            (
+                &b"\x1b[?2004h"[..],
+                std::time::Duration::from_millis(500),
+                false,
+                2,
+            ),
+            (
+                &b""[..],
+                PROCESS_ACQUISITION_WINDOW + PROCESS_ACQUISITION_IDLE_RESET,
+                false,
+                2,
+            ),
+        ] {
+            runtime.test_process_pty_bytes(bytes);
+            let observation = cache.observe(
+                None,
+                runtime.detection_content_seq.load(Ordering::Relaxed),
+                false,
+                || {
+                    snapshots += 1;
+                    read_detection_screen_snapshot(&runtime.terminal, None)
+                },
+            );
+            assert_eq!(observation.content_changed, expected_change);
+            assert_eq!(snapshots, expected_snapshots);
+            sync_content_change_acquisition(
+                None,
+                None,
+                false,
+                observation.content_changed,
+                now + elapsed,
+                &mut acquisition_started_at,
+                &mut last_content_change_at,
+            );
+        }
+        assert!(acquisition_started_at.is_none());
+        assert!(last_content_change_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn detection_cache_osc_only_output_rechecks_without_semantic_text_change() {
+        let runtime = PaneRuntime::test_with_screen_bytes(40, 5, b"fixed bottom text");
+        let mut cache = DetectionScreenCache::default();
+        for (bytes, expected, content_changed) in [
+            (&b"\x1b]2;test-active\x07"[..], AgentState::Working, true),
+            (&b"\x1b]9;4;3;0\x07"[..], AgentState::Blocked, false),
+        ] {
+            runtime.test_process_pty_bytes(bytes);
+            let observation = cache.observe(
+                None,
+                runtime.detection_content_seq.load(Ordering::Relaxed),
+                false,
+                || {
+                    // Synthetic signals exercise OSC transport, independent of CLI conventions.
+                    let title = runtime.terminal.agent_osc_title();
+                    let progress = runtime.terminal.agent_osc_progress();
+                    DetectionScreenSnapshot {
+                        content: runtime.terminal.detection_text(),
+                        detection: Some(crate::detect::AgentDetection {
+                            state: if progress.is_empty() && title == "test-active" {
+                                AgentState::Working
+                            } else {
+                                AgentState::Blocked
+                            },
+                            skip_state_update: false,
+                            visible_idle: false,
+                            visible_blocker: false,
+                            visible_working: false,
+                        }),
+                    }
+                },
+            );
+            assert!(observation.refreshed);
+            assert_eq!(observation.content_changed, content_changed);
+            assert_eq!(observation.detection.unwrap().state, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn detection_cache_ignores_viewport_scroll_and_rechecks_local_mutations() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(
+            40,
+            5,
+            4096,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n",
+        );
+        let mut cache = DetectionScreenCache::default();
+        let snapshots = Cell::new(0);
+        let observe = |cache: &mut DetectionScreenCache| {
+            cache.observe(
+                None,
+                runtime.detection_content_seq.load(Ordering::Relaxed),
+                false,
+                || {
+                    snapshots.set(snapshots.get() + 1);
+                    read_detection_screen_snapshot(&runtime.terminal, None)
+                },
+            )
+        };
+        assert!(observe(&mut cache).refreshed);
+        let bottom_buffer = cache.content().to_owned();
+        runtime.scroll_up(2);
+        assert!(!observe(&mut cache).refreshed);
+        assert_eq!(cache.content(), bottom_buffer);
+        runtime.resize(6, 40, 0, 0);
+        assert!(observe(&mut cache).refreshed);
+        runtime.clear_screen().unwrap();
+        assert!(observe(&mut cache).refreshed);
+        assert_eq!(snapshots.get(), 3);
     }
 
     #[test]
