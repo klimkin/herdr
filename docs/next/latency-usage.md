@@ -219,3 +219,14 @@ return is separate from a scheduler wakeup or context switch. Untraced internal
 producers limit whole-lane oldest-age attribution.
 
 Detailed background: [latency measurement documentation](website/src/content/docs/latency-measurement.mdx).
+
+## Server deadline waiting
+
+Linux uses a reusable absolute one-shot `timerfd` for server-loop deadlines.
+Incoming events cancel the pending timer; idle waits remain event-driven.
+The presentation interval stays 16 ms. This reduces timer rounding delay;
+it does not guarantee an end-to-end maximum latency.
+
+If the native timer cannot initialize or fails, the server logs a warning
+and uses Tokio deadline sleeping. macOS and Windows retain Tokio sleeping;
+native high-resolution implementations remain out of scope.

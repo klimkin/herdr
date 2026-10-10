@@ -1,3 +1,8 @@
+// Native high-resolution macOS deadline integration remains out of scope.
+// Stub: preserve Tokio sleeping; a future native waiter must cancel on drop
+// and leave idle sessions blocked without recurring timers.
+pub(super) use super::PortableDeadlineWaiter as NativeDeadlineWaiter;
+
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::fd::RawFd;
