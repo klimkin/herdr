@@ -29,6 +29,7 @@ mod input;
 mod integration;
 mod ipc;
 mod kitty_graphics;
+mod latency_prof;
 mod layout;
 mod logging;
 mod metadata_tokens;
@@ -474,7 +475,7 @@ fn exit_if_nested_disabled(config: &config::Config) {
         eprintln!("see configuration if you want to enable it.");
         eprintln!();
         eprintln!("\x1b[2m\"{}\"\x1b[0m", random_nested_message());
-        std::process::exit(1);
+        latency_exit(1);
     }
 }
 
@@ -493,28 +494,31 @@ where
 
 fn finish_cli(outcome: io::Result<cli::CommandOutcome>) -> io::Result<()> {
     match outcome {
-        Ok(cli::CommandOutcome::Handled(code)) => std::process::exit(code),
+        Ok(cli::CommandOutcome::Handled(code)) => latency_exit(code),
         Ok(cli::CommandOutcome::NotCli) => Ok(()),
-        Err(err) if cli::protocol_mismatch_was_reported(&err) => std::process::exit(1),
+        Err(err) if cli::protocol_mismatch_was_reported(&err) => latency_exit(1),
         Err(err) if cli::server_not_running_was_reported(&err) => {
             if let Some(response) = cli::server_not_running_reported_response(&err) {
                 if let Ok(json) = serde_json::to_string(response) {
                     eprintln!("{json}");
                 }
             }
-            std::process::exit(1);
+            latency_exit(1);
         }
         Err(err) => Err(err),
     }
 }
 
 fn main() -> io::Result<()> {
+    let _latency_guard = latency_prof::Guard;
+    // Initialize diagnostic resources before any terminal/core lock is acquired.
+    latency_prof::record("process.start", std::process::id() as u64, 0);
     let raw_args: Vec<String> = match args_as_utf8(std::env::args_os()) {
         Ok(args) => args,
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!("run 'herdr --help' for usage");
-            std::process::exit(2);
+            latency_exit(2);
         }
     };
     #[cfg(windows)]
@@ -529,7 +533,7 @@ fn main() -> io::Result<()> {
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!("run 'herdr --help' for usage");
-            std::process::exit(2);
+            latency_exit(2);
         }
     };
     let (args, remote_launch) = match remote::extract_remote_args(&args) {
@@ -537,7 +541,7 @@ fn main() -> io::Result<()> {
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!("run 'herdr --help' for usage");
-            std::process::exit(2);
+            latency_exit(2);
         }
     };
 
@@ -552,7 +556,7 @@ fn main() -> io::Result<()> {
     {
         eprintln!("error: --remote can only be used with the default launch command");
         eprintln!("run 'herdr --help' for usage");
-        std::process::exit(2);
+        latency_exit(2);
     }
 
     finish_cli(cli::maybe_run(&args))?;
@@ -582,12 +586,12 @@ fn main() -> io::Result<()> {
             Ok(options) => options,
             Err(err) if err.starts_with("usage:") => {
                 eprintln!("{err}");
-                std::process::exit(0);
+                latency_exit(0);
             }
             Err(err) => {
                 eprintln!("{err}");
                 eprintln!("usage: herdr update [--handoff]");
-                std::process::exit(2);
+                latency_exit(2);
             }
         };
         match update::self_update(options) {
@@ -598,7 +602,7 @@ fn main() -> io::Result<()> {
                 } else {
                     eprintln!("update failed: {e}");
                 }
-                std::process::exit(1);
+                latency_exit(1);
             }
         }
     }
@@ -758,7 +762,7 @@ fn main() -> io::Result<()> {
         if arg.starts_with('-') && !known_flags.contains(&arg_name) {
             eprintln!("unknown option: {arg}");
             eprintln!("run 'herdr --help' for usage");
-            std::process::exit(2);
+            latency_exit(2);
         }
         if !arg.starts_with('-')
             && ![
@@ -780,7 +784,7 @@ fn main() -> io::Result<()> {
         {
             eprintln!("unknown command: {arg}");
             eprintln!("run 'herdr --help' for usage");
-            std::process::exit(2);
+            latency_exit(2);
         }
     }
 
@@ -789,7 +793,7 @@ fn main() -> io::Result<()> {
         if let Err(err) = remote::run_remote(remote_launch) {
             eprintln!("error: {err}");
             remote::print_remote_error_hint(&err, &remote_target);
-            std::process::exit(1);
+            latency_exit(1);
         }
         return Ok(());
     }
@@ -801,9 +805,14 @@ fn main() -> io::Result<()> {
         client::endpoint::EndpointCatalog::load().is_ok_and(|catalog| catalog.has_enabled_ssh());
     if let Err(err) = server::autodetect::auto_detect_launch(saved_federation) {
         eprintln!("herdr: {err}");
-        std::process::exit(1);
+        latency_exit(1);
     }
     Ok(())
+}
+
+fn latency_exit(code: i32) -> ! {
+    latency_prof::shutdown();
+    std::process::exit(code)
 }
 
 #[cfg(test)]

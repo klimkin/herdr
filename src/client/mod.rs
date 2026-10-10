@@ -242,7 +242,10 @@ fn run_client_with_mode(
     };
     let federated = endpoint_catalog.has_enabled_ssh();
 
-    let initial_stream = match crate::ipc::connect_local_stream(&socket_path) {
+    let connect_trace = crate::latency_prof::connect::ConnectTrace::begin();
+    let initial_connection = crate::ipc::connect_local_stream(&socket_path);
+    connect_trace.complete(&initial_connection);
+    let initial_stream = match initial_connection {
         Ok(stream) => Some(stream),
         Err(error) if federated => {
             warn!(%error, "Local is unavailable; keeping saved machines available");
@@ -394,6 +397,7 @@ fn run_client_with_mode(
             return Ok(());
         }
 
+        crate::latency_prof::shutdown();
         std::process::exit(1);
     }
 
@@ -841,6 +845,7 @@ async fn run_client_loop(
             shell.tick_popup_pending(now);
         }
 
+        crate::latency_prof::set_delivery(crate::latency_prof::FrameIdentity::empty());
         match event {
             ClientLoopEvent::HostPower(event) => {
                 if supervisors.host_power_event(event, now) {
@@ -850,6 +855,11 @@ async fn run_client_loop(
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
+                crate::latency_prof::record(
+                    "client.input_dispatch",
+                    crate::latency_prof::bytes_id(&data),
+                    data.len() as u64,
+                );
                 let image_bridge_active = endpoint_accepts_local_images(
                     is_remote_client,
                     write_stream.active_id(),
@@ -1169,6 +1179,7 @@ async fn run_client_loop(
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
+                crate::latency_prof::record("client.input_dispatch", 0, events.len() as u64);
                 let image_bridge_active = endpoint_accepts_local_images(
                     is_remote_client,
                     write_stream.active_id(),
@@ -1447,6 +1458,8 @@ async fn run_client_loop(
                 )?;
             }
             ClientLoopEvent::ServerMessage {
+                #[cfg(feature = "latency-prof")]
+                diagnostic_frame,
                 endpoint_id,
                 generation,
                 message,
@@ -1454,6 +1467,8 @@ async fn run_client_loop(
                 if !write_stream.accepts(&endpoint_id, generation) {
                     continue;
                 }
+                #[cfg(feature = "latency-prof")]
+                crate::latency_prof::set_delivery(diagnostic_frame);
                 write_stream.received(&endpoint_id, generation, now);
                 supervisors.received(&endpoint_id, generation);
                 // Retirements belong to the exact live connection, even after deactivation.

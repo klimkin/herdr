@@ -35,6 +35,7 @@ impl RenderSignal {
     }
 
     pub(crate) fn request_generic(&self) {
+        crate::latency_prof::record("render.state_ready", 0, 0);
         let mut state = self
             .state
             .lock()
@@ -45,6 +46,7 @@ impl RenderSignal {
 
     /// Returns true when the signal becomes pending or visible PTY work joins it.
     pub(crate) fn request_pty(&self, pane_id: PaneId) -> bool {
+        crate::latency_prof::record("render.state_ready", pane_id.raw() as u64, 0);
         let mut state = self
             .state
             .lock()

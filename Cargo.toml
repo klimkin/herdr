@@ -24,6 +24,10 @@ include = [
 members = ["crates/ghostty-vt"]
 default-members = [".", "crates/ghostty-vt"]
 
+[features]
+# Opt-in diagnostics; release builds contain no latency instrumentation by default.
+latency-prof = ["dep:tracy-client"]
+
 [dependencies]
 ghostty-vt = { path = "crates/ghostty-vt" }
 base64 = "0.22.1"
@@ -49,6 +53,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 toml = "0.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Static zones and local capture complement existing aggregate render profiling.
+tracy-client = { version = "=0.19.0", optional = true, default-features = false, features = ["enable", "manual-lifetime", "ondemand", "only-localhost", "timer-fallback"] }
 unicode-width = "0.2"
 unicode-segmentation = "1.13.1"
 schemars = { version = "1.2.1", features = ["derive"] }
@@ -78,6 +84,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Console",
+    "Win32_System_Performance",
     "Win32_System_JobObjects",
     "Win32_System_Kernel",
     "Win32_System_Memory",

@@ -228,15 +228,27 @@ pub(super) fn do_handshake(
             pixel_mouse: pixel_capabilities.exact_geometry && pixel_capabilities.sgr_mouse,
         }
     };
-    protocol::write_message(stream, &hello)
-        .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
+    let trace = crate::latency_prof::connect::HandshakeTrace::begin();
+    let sent = protocol::write_message(stream, &hello);
+    trace.returned(if sent.is_ok() {
+        "client.hello_written"
+    } else {
+        "client.hello_failed"
+    });
+    sent.map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
 
     let read_timeout = if endpoint_shell && !surface_active {
         REMOTE_HANDSHAKE_READ_TIMEOUT
     } else {
         handshake_read_timeout()
     };
-    let welcome = read_handshake_response(stream, read_timeout, stopped)?;
+    let welcome = read_handshake_response(stream, read_timeout, stopped);
+    trace.returned(if welcome.is_ok() {
+        "client.welcome_received"
+    } else {
+        "client.welcome_failed"
+    });
+    let welcome = welcome?;
 
     if endpoint_shell {
         let ServerMessage::EndpointControl { kind, data } = welcome else {
