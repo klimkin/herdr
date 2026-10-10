@@ -92,6 +92,7 @@ fn unix_stdin_reader_loop(
 ) {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
+    let mut diagnostic_input = crate::latency_prof::InputStimuli::default();
     let mut scratch = [0u8; 4096];
     let mut framer = crate::raw_input::RawInputByteFramer::for_host_input();
     framer.set_host_escape_disambiguation_active(host_escape_disambiguation_active);
@@ -180,6 +181,12 @@ fn unix_stdin_reader_loop(
         match reader.read(&mut scratch) {
             Ok(0) => break,
             Ok(n) => {
+                diagnostic_input.observe(&scratch[..n], "input.stdin_stimulus", 0);
+                crate::latency_prof::record(
+                    "client.input_received",
+                    crate::latency_prof::bytes_id(&scratch[..n]),
+                    n as u64,
+                );
                 // A redraw can issue queries while this thread is blocked in read().
                 // Arm the split-reply guard before framing the returned bytes.
                 for _ in 0..host_theme_query_pending.swap(0, Ordering::AcqRel) {

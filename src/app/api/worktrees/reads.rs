@@ -149,11 +149,14 @@ impl App {
             ),
             Method::WorktreeOpen(params) => {
                 if params.path.is_some() == params.branch.is_some() {
-                    let _ = respond_to.send(encode_error(
-                        request.id,
-                        "invalid_request",
-                        "exactly one of path or branch is required",
-                    ));
+                    Self::send_api_response(
+                        respond_to,
+                        encode_error(
+                            request.id,
+                            "invalid_request",
+                            "exactly one of path or branch is required",
+                        ),
+                    );
                     return;
                 }
                 (
@@ -168,21 +171,29 @@ impl App {
         let input = match self.capture_worktree_read_source(workspace_id, cwd) {
             Ok(input) => input,
             Err(err) => {
-                let _ = respond_to.send(encode_error(request.id, err.code, err.message));
+                Self::send_api_response(
+                    respond_to,
+                    encode_error(request.id, err.code, err.message),
+                );
                 return;
             }
         };
         let Ok(permit) = self.worktree_read_slots.clone().try_acquire_owned() else {
-            let _ = respond_to.send(encode_error(
-                request.id,
-                "worktree_busy",
-                "too many worktree checks are pending; retry shortly",
-            ));
+            Self::send_api_response(
+                respond_to,
+                encode_error(
+                    request.id,
+                    "worktree_busy",
+                    "too many worktree checks are pending; retry shortly",
+                ),
+            );
             return;
         };
         let event_tx = self.event_tx.clone();
         let spawn_error_response = respond_to.clone();
         let request_id = request.id.clone();
+        #[cfg(feature = "latency-prof")]
+        let diagnostic_trace = crate::latency_prof::event::current().deferred();
         let spawned = std::thread::Builder::new()
             .name("worktree-read".into())
             .spawn(move || {
@@ -215,6 +226,8 @@ impl App {
                     .map_err(|err| (err.code.to_string(), err.message));
                 let _ = event_tx.blocking_send(AppEvent::WorktreeReadFinished(Box::new(
                     WorktreeReadResult {
+                        #[cfg(feature = "latency-prof")]
+                        diagnostic_trace,
                         _permit: permit,
                         request,
                         client_local,
@@ -226,11 +239,14 @@ impl App {
                 )));
             });
         if let Err(err) = spawned {
-            let _ = spawn_error_response.send(encode_error(
-                request_id,
-                "worktree_list_failed",
-                format!("could not start worktree discovery: {err}"),
-            ));
+            Self::send_api_response(
+                spawn_error_response,
+                encode_error(
+                    request_id,
+                    "worktree_list_failed",
+                    format!("could not start worktree discovery: {err}"),
+                ),
+            );
         }
     }
 
@@ -293,6 +309,8 @@ impl App {
                 }
             }
         };
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::event::current().response(&response);
         let _ = result.respond_to.send(response);
     }
 }

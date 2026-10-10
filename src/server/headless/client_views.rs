@@ -811,6 +811,8 @@ impl HeadlessServer {
         &mut self,
         mut msg: api::ApiRequestMessage,
     ) -> bool {
+        #[cfg(feature = "latency-prof")]
+        let _handler = msg.diagnostic_trace.handler_in(2);
         let target_before = self.default_shell_target();
         let popup_before = self.app.state.popup_pane.is_some();
         let method_claims_geometry = Self::public_request_may_change_geometry(&msg.request.method);

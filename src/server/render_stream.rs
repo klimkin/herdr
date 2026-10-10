@@ -400,6 +400,27 @@ impl PreparedRender {
         }
     }
 
+    /// Metadata captured for the selected update, independent of its wire codec.
+    pub(crate) fn diagnostic_panes(&self) -> Option<&[crate::protocol::PaneSurfacePane]> {
+        if !crate::latency_prof::active() {
+            return None;
+        }
+        match self {
+            Self::Semantic {
+                committed_surface, ..
+            } => Some(&committed_surface.panes),
+            Self::SemanticPatch {
+                encoded: Some(patch),
+                ..
+            } => Some(&patch.panes),
+            Self::SemanticPatch {
+                message: ServerMessage::PaneSurfacePatch(patch),
+                ..
+            } => Some(&patch.panes),
+            Self::SemanticPatch { .. } | Self::TerminalAnsi { .. } => None,
+        }
+    }
+
     /// Graphics metadata represented by this semantic update plus only the
     /// asset keys whose pixel payloads were queued. This is independent of the
     /// selected wire codec and avoids cloning asset byte vectors.

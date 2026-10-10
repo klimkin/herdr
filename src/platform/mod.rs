@@ -3,6 +3,9 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+#[cfg(feature = "latency-prof")]
+pub(crate) mod latency;
+
 #[cfg(unix)]
 pub(crate) mod ssh_agent;
 
@@ -1057,3 +1060,10 @@ pub(crate) fn shared_ssh_control_path(
         "interactive SSH recovery requires Unix OpenSSH multiplexing",
     ))
 }
+
+#[cfg(all(feature = "latency-prof", not(unix)))]
+pub(crate) fn local_stream_peer_pid(_stream: &crate::ipc::LocalStream) -> Option<u32> {
+    None
+}
+#[cfg(all(feature = "latency-prof", unix))]
+pub(crate) use unix_common::local_stream_peer_pid;
