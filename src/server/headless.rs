@@ -84,6 +84,7 @@ mod notifications;
 mod render;
 mod retained_surface;
 mod surface_interest;
+mod terminal_feedback;
 
 // Producers can refill even a bounded channel while it is being drained.
 // Yield to scheduled work and rendering between batches; select! below
@@ -212,6 +213,7 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    feedback_recovery: HashSet<u64>,
     native_graphics: native_graphics::NativeGraphics,
     interactive_input_deadlines: HashMap<crate::layout::PaneId, Instant>,
     interactive_render_budget: Option<(Instant, u8)>,
@@ -373,6 +375,7 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            feedback_recovery: HashSet::new(),
             native_graphics: Default::default(),
             interactive_input_deadlines: HashMap::new(),
             interactive_render_budget: None,
@@ -485,7 +488,7 @@ impl HeadlessServer {
             }
 
             // 1. Check the coalesced render signal from PTY readers and generic runtime work.
-            if self.app.render_dirty.is_pending() {
+            if self.app.render_dirty.is_pending() || self.has_ready_feedback_recovery() {
                 needs_render = true;
                 crate::render_prof::event("render.request.signal");
             }
@@ -566,6 +569,81 @@ impl HeadlessServer {
             self.stream_host_mouse_capture_mode();
             self.stream_direct_terminal_keyboard_mode();
 
+            // Supported early feedback shares a bounded budget. Refresh
+            // time and pending work here: maintenance may cross the ordinary due
+            // boundary after the baseline turn's time sample.
+            if self.app.early_presentation.enabled() {
+                let decision_now = Instant::now();
+                needs_render |= self.app.render_dirty.is_pending();
+                let ordinary_due = needs_render
+                    && (self.app.can_render_now(decision_now)
+                        || (self.app.can_present_now(decision_now)
+                            && self.has_pending_presentation_work(
+                                needs_full_render,
+                                needs_graphics_render,
+                            )));
+                if !ordinary_due {
+                    let clients = &self.clients;
+                    if let Some(opportunity) = self.app.early_action_ready(decision_now, |origin| {
+                        clients.get(&origin.client_id).is_some_and(|client| {
+                            client.is_active_shell_client()
+                                && client.shell_projection_revision == origin.projection_revision
+                        })
+                    }) {
+                        let has_recipient = self
+                            .clients
+                            .values()
+                            .any(|client| client.is_active_shell_client());
+                        if has_recipient
+                            && self.app.early_presentation.admit(
+                                opportunity.id,
+                                decision_now,
+                                ordinary_due,
+                            )
+                        {
+                            let presentation = crate::latency_prof::PresentationTrace::selected(
+                                decision_now,
+                                decision_now,
+                            );
+                            #[cfg(feature = "latency-prof")]
+                            crate::latency_prof::record_context_at(
+                                "opportunity.admitted",
+                                opportunity.id,
+                                0,
+                                0,
+                                crate::latency_prof::now(),
+                                presentation.context(),
+                            );
+                            let pending_request = self.app.render_dirty.take_pending();
+                            let (_, outer_title_synced) = self.sync_terminal_title_sources(
+                                &pending_request.request.terminal_title_sources,
+                            );
+                            if !outer_title_synced {
+                                self.sync_window_title();
+                            }
+                            let outcome = self.render_and_stream_traced(presentation.context());
+                            if outcome.ordinary_work_handled {
+                                pending_request.complete();
+                                needs_render = false;
+                                needs_full_render = false;
+                            } else {
+                                drop(pending_request);
+                                // Destructive construction may have exhausted
+                                // rows before a matching enqueue. Force coherent
+                                // ordinary recovery without changing its deadline.
+                                self.app.full_redraw_pending = true;
+                                needs_render = true;
+                                needs_full_render = true;
+                            }
+                            // Both clocks still belong to ordinary cadence. Live
+                            // arrivals and recipient recovery retain their owners.
+                            needs_graphics_render = false;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // 7. Render virtually and stream frames. Hidden-only PTY work keeps a
             // bounded classification cadence without delaying presentation work
             // that joins the same coalesced request.
@@ -626,7 +704,11 @@ impl HeadlessServer {
                 if needs_full_render && !outer_title_synced {
                     self.sync_window_title();
                 }
-                if !needs_full_render && !needs_graphics_render && !pty_dirty {
+                if !needs_full_render
+                    && !needs_graphics_render
+                    && !pty_dirty
+                    && !self.has_ready_feedback_recovery()
+                {
                     // A synchronized-output OSC title can be the only pending work.
                     // Its deferred PTY repaint has its own signal; do not manufacture
                     // a full UI render for this client-local side effect.
@@ -634,7 +716,8 @@ impl HeadlessServer {
                     needs_render = false;
                     continue;
                 }
-                let hidden_only = pty_dirty
+                let hidden_only = !self.has_ready_feedback_recovery()
+                    && pty_dirty
                     && !needs_full_render
                     && !needs_graphics_render
                     && !self.pty_sources_visible_to_any_render_target(&render_request.pty_sources);
@@ -674,11 +757,15 @@ impl HeadlessServer {
                     crate::render_prof::event("render.skipped.hidden_sources");
                 } else if !needs_full_render
                     && !needs_graphics_render
-                    && self.render_retained_pane_surface_traced(
-                        &render_request.pty_sources,
-                        presentation.context(),
-                    )
+                    && (!pty_dirty
+                        || self.render_retained_pane_surface_traced(
+                            &render_request.pty_sources,
+                            presentation.context(),
+                        ))
                 {
+                    if self.has_ready_feedback_recovery() {
+                        self.render_feedback_recovery_traced(presentation.context());
+                    }
                     crate::render_prof::event("retained_surface.invoke");
                 } else {
                     crate::render_prof::event("full_render.invoke");
@@ -699,11 +786,44 @@ impl HeadlessServer {
                 continue;
             }
 
+            if self.app.early_presentation.enabled() {
+                needs_render |= self.app.render_dirty.is_pending();
+                let service_now = Instant::now();
+                let ordinary_due = needs_render
+                    && (self.app.can_render_now(service_now)
+                        || (self.app.can_present_now(service_now)
+                            && self.has_pending_presentation_work(
+                                needs_full_render,
+                                needs_graphics_render,
+                            )));
+                if ordinary_due {
+                    continue;
+                }
+                self.try_early_terminal_feedback(service_now);
+
+                self.app.prune_terminal_feedback();
+                if self.app.full_redraw_pending {
+                    needs_render = true;
+                    needs_full_render = true;
+                }
+                if !needs_full_render
+                    && !needs_graphics_render
+                    && !self.app.render_dirty.is_pending()
+                    && !self.has_ready_feedback_recovery()
+                {
+                    needs_render = false;
+                }
+            }
+
             // A runtime/API shutdown can be requested without setting the
             // external stop flag. It must not rely on another event or timer.
             if self.app.state.should_quit || self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
+
+            // Recovery created in this turn owns an ordinary deadline even
+            // when selected work consumed the last shared dirty request.
+            needs_render |= self.has_ready_feedback_recovery();
 
             // 8. Wait for next event.
             let mut deadline = self.app.next_headless_deadline_selection(
@@ -1077,6 +1197,10 @@ impl HeadlessServer {
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
+        self.feedback_recovery.remove(&client_id);
+        self.cancel_terminal_source_opportunities(client_id);
+        self.app.early_presentation.cancel_client(client_id);
+        self.app.prune_terminal_feedback();
         self.disconnect_native_graphics(client_id);
         let disconnected_focus = self
             .clients
@@ -1143,7 +1267,7 @@ impl HeadlessServer {
                     ) else {
                         continue;
                     };
-                    apply_client_pane_input_events(runtime, &[held.release])
+                    apply_client_pane_input_events(runtime, &[held.release]).map(|_| ())
                 }
                 ClientShellInputTarget::Popup(terminal_id) => {
                     let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) else {
@@ -1391,12 +1515,26 @@ impl HeadlessServer {
                 ) else {
                     return foreground_changed | geometry_changed;
                 };
-                if let Err(err) = apply_client_pane_input_events(
+                let baseline = self
+                    .app
+                    .terminal_input_baseline(workspace_index, runtime_pane_id);
+                let accepted = match apply_client_pane_input_events(
                     runtime,
                     &[protocol::ClientPaneInputEvent::Paste(path)],
                 ) {
-                    warn!(client_id, pane_id, err = %err, "client shell clipboard image paste failed");
-                }
+                    Ok(accepted) => accepted,
+                    Err(err) => {
+                        warn!(client_id,pane_id,err=%err,"client shell clipboard image paste failed");
+                        false
+                    }
+                };
+                let origin = self.clients.get(&client_id).map(|client| {
+                    app::early_presentation::OriginLease {
+                        client_id,
+                        projection_revision: client.shell_projection_revision,
+                    }
+                });
+                self.app.accepted_terminal_input(baseline, accepted, origin);
                 true
             }
             protocol::ClientClipboardImageTarget::Popup(terminal_id) => {
@@ -2664,6 +2802,9 @@ impl HeadlessServer {
                 ) else {
                     return foreground_changed | geometry_changed;
                 };
+                let baseline = self
+                    .app
+                    .terminal_input_baseline(workspace_index, runtime_pane_id);
                 let scroll_before = runtime.scroll_metrics();
                 let mut keyboard_forwarded = false;
                 let input_result = apply_client_terminal_input_events(
@@ -2676,8 +2817,18 @@ impl HeadlessServer {
                 if keyboard_forwarded {
                     self.note_interactive_input(runtime_pane_id, Instant::now());
                 }
-                if let Err(err) = input_result {
-                    warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                let origin = self.clients.get(&client_id).map(|client| {
+                    app::early_presentation::OriginLease {
+                        client_id,
+                        projection_revision: client.shell_projection_revision,
+                    }
+                });
+                match input_result {
+                    Ok(accepted) => self.app.accepted_terminal_input(baseline, accepted, origin),
+                    Err(err) => {
+                        self.app.rejected_terminal_input();
+                        warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                    }
                 }
                 foreground_changed | geometry_changed || scroll_changed
             }
@@ -2878,11 +3029,22 @@ impl HeadlessServer {
                 true
             }
             ServerEvent::ClientWriterDrained { client_id } => {
+                if self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|client| client.pending_feedback.is_some())
+                {
+                    return self.retry_pending_feedback(client_id);
+                }
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     #[cfg(feature = "latency-prof")]
                     crate::latency_prof::record("writer.feedback.orphaned", client_id, 0);
                     return false;
                 };
+                if client.feedback_recovery && client.render_pending {
+                    self.feedback_recovery.insert(client_id);
+                    return false;
+                }
                 let retry = client.take_deferred_render() != DeferredRender::None;
                 #[cfg(feature = "latency-prof")]
                 if let Some(writer) = &client.writer {

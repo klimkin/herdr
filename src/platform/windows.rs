@@ -523,6 +523,11 @@ pub(crate) fn write_existing_config(
     config_backup::write_existing(target, contents)
 }
 
+/// Windows retains cadence-based presentation.
+pub(crate) fn early_presentation_supported() -> bool {
+    false
+}
+
 #[cfg(test)]
 fn config_security_descriptor(
     path: &std::path::Path,

@@ -2,6 +2,9 @@
 
 #![cfg(unix)]
 
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[path = "../examples/latency/observer.rs"]
+mod action_observer;
 pub mod support;
 #[path = "support/terminal_screen.rs"]
 mod terminal_screen;
@@ -1461,6 +1464,566 @@ fn send_pane_shell_command(socket_path: &PathBuf, pane_id: &str, command: &str) 
     assert_eq!(response["result"]["type"], "ok", "{response}");
 }
 
+#[cfg(all(feature = "latency-prof", target_os = "linux"))]
+#[test]
+fn accepted_terminal_input_presents_real_echo_and_empty_input_grants_no_opportunity() {
+    terminal_feedback_case();
+}
+
+#[cfg(all(feature = "latency-prof", target_os = "linux"))]
+fn terminal_feedback_case() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let traces = base.join("traces");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(
+        config_home.join(app_dir_name()).join("config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+    let trace_env = traces.to_string_lossy();
+    let server_env = [("HERDR_LATENCY_TRACE_DIR", trace_env.as_ref())];
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &server_env,
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &runtime_dir.join("herdr-client.sock"),
+        Duration::from_secs(10),
+    );
+    let client = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    let output = spawn_pty_drain(
+        client
+            ._master
+            .as_ref()
+            .expect("owned client PTY")
+            .try_clone_reader()
+            .unwrap(),
+    );
+    let created = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id":"target-workspace", "method":"workspace.create", "params":{"cwd":base,"focus":true}
+        })
+        .to_string(),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("created pane");
+    let split = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id":"target-bulk-pane", "method":"pane.split",
+            "params":{"target_pane_id":pane_id,"direction":"right","focus":false}
+        })
+        .to_string(),
+    );
+    let bulk_pane = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .expect("bulk pane");
+    // Independent output owns ordinary demand without changing the selected
+    // terminal's input baseline or consuming urgency before its real response.
+    send_pane_shell_command(&api_socket, bulk_pane,
+        "stty -echo; i=0; while [ $i -lt 2000 ]; do printf '\\033[H'; if [ $((i%2)) -eq 0 ]; then printf BULK_A; else printf BULK_B; fi; i=$((i+1)); sleep 0.002; done");
+    send_pane_shell_command(&api_socket, pane_id,
+        "stty -echo; printf '\\033[2J\\033[HTARGET_READY'; read neutral; printf '\\033[0m'; i=0; while [ $i -lt 4 ]; do read value; printf '\\033[2;1HTARGET_ECHO:%s\\r\\n' \"$value\"; i=$((i+1)); done; sleep 2");
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || {
+            terminal_screen::text(&output.lock().unwrap().bytes, 80, 24).contains("TARGET_READY")
+        }
+    ));
+    for (id, keys) in [
+        ("target-no-keys", Vec::<&str>::new()),
+        ("target-invalid-keys", vec!["NotAKey"]),
+    ] {
+        let response=send_json_request(&api_socket,&serde_json::json!({"id":id,"method":"pane.send_keys","params":{"pane_id":pane_id,"keys":keys}}).to_string());
+        if id == "target-invalid-keys" {
+            assert_eq!(response["error"]["code"], "invalid_key");
+        } else {
+            assert_eq!(response["result"]["type"], "ok");
+        }
+    }
+    let invalid=send_json_request(&api_socket,&serde_json::json!({"id":"target-invalid-whole","method":"pane.send_input","params":{"pane_id":pane_id,"text":"must-not-be-written","keys":["NotAKey"]}}).to_string());
+    assert_eq!(invalid["error"]["code"], "invalid_key");
+    let empty = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id":"target-empty", "method":"pane.send_text", "params":{"pane_id":pane_id,"text":""}
+        })
+        .to_string(),
+    );
+    assert_eq!(empty["result"]["type"], "ok");
+    let neutral = send_json_request(&api_socket, &serde_json::json!({
+        "id":"target-no-material", "method":"pane.send_text", "params":{"pane_id":pane_id,"text":"neutral\n"}
+    }).to_string());
+    assert_eq!(neutral["result"]["type"], "ok");
+    thread::sleep(Duration::from_millis(50));
+    let mut committed = None;
+    // Fixed material-response trials exercise the public behavior across the
+    // ordinary cadence; every required echo remains an output obligation.
+    for sequence in 0..4 {
+        let value = format!("accepted-{sequence}");
+        let response = send_json_request(
+            &api_socket,
+            &serde_json::json!({
+                "id":format!("target-echo-{sequence}"), "method":"pane.send_text",
+                "params":{"pane_id":pane_id,"text":format!("{value}\n")}
+            })
+            .to_string(),
+        );
+        assert_eq!(response["result"]["type"], "ok", "{response}");
+        assert!(wait_until(
+            Duration::from_secs(8),
+            Duration::from_millis(1),
+            || {
+                let bytes = output.lock().unwrap().bytes.clone();
+                if let Some(snapshot) = terminal_screen::committed_snapshot(&bytes, 80, 24) {
+                    if snapshot.text.contains(&format!("TARGET_ECHO:{value}")) {
+                        committed = Some(snapshot);
+                        return true;
+                    }
+                }
+                false
+            }
+        ));
+    }
+    assert!(
+        !terminal_screen::text(&output.lock().unwrap().bytes, 80, 24)
+            .contains("must-not-be-written")
+    );
+    let committed_cursor = committed
+        .expect("committed echo snapshot")
+        .cursor
+        .expect("committed outer cursor");
+    assert!(
+        committed_cursor.2,
+        "successful selected echo retains visible host cursor"
+    );
+    let server_pid = server.child.process_id().expect("server PID");
+    drop(server);
+    drop(client);
+    let path = traces.join(format!("{server_pid}.jsonl"));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || fs::read_to_string(&path).is_ok_and(|trace| trace.contains("process.finish"))
+    ));
+    let records: Vec<Value> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("public diagnostic record"))
+        .collect();
+    let admitted: Vec<_> = records
+        .iter()
+        .filter(|record| record["stage"] == "opportunity.input_accepted")
+        .filter(|record| record["value"] == 1)
+        .collect();
+    assert!(
+        admitted.len() >= 5,
+        "neutral plus all four whole echo inputs are accepted"
+    );
+    for outcome in admitted {
+        let association = records
+            .iter()
+            .filter(|record| {
+                record["stage"] == "opportunity.input"
+                    && record["id"] == outcome["id"]
+                    && record["service"] == outcome["service"]
+            })
+            .count();
+        let unavailable = records
+            .iter()
+            .filter(|record| {
+                record["stage"] == "opportunity.input_no_baseline"
+                    && record["id"] == outcome["id"]
+                    && record["service"] == outcome["service"]
+            })
+            .count();
+        assert_eq!(
+            association + unavailable,
+            1,
+            "accepted input has an exact grant or explicit unavailable baseline"
+        );
+    }
+    assert!(
+        records
+            .iter()
+            .any(|record| record["stage"] == "opportunity.early_terminal_admitted"),
+        "accepted target response can spend one bounded early opportunity"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["stage"] == "opportunity.terminal_enqueued"),
+        "real successful terminal presentation has an exact enqueue receipt"
+    );
+    {
+        let residual = records
+            .iter()
+            .find(|record| record["stage"] == "server.selected_revision_residual")
+            .expect("revision-only early work preserves an ordinary presentation obligation");
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["stage"] == "opportunity.terminal_enqueued"
+                    && record["attempt"] == residual["attempt"]),
+            "nonmaterial selected work emits no early receipt"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record["stage"] == "surface.content"
+                    && record["ns"].as_u64() > residual["ns"].as_u64()
+                    && record["runtime_instance"] == residual["runtime_instance"]
+                    && record["value"].as_u64() >= residual["value"].as_u64()
+                    && record["attempt"] != residual["attempt"]),
+            "ordinary service eventually incorporates revision-only residual state"
+        );
+    }
+    let script="import json,sys;sys.path.insert(0,'scripts');from latency_target_report import target_opportunities; records=[json.loads(line) for line in open(sys.argv[1])]; rows=target_opportunities(records,strict=True); assert any(row['status']=='early_enqueued' for row in rows),rows";
+    let report = std::process::Command::new("python3")
+        .args(["-c", script])
+        .arg(&path)
+        .output()
+        .expect("public target report");
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["stage"] == "opportunity.input_empty"),
+        "empty accepted command remains a public no-grant outcome"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["stage"] == "opportunity.input_rejected"),
+        "invalid whole input remains a public rejected outcome"
+    );
+    cleanup_test_base(&base);
+}
+
+#[cfg(all(feature = "latency-prof", target_os = "linux"))]
+#[test]
+fn selected_cursor_only_feedback_moves_committed_host_cursor() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let traces = base.join("traces");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(
+        config_home.join(app_dir_name()).join("config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+    let trace_env = traces.to_string_lossy();
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &runtime_dir.join("herdr-client.sock"),
+        Duration::from_secs(10),
+    );
+    let client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    let output = spawn_pty_drain(client._master.as_ref().unwrap().try_clone_reader().unwrap());
+    let created=send_json_request(&api_socket,&serde_json::json!({"id":"cursor-only-workspace","method":"workspace.create","params":{"cwd":base,"focus":true}}).to_string());
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let ready = base.join("child-ready");
+    let replied = base.join("child-replied");
+    let command=format!("stty -echo; printf '\\033[2J\\033[HCURSOR_ONLY_READY\\033[3;5H'; touch '{}'; read value; printf '\\033[4;7H'; touch '{}'; sleep 3",ready.display(),replied.display());
+    send_pane_shell_command(&api_socket, pane, &command);
+    let mut baseline = None;
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || {
+            let bytes = output.lock().unwrap().bytes.clone();
+            if let Some(snapshot) = terminal_screen::committed_snapshot(&bytes, 80, 24) {
+                if snapshot.text.contains("CURSOR_ONLY_READY") {
+                    baseline = snapshot.cursor;
+                    return baseline.is_some();
+                }
+            }
+            false
+        }
+    ));
+    // Establish real child input state before the cursor-only command; a public
+    // output observation owns presentation completion, file only owns child phase.
+    assert!(ready.exists());
+    let response=send_json_request(&api_socket,&serde_json::json!({"id":"cursor-only-input","method":"pane.send_text","params":{"pane_id":pane,"text":"move\n"}}).to_string());
+    assert_eq!(response["result"]["type"], "ok");
+    let baseline = baseline.unwrap();
+    let mut observed = None;
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || {
+            let bytes = output.lock().unwrap().bytes.clone();
+            if let Some(snapshot) = terminal_screen::committed_snapshot(&bytes, 80, 24) {
+                if snapshot.text.contains("CURSOR_ONLY_READY")
+                    && snapshot.cursor.is_some_and(|cursor| cursor != baseline)
+                {
+                    observed = snapshot.cursor;
+                    return true;
+                }
+            }
+            false
+        }
+    ));
+    let observed = observed.unwrap();
+    assert_eq!((observed.0 - baseline.0, observed.1 - baseline.1), (2, 1));
+    assert!(observed.2);
+    assert!(replied.exists());
+    let pid = server.child.process_id().unwrap();
+    drop(server);
+    drop(client);
+    let path = traces.join(format!("{pid}.jsonl"));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || fs::read_to_string(&path).is_ok_and(|trace| trace.contains("process.finish"))
+    ));
+    let records: Vec<Value> = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let cursor_attempt = records
+        .iter()
+        .find(|record| record["stage"] == "server.selected_cursor_only")
+        .expect("selected cursor-only construction");
+    assert!(
+        records
+            .iter()
+            .any(|record| record["stage"] == "opportunity.terminal_presented"
+                && record["attempt"] == cursor_attempt["attempt"]),
+        "cursor-only selected attempt owns an exact successful target enqueue"
+    );
+    cleanup_test_base(&base);
+}
+
+#[cfg(all(feature = "latency-prof", target_os = "linux"))]
+#[test]
+fn selected_unfocused_terminal_keeps_committed_focused_cursor() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let traces = base.join("traces");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(
+        config_home.join(app_dir_name()).join("config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+    let trace_env = traces.to_string_lossy();
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    let client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    let output = spawn_pty_drain(client._master.as_ref().unwrap().try_clone_reader().unwrap());
+    let created=send_json_request(&api_socket,&serde_json::json!({"id":"cursor-workspace","method":"workspace.create","params":{"cwd":base,"focus":true}}).to_string());
+    let first = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let split=send_json_request(&api_socket,&serde_json::json!({"id":"cursor-split","method":"pane.split","params":{"target_pane_id":first,"direction":"right","focus":true}}).to_string());
+    let second = split["result"]["pane"]["pane_id"].as_str().unwrap();
+    send_pane_shell_command(&api_socket,first,"stty -echo; printf '\\033[2J\\033[HLEFT_READY'; (while :; do printf '\\033[5;1HBULK\\033[6;1H'; sleep 0.002; done) & bulk=$!; read value; kill \"$bulk\"; printf '\\033[2;1HLEFT_ECHO:%s' \"$value\"; sleep 3");
+    send_pane_shell_command(
+        &api_socket,
+        second,
+        "stty -echo; printf '\\033[2J\\033[HRIGHT_READY\\033[3;5H'; sleep 4",
+    );
+    let mut baseline = None;
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || {
+            let bytes = output.lock().unwrap().bytes.clone();
+            if let Some(snapshot) = terminal_screen::committed_snapshot(&bytes, 80, 24) {
+                if snapshot.text.contains("LEFT_READY") && snapshot.text.contains("RIGHT_READY") {
+                    baseline = snapshot.cursor;
+                    return baseline.is_some();
+                }
+            }
+            false
+        }
+    ));
+    let baseline = baseline.expect("committed focused right cursor");
+    let response=send_json_request(&api_socket,&serde_json::json!({"id":"cursor-echo","method":"pane.send_text","params":{"pane_id":first,"text":"selected\n"}}).to_string());
+    assert_eq!(response["result"]["type"], "ok");
+    let mut selected = None;
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || {
+            let bytes = output.lock().unwrap().bytes.clone();
+            if let Some(snapshot) = terminal_screen::committed_snapshot(&bytes, 80, 24) {
+                if snapshot.text.contains("LEFT_ECHO:selected") {
+                    selected = snapshot.cursor;
+                    return selected.is_some();
+                }
+            }
+            false
+        }
+    ));
+    assert_eq!(
+        selected.expect("committed right cursor after selected left patch"),
+        baseline,
+        "selected left output keeps focused right cursor at committed position"
+    );
+    let pid = server.child.process_id().unwrap();
+    drop(server);
+    drop(client);
+    let path = traces.join(format!("{pid}.jsonl"));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || fs::read_to_string(&path).is_ok_and(|trace| trace.contains("process.finish"))
+    ));
+    let records: Vec<Value> = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records.iter().any(|preserved| {
+            preserved["stage"] == "server.unselected_cursor_preserved"
+                && records.iter().any(|receipt| {
+                    receipt["stage"] == "opportunity.terminal_presented"
+                        && receipt["attempt"] == preserved["attempt"]
+                })
+        }),
+        "selected unfocused target owns exact successful receipt on preserving attempt"
+    );
+    cleanup_test_base(&base);
+}
+
+#[cfg(all(feature = "latency-prof", target_os = "linux"))]
+#[test]
+fn unrelated_viewer_disconnect_keeps_shared_terminal_feedback_eligible() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let traces = base.join("traces");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(
+        config_home.join(app_dir_name()).join("config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+    let trace_env = traces.to_string_lossy();
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    let client = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    let output = spawn_pty_drain(
+        client
+            ._master
+            .as_ref()
+            .expect("owned client PTY")
+            .try_clone_reader()
+            .unwrap(),
+    );
+    let created=send_json_request(&api_socket,&serde_json::json!({"id":"viewer-workspace","method":"workspace.create","params":{"cwd":base,"focus":true}}).to_string());
+    let pane_id = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    send_pane_shell_command(&api_socket,pane_id,
+        "stty -echo; printf '\\033[2J\\033[HVIEWER_READY'; (while :; do printf '\\033[5;1HBULK\\033[6;1H'; sleep 0.002; done) & bulk=$!; read value; sleep 0.003; kill \"$bulk\"; printf '\\033[2;1HVIEWER_ECHO:%s' \"$value\"; sleep 2");
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || terminal_screen::text(&output.lock().unwrap().bytes, 80, 24).contains("VIEWER_READY")
+    ));
+    let mut viewer = UnixStream::connect(&client_socket).unwrap();
+    let (_, error) = client_shell_handshake(&mut viewer, CURRENT_PROTOCOL, 80, 23).unwrap();
+    assert!(error.is_none());
+    wait_for_client_shell_bootstrap(&mut viewer, Duration::from_secs(10)).unwrap();
+    let response=send_json_request(&api_socket,&serde_json::json!({"id":"viewer-echo","method":"pane.send_text","params":{"pane_id":pane_id,"text":"healthy\n"}}).to_string());
+    assert_eq!(response["result"]["type"], "ok");
+    drop(viewer);
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || {
+            let bytes = output.lock().unwrap().bytes.clone();
+            terminal_screen::committed_snapshot(&bytes, 80, 24)
+                .is_some_and(|snapshot| snapshot.text.contains("VIEWER_ECHO:healthy"))
+        }
+    ));
+    let server_pid = server.child.process_id().unwrap();
+    drop(server);
+    drop(client);
+    let path = traces.join(format!("{server_pid}.jsonl"));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || fs::read_to_string(&path).is_ok_and(|trace| trace.contains("process.finish"))
+    ));
+    let records: Vec<Value> = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let grant = records
+        .iter()
+        .rfind(|record| record["stage"] == "opportunity.terminal_granted")
+        .expect("shared terminal input grant");
+    assert!(
+        records
+            .iter()
+            .any(|record| record["stage"] == "opportunity.terminal_presented"
+                && record["id"] == grant["id"]),
+        "unrelated viewer departure keeps the grant eligible for early or due ordinary delivery"
+    );
+    cleanup_test_base(&base);
+}
+
 #[cfg(feature = "latency-prof")]
 #[test]
 fn synchronized_title_notification_reports_the_actual_wake_request() {
@@ -1998,8 +2561,30 @@ fn client_keeps_terminal_output_across_hidden_damage_source_switch_and_resize() 
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("herdr.sock");
     let client_socket = runtime_dir.join("herdr-client.sock");
-    let (server, client, output) =
-        attach_thin_client(&config_home, &runtime_dir, &api_socket, &client_socket);
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(
+        config_home.join(app_dir_name()).join("config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &[],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    let client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
+    let output = spawn_pty_drain(
+        client
+            ._master
+            .as_ref()
+            .expect("owned PTY")
+            .try_clone_reader()
+            .unwrap(),
+    );
 
     let created = send_json_request(
         &api_socket,
@@ -2529,4 +3114,543 @@ fn client_receives_notify_on_agent_state_change() {
     );
 
     cleanup_spawned_herdr(spawned, base);
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[test]
+fn rapid_authoritative_actions_coalesce_without_renewing_extra_budget() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let traces = base.join("traces");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(config_home.join(app_dir_name()).join("config.toml"), "onboarding = false\n[ui]\nwindow_title = \"\"\n[update]\nversion_check = false\nmanifest_check = false\n").unwrap();
+    let trace_env = traces.to_string_lossy();
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &runtime_dir.join("herdr-client.sock"),
+        Duration::from_secs(10),
+    );
+    let client = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    let output = spawn_pty_drain(client._master.as_ref().unwrap().try_clone_reader().unwrap());
+    let created = send_json_request(&api_socket, &serde_json::json!({"id":"action-create", "method":"workspace.create", "params":{"cwd":base,"focus":true,"label":"action-start"}}).to_string());
+    let workspace = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("created workspace");
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(10), || {
+            terminal_screen::text(&output.lock().unwrap().bytes, 80, 24).contains("action-start")
+        }),
+        "client attached before action burst: {}",
+        read_output(&output)
+    );
+    let mut input = client._master.as_ref().unwrap().take_writer().unwrap();
+    input.write_all(b"\x02W").unwrap();
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(5), || {
+            terminal_screen::text(&output.lock().unwrap().bytes, 80, 24)
+                .contains("rename workspace")
+        }),
+        "TUI rename preparation stays outside action timing"
+    );
+    input.write_all(b"\x03MixedOrigin\r").unwrap();
+    for sequence in 0..64 {
+        let request = serde_json::json!({"id":format!("action-burst-{sequence}"),"method":"workspace.rename","params":{"workspace_id":workspace,"label":format!("Rapid{sequence:03}")}});
+        let response = send_json_request(&api_socket, &request.to_string());
+        assert_eq!(response["id"], format!("action-burst-{sequence}"));
+        assert!(response["error"].is_null(), "{response}");
+    }
+    assert!(
+        wait_for_committed_action_label(&output, "Rapid063", 80, 24),
+        "last committed authoritative label remains visible"
+    );
+    let same = send_json_request(&api_socket, &serde_json::json!({"id":"action-noop","method":"workspace.rename","params":{"workspace_id":workspace,"label":"Rapid063"}}).to_string());
+    assert!(same["error"].is_null());
+    let rejected = send_json_request(&api_socket, &serde_json::json!({"id":"action-invalid","method":"workspace.rename","params":{"workspace_id":"missing-workspace","label":"Rejected"}}).to_string());
+    assert!(!rejected["error"].is_null());
+    let server_pid = server.child.process_id().unwrap();
+    drop(input);
+    drop(client);
+    drop(server);
+    let trace = traces.join(format!("{server_pid}.jsonl"));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || fs::read_to_string(&trace).is_ok_and(|raw| raw.contains("process.finish"))
+    ));
+    let records: Vec<Value> = fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let diagnostic_id = |text: &str| {
+        text.as_bytes()
+            .iter()
+            .fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            })
+    };
+    for request in ["action-noop", "action-invalid"] {
+        let identity = diagnostic_id(request);
+        assert!(
+            !records
+                .iter()
+                .any(
+                    |r| (r["stage"] == "opportunity.action_granted" && r["scope"] == identity)
+                        || (r["stage"] == "opportunity.superseded" && r["value"] == identity)
+                ),
+            "unchanged/rejected request grants no accepted opportunity"
+        );
+    }
+    assert!(
+        records
+            .iter()
+            .any(|r| r["stage"] == "opportunity.superseded"),
+        "rapid actions coalesce instead of one obligation per request"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r["stage"] == "opportunity.token_denied"),
+        "global extra admission budget remains bounded"
+    );
+    let admitted: Vec<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "opportunity.admitted")
+        .collect();
+    assert!(
+        admitted.len() < 64,
+        "burst cannot bypass global admission budget"
+    );
+    let origins: Vec<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "opportunity.origin")
+        .collect();
+    assert!(
+        !origins.is_empty(),
+        "shared committed work exposes explicit origin scope"
+    );
+    assert!(
+        origins.iter().any(|r| r["value"] == 0)
+            && origins
+                .iter()
+                .any(|r| r["value"].as_u64().is_some_and(|id| id != 0)),
+        "JSON actions remain origin-neutral and TUI actions retain explicit source lease"
+    );
+    let expiries: Vec<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "opportunity.expires_at")
+        .collect();
+    assert!(
+        !expiries.is_empty(),
+        "public lifecycle exposes fixed expiry"
+    );
+    let mut expiry_by_id = std::collections::HashMap::new();
+    for record in expiries {
+        let identity = record["id"].as_u64().unwrap();
+        let expires = record["value"].as_u64().unwrap();
+        if let Some(first) = expiry_by_id.insert(identity, expires) {
+            assert_eq!(first, expires, "coalescing cannot renew fixed expiry");
+        }
+    }
+    let charges: Vec<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "opportunity.charged_at")
+        .filter_map(|r| r["value"].as_u64())
+        .collect();
+    assert!(
+        !charges.is_empty(),
+        "public admission records expose actual charged policy time"
+    );
+    assert!(
+        charges
+            .windows(2)
+            .all(|times| times[1] - times[0] >= 16_000_000),
+        "one shared token refills no faster than16ms"
+    );
+    cleanup_test_base(&base);
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[test]
+fn actions_without_viewers_expire_without_creating_idle_frames() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let traces = base.join("traces");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(config_home.join(app_dir_name()).join("config.toml"), "onboarding = false\n[ui]\nwindow_title = \"\"\n[update]\nversion_check = false\nmanifest_check = false\n").unwrap();
+    let trace_env = traces.to_string_lossy();
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &runtime_dir.join("herdr-client.sock"),
+        Duration::from_secs(10),
+    );
+    let created = send_json_request(&api_socket, &serde_json::json!({"id":"action-create", "method":"workspace.create", "params":{"cwd":base,"focus":true,"label":"action-start"}}).to_string());
+    let workspace = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("created workspace");
+    for sequence in 0..64 {
+        let response = send_json_request(&api_socket, &serde_json::json!({"id":format!("silent-{sequence}"),"method":"workspace.rename","params":{"workspace_id":workspace,"label":format!("Silent{sequence:03}")}}).to_string());
+        assert!(response["error"].is_null());
+    }
+    thread::sleep(Duration::from_millis(100));
+    let trace = traces.join(format!("{}.jsonl", server.child.process_id().unwrap()));
+    // The asynchronous diagnostic writer flushes during this existing idle
+    // interval; inspecting its public artifacts sends no server wake.
+    thread::sleep(Duration::from_millis(100));
+    let before_attach: Vec<Value> = fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!before_attach
+        .iter()
+        .any(|r| r["stage"] == "opportunity.admitted"));
+    let last_commit_ns = before_attach
+        .iter()
+        .filter(|r| r["stage"] == "server.action_committed")
+        .filter_map(|r| r["ns"].as_u64())
+        .max()
+        .unwrap();
+    assert!(
+        !before_attach
+            .iter()
+            .any(|r| r["stage"] == "server.frame_start"
+                && r["ns"]
+                    .as_u64()
+                    .is_some_and(|ns| ns > last_commit_ns + 50_000_000)),
+        "expiry creates no frame after ordinary work drains"
+    );
+    let client = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    let output = spawn_pty_drain(client._master.as_ref().unwrap().try_clone_reader().unwrap());
+    assert!(
+        wait_for_committed_action_label(&output, "Silent063", 80, 24),
+        "late viewer receives committed authoritative state through ordinary presentation"
+    );
+    drop(client);
+    drop(server);
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || fs::read_to_string(&trace).is_ok_and(|raw| raw.contains("process.finish"))
+    ));
+    let records: Vec<Value> = fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records.iter().any(|r| r["stage"] == "opportunity.expired"),
+        "existing attach service lazily expires old opportunity"
+    );
+    assert!(
+        !records.iter().any(|r| r["stage"] == "opportunity.admitted"),
+        "expired no-viewer action never claims extra admission"
+    );
+    cleanup_test_base(&base);
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[test]
+fn stalled_client_recovers_without_blocking_authoritative_actions() {
+    action_backpressure_contract(false);
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[test]
+#[ignore = "controlled early-admission workload; ineligible setup remains a failed outcome"]
+fn early_action_with_stalled_recipient_uses_a_committed_phase() {
+    action_backpressure_contract(true);
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+fn wait_for_committed_action_label(
+    output: &SharedOutput,
+    marker: &str,
+    cols: u16,
+    rows: u16,
+) -> bool {
+    let mut observer = action_observer::Observer::new(cols, rows).unwrap();
+    observer.expect(marker.into(), 0);
+    let mut consumed = 0;
+    wait_until(Duration::from_secs(8), Duration::from_millis(5), || {
+        let captured = output.lock().unwrap();
+        let found = observer
+            .feed(&captured.bytes[consumed..], 1)
+            .unwrap()
+            .iter()
+            .any(|observation| observation.marker == marker && observation.received_ns == 1);
+        consumed = captured.bytes.len();
+        found
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+fn action_backpressure_contract(early: bool) {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let traces = base.join("traces");
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    fs::write(config_home.join(app_dir_name()).join("config.toml"), "onboarding = false\n[ui]\nwindow_title = \"\"\n[update]\nversion_check = false\nmanifest_check = false\n").unwrap();
+    let trace_env = traces.to_string_lossy();
+    let server = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["server"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &runtime_dir.join("herdr-client.sock"),
+        Duration::from_secs(10),
+    );
+    let mut client_a = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    client_a
+        ._master
+        .as_ref()
+        .unwrap()
+        .resize(PtySize {
+            rows: 80,
+            cols: 240,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let output_a = spawn_pty_drain(
+        client_a
+            ._master
+            .as_ref()
+            .unwrap()
+            .try_clone_reader()
+            .unwrap(),
+    );
+    let mut client_b = spawn_client_process_with_args_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &["client"],
+        &[("HERDR_LATENCY_TRACE_DIR", &trace_env)],
+    );
+    client_b
+        ._master
+        .as_ref()
+        .unwrap()
+        .resize(PtySize {
+            rows: 80,
+            cols: 240,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let output_b = spawn_pty_drain(
+        client_b
+            ._master
+            .as_ref()
+            .unwrap()
+            .try_clone_reader()
+            .unwrap(),
+    );
+    let created = send_json_request(&api_socket, &serde_json::json!({"id":"defer-create", "method":"workspace.create", "params":{"cwd":base,"focus":true,"label":"defer-start"}}).to_string());
+    let workspace = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap();
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || terminal_screen::text(&output_a.lock().unwrap().bytes, 240, 80).contains("defer-start")
+    ));
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(10),
+        || terminal_screen::text(&output_b.lock().unwrap().bytes, 240, 80).contains("defer-start")
+    ));
+    let healthy_pid = client_a.child.process_id().unwrap();
+    let stalled_pid = client_b.child.process_id().unwrap();
+    struct ResumeOnDrop(u32);
+    impl Drop for ResumeOnDrop {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0 as libc::pid_t, libc::SIGCONT);
+            }
+        }
+    }
+    let resume_guard = ResumeOnDrop(stalled_pid);
+    unsafe {
+        libc::kill(stalled_pid as libc::pid_t, libc::SIGSTOP);
+    }
+    send_pane_shell_command(&api_socket, pane,
+        "stty -echo; (a=$(printf '%0240d' 0 | tr 0 A); b=$(printf '%0240d' 0 | tr 0 B); i=0; while [ $i -lt 400 ]; do printf '\\033[H'; if [ $((i%2)) -eq 0 ]; then line=$a; else line=$b; fi; j=0; while [ $j -lt 80 ]; do printf '%s' \"$line\"; j=$((j+1)); done; i=$((i+1)); sleep 0.016; done) & bulk=$!");
+    // Keep real socket consumption stopped long enough for repeated coherent
+    // full surfaces to fill the bounded server slot. This is behavior evidence,
+    // not a wall-clock latency gate; the producer remains finite.
+    thread::sleep(Duration::from_secs(5));
+    if early {
+        // Observer initialization parses existing history before the phase
+        // stimulus; only new bytes contribute to phase rendezvous.
+        let mut phase_observer = action_observer::Observer::new(240, 80).unwrap();
+        let mut consumed = {
+            let bytes = output_a.lock().unwrap();
+            phase_observer.feed(&bytes.bytes, 0).unwrap();
+            bytes.bytes.len()
+        };
+        phase_observer.cancel("ACTION_DEFER_PHASE");
+        phase_observer.expect("ACTION_DEFER_PHASE".into(), 1);
+        send_pane_shell_command(&api_socket, pane, "kill \"$bulk\" 2>/dev/null; wait \"$bulk\" 2>/dev/null; printf '\\033[1;1HACTION_DEFER_PHASE'");
+        assert!(
+            wait_until(Duration::from_secs(8), Duration::from_millis(1), || {
+                let bytes = output_a.lock().unwrap();
+                let found = phase_observer
+                    .feed(&bytes.bytes[consumed..], 1)
+                    .unwrap()
+                    .iter()
+                    .any(|o| o.marker == "ACTION_DEFER_PHASE" && o.received_ns == 1);
+                consumed = bytes.bytes.len();
+                found
+            }),
+            "phase anchor requires committed outer-PTY marker"
+        );
+    }
+    let response = send_json_request(&api_socket, &serde_json::json!({"id":"defer-early-action","method":"workspace.rename","params":{"workspace_id":workspace,"label":"HealthyEarly"}}).to_string());
+    assert!(response["error"].is_null());
+    let healthy = wait_for_committed_action_label(&output_a, "HealthyEarly", 240, 80);
+    drop(resume_guard);
+    assert!(
+        healthy,
+        "healthy client presents committed action while peer stopped"
+    );
+    assert!(
+        wait_for_committed_action_label(&output_b, "HealthyEarly", 240, 80),
+        "stalled peer recovers committed action after real socket consumption resumes"
+    );
+    let server_pid = server.child.process_id().unwrap();
+    client_a.close_master();
+    client_b.close_master();
+    drop(client_a);
+    drop(client_b);
+    drop(server);
+    let trace = traces.join(format!("{server_pid}.jsonl"));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || fs::read_to_string(&trace).is_ok_and(|raw| raw.contains("process.finish"))
+    ));
+    let records: Vec<Value> = fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records.iter().any(|r| r["stage"] == "writer.deferred"),
+        "actual server render refusal validates backpressure boundary"
+    );
+    let connection_for = |pid: u32| {
+        records
+            .iter()
+            .find(|r| r["stage"] == "server.connection" && r["value"] == pid)
+            .and_then(|r| r["id"].as_u64())
+            .expect("exact connection peer PID")
+    };
+    let stalled_connection = connection_for(stalled_pid);
+    let healthy_connection = connection_for(healthy_pid);
+    assert!(
+        records.iter().any(
+            |r| r["stage"] == "server.render_deferred" && r["connection"] == stalled_connection
+        ),
+        "stalled recipient refused render enqueue"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r["stage"] == "server.enqueue" && r["connection"] == healthy_connection),
+        "healthy recipient enqueued exact bytes"
+    );
+    let early_presentations: std::collections::HashSet<_> = records
+        .iter()
+        .filter(|r| r["stage"] == "opportunity.admitted")
+        .filter_map(|r| r["presentation"].as_u64())
+        .collect();
+    let deferred = records
+        .iter()
+        .filter(|r| r["stage"] == "writer.deferred")
+        .count();
+    eprintln!("authoritative-action recovery: server={server_pid}, stalled_client={stalled_pid}, writer_deferred={deferred}");
+    if let Some(root) = std::env::var_os("HERDR_ACTION_TEST_ARTIFACTS") {
+        let artifact = PathBuf::from(root).join(format!("backpressure-{server_pid}"));
+        fs::create_dir_all(artifact.join("traces")).unwrap();
+        for file in fs::read_dir(&traces).unwrap() {
+            let file = file.unwrap();
+            if file.file_type().unwrap().is_file() {
+                fs::copy(file.path(), artifact.join("traces").join(file.file_name())).unwrap();
+            }
+        }
+        fs::write(
+            artifact.join("client-a.pty"),
+            &output_a.lock().unwrap().bytes,
+        )
+        .unwrap();
+        fs::write(
+            artifact.join("client-b.pty"),
+            &output_b.lock().unwrap().bytes,
+        )
+        .unwrap();
+        fs::write(artifact.join("audit.json"), serde_json::to_vec_pretty(&serde_json::json!({"server_pid":server_pid,"healthy_client_pid":healthy_pid,"stalled_client_pid":stalled_pid,"healthy_connection":healthy_connection,"stalled_connection":stalled_connection,"writer_deferred":deferred,"geometry":[240,80],"stopped_seconds":5,"healthy_before_resume":healthy,"recovered":true})).unwrap()).unwrap();
+    }
+    if early {
+        assert!(
+            !early_presentations.is_empty(),
+            "post-phase committed action uses available extra token"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r["stage"] == "opportunity.action_enqueued"
+                    && r["presentation"]
+                        .as_u64()
+                        .is_some_and(|id| early_presentations.contains(&id))),
+            "healthy recipient enqueues exact early action"
+        );
+    }
+    cleanup_test_base(&base);
 }

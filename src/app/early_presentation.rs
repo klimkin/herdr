@@ -1,0 +1,971 @@
+//! Demand-driven extra presentation, with no token or expiry wake source.
+
+use std::time::{Duration, Instant};
+
+const INTERVAL: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OriginLease {
+    pub(crate) client_id: u64,
+    pub(crate) projection_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalPlacement {
+    pub(crate) workspace_id: String,
+    pub(crate) tab_root: crate::layout::PaneId,
+    pub(crate) pane_id: crate::layout::PaneId,
+    pub(crate) public_pane_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum Work {
+    Action {
+        workspace_id: String,
+        label: String,
+        request_id: String,
+    },
+    Terminal {
+        placement: TerminalPlacement,
+        terminal_id: crate::terminal::TerminalId,
+        runtime_instance: u64,
+        baseline_revision: u64,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Opportunity {
+    pub(crate) id: u64,
+    pub(crate) accepted_at: Instant,
+    pub(crate) expires_at: Instant,
+    pub(crate) origin: Option<OriginLease>,
+    pub(crate) work: Work,
+    attempts: u8,
+    awaiting_delivery: bool,
+    #[cfg(feature = "latency-prof")]
+    diagnostic_times: (u64, u64),
+}
+
+/// Server-local construction ownership, independent of published surface codecs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalAttempt {
+    pub(crate) opportunity: u64,
+    pub(crate) ordinal: u8,
+}
+
+/// Successful delivery advances the matching lease without renewing its budget.
+pub(crate) struct TerminalFeedbackAdvance {
+    pub(crate) pane_id: crate::layout::PaneId,
+    pub(crate) runtime_instance: u64,
+    pub(crate) revision: u64,
+    pub(crate) opportunity: u64,
+    pub(crate) wake_allowed: bool,
+}
+
+impl Opportunity {
+    fn can_attempt(&self) -> bool {
+        let limit = if matches!(self.work, Work::Terminal { .. }) {
+            2
+        } else {
+            1
+        };
+        self.attempts < limit && !self.awaiting_delivery
+    }
+
+    fn expensive(&self) -> bool {
+        matches!(self.work, Work::Action { .. })
+    }
+
+    fn target_key(&self) -> &str {
+        match &self.work {
+            Work::Action { workspace_id, .. } => workspace_id,
+            Work::Terminal { terminal_id, .. } => terminal_id.as_str(),
+        }
+    }
+}
+
+pub(crate) struct EarlyPresentation {
+    opportunities: Vec<Opportunity>,
+    next_id: u64,
+    admissions: [Option<Instant>; 2],
+    last_expensive: Option<Instant>,
+    active_terminal_attempt: Option<TerminalAttempt>,
+    pub(crate) origin: Option<OriginLease>,
+}
+
+impl EarlyPresentation {
+    pub(crate) fn enabled(&self) -> bool {
+        crate::platform::early_presentation_supported()
+    }
+
+    pub(crate) fn new() -> Self {
+        Self {
+            opportunities: Vec::new(),
+            next_id: 1,
+            admissions: [None; 2],
+            last_expensive: None,
+            active_terminal_attempt: None,
+            origin: None,
+        }
+    }
+
+    pub(crate) fn accepted_action(
+        &mut self,
+        workspace_id: String,
+        label: String,
+        request_id: String,
+        now: Instant,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        self.expire(now);
+        if let Some(existing) = self.opportunities.iter_mut().find(|opportunity| {
+            matches!(&opportunity.work, Work::Action { workspace_id: old, .. } if old == &workspace_id)
+        }) {
+            crate::latency_prof::record("opportunity.superseded", existing.id, crate::latency_prof::bytes_id(request_id.as_bytes()));
+            existing.work = Work::Action { workspace_id, label, request_id };
+            existing.origin = self.origin;
+            record_origin(existing.id, existing.origin);
+            #[cfg(feature = "latency-prof")]
+            record_opportunity_times(existing.id, existing.diagnostic_times);
+            // The first accepted grant owns expiry/priority. A coalesced action
+            // cannot restore a spent admission or extend its lifetime.
+            return;
+        }
+        let Some(next_id) = self.next_id.checked_add(1) else {
+            tracing::warn!("early presentation opportunity identity exhausted");
+            return;
+        };
+        let id = self.next_id;
+        self.next_id = next_id;
+        crate::latency_prof::record_at(
+            "opportunity.action_granted",
+            id,
+            crate::latency_prof::bytes_id(label.as_bytes()),
+            crate::latency_prof::bytes_id(request_id.as_bytes()),
+            crate::latency_prof::now(),
+        );
+        crate::latency_prof::record(
+            "opportunity.action_target",
+            id,
+            crate::latency_prof::bytes_id(workspace_id.as_bytes()),
+        );
+        record_origin(id, self.origin);
+        #[cfg(feature = "latency-prof")]
+        let diagnostic_times = diagnostic_opportunity_times(now);
+        #[cfg(feature = "latency-prof")]
+        record_opportunity_times(id, diagnostic_times);
+        self.opportunities.push(Opportunity {
+            id,
+            accepted_at: now,
+            expires_at: now + INTERVAL,
+            origin: self.origin,
+            work: Work::Action {
+                workspace_id,
+                label,
+                request_id,
+            },
+            attempts: 0,
+            awaiting_delivery: false,
+            #[cfg(feature = "latency-prof")]
+            diagnostic_times,
+        });
+    }
+
+    pub(crate) fn oldest_ready(
+        &mut self,
+        now: Instant,
+        mut ready: impl FnMut(&Opportunity) -> bool,
+    ) -> Option<Opportunity> {
+        self.expire(now);
+        self.opportunities
+            .iter()
+            .filter(|o| o.can_attempt() && ready(o))
+            .min_by(|left, right| {
+                left.accepted_at
+                    .cmp(&right.accepted_at)
+                    .then_with(|| left.target_key().cmp(right.target_key()))
+            })
+            .cloned()
+    }
+
+    pub(crate) fn admit(&mut self, id: u64, now: Instant, ordinary_due: bool) -> bool {
+        if ordinary_due {
+            return false;
+        }
+        let Some(opportunity) = self
+            .opportunities
+            .iter()
+            .find(|o| o.id == id && o.can_attempt() && now < o.expires_at)
+        else {
+            return false;
+        };
+        let expensive = opportunity.expensive();
+        if !self.capacity(now, expensive) {
+            crate::latency_prof::record("opportunity.token_denied", id, 0);
+            return false;
+        }
+        for admission in &mut self.admissions {
+            if admission.is_some_and(|last| now.saturating_duration_since(last) >= INTERVAL) {
+                *admission = None;
+            }
+        }
+        let Some(slot) = self.admissions.iter_mut().find(|slot| slot.is_none()) else {
+            return false;
+        };
+        *slot = Some(now);
+        if expensive {
+            self.last_expensive = Some(now);
+        }
+        let Some(opportunity) = self.opportunities.iter_mut().find(|o| o.id == id) else {
+            return false;
+        };
+        opportunity.attempts += 1;
+        opportunity.awaiting_delivery = true;
+        if matches!(opportunity.work, Work::Terminal { .. }) {
+            self.active_terminal_attempt = Some(TerminalAttempt {
+                opportunity: id,
+                ordinal: opportunity.attempts,
+            });
+        }
+        #[cfg(feature = "latency-prof")]
+        if crate::latency_prof::active() {
+            let anchor = Instant::now();
+            let anchor_ns = crate::latency_prof::now();
+            let charged_ns = if now >= anchor {
+                anchor_ns.saturating_add(now.duration_since(anchor).as_nanos() as u64)
+            } else {
+                anchor_ns.saturating_sub(anchor.duration_since(now).as_nanos() as u64)
+            };
+            crate::latency_prof::record_at("opportunity.charged_at", id, charged_ns, 0, anchor_ns);
+        }
+        true
+    }
+
+    fn capacity(&self, now: Instant, expensive: bool) -> bool {
+        self.admissions
+            .iter()
+            .any(|slot| slot.is_none_or(|last| now.saturating_duration_since(last) >= INTERVAL))
+            && (!expensive
+                || self
+                    .last_expensive
+                    .is_none_or(|last| now.saturating_duration_since(last) >= INTERVAL))
+    }
+
+    pub(crate) fn terminal_attempt(
+        &self,
+        terminal: &crate::terminal::TerminalId,
+    ) -> Option<TerminalAttempt> {
+        self.active_terminal_attempt.filter(|attempt| {
+            self.opportunities.iter().any(|o| {
+                o.id == attempt.opportunity
+                    && matches!(&o.work,
+                Work::Terminal { terminal_id, .. } if terminal_id == terminal)
+            })
+        })
+    }
+
+    pub(crate) fn finish_terminal_attempt(&mut self) {
+        self.active_terminal_attempt = None;
+    }
+
+    pub(crate) fn acknowledge_action(
+        &mut self,
+        snapshot: &crate::protocol::ClientShellSnapshot,
+        surface_projection_revision: u64,
+        client_id: u64,
+        context: crate::latency_prof::TraceContext,
+    ) -> bool {
+        if !self.enabled() || snapshot.revision != surface_projection_revision {
+            return false;
+        }
+        self.expire(Instant::now());
+        let mut satisfied = false;
+        self.opportunities.retain(|opportunity| {
+            let Work::Action {
+                workspace_id,
+                label,
+                request_id,
+            } = &opportunity.work
+            else {
+                return true;
+            };
+            if !snapshot.workspaces.iter().any(|workspace| {
+                &workspace.workspace_id == workspace_id && &workspace.label == label
+            }) {
+                return true;
+            }
+            satisfied = true;
+            crate::latency_prof::record(
+                "opportunity.action_satisfied_request",
+                opportunity.id,
+                crate::latency_prof::bytes_id(request_id.as_bytes()),
+            );
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::record_context_at(
+                "opportunity.action_enqueued",
+                opportunity.id,
+                snapshot.revision,
+                client_id,
+                crate::latency_prof::now(),
+                context,
+            );
+            #[cfg(not(feature = "latency-prof"))]
+            let _ = (client_id, context);
+            false
+        });
+        satisfied
+    }
+
+    pub(crate) fn pending(&self) -> bool {
+        !self.opportunities.is_empty()
+    }
+    pub(crate) fn contains(&self, id: u64) -> bool {
+        self.opportunities
+            .iter()
+            .any(|opportunity| opportunity.id == id)
+    }
+
+    pub(crate) fn tracks_terminal(&self, terminal_id: &crate::terminal::TerminalId) -> bool {
+        self.opportunities.iter().any(|opportunity|matches!(&opportunity.work,Work::Terminal{terminal_id:target,..} if target==terminal_id))
+    }
+
+    pub(crate) fn accepted_terminal(
+        &mut self,
+        terminal_id: crate::terminal::TerminalId,
+        placement: TerminalPlacement,
+        runtime_instance: u64,
+        baseline_revision: u64,
+        origin: Option<OriginLease>,
+        now: Instant,
+    ) -> Option<Opportunity> {
+        if !self.enabled() || runtime_instance == 0 || !baseline_revision.is_multiple_of(2) {
+            return None;
+        }
+        self.expire(now);
+        if let Some(existing) = self.opportunities.iter().find(|opportunity| {
+            matches!(&opportunity.work, Work::Terminal { terminal_id: old, runtime_instance: old_instance, .. }
+                if old == &terminal_id && *old_instance == runtime_instance)
+        }) {
+            crate::latency_prof::record("opportunity.coalesced", existing.id, baseline_revision);
+            return Some(existing.clone());
+        }
+        // A replacement runtime cannot share a prior counter lifetime.
+        self.opportunities.retain(|opportunity| {
+            let keep = !matches!(&opportunity.work,
+            Work::Terminal { terminal_id: old, .. } if old == &terminal_id);
+            if !keep {
+                crate::latency_prof::record("opportunity.revoked", opportunity.id, 0);
+            }
+            keep
+        });
+        let next_id = self.next_id.checked_add(1)?;
+        let id = self.next_id;
+        self.next_id = next_id;
+        crate::latency_prof::record_runtime_at(
+            "opportunity.terminal_granted",
+            id,
+            baseline_revision,
+            crate::latency_prof::bytes_id(terminal_id.as_str().as_bytes()),
+            crate::latency_prof::now(),
+            runtime_instance,
+        );
+        crate::latency_prof::record_runtime_at(
+            "opportunity.target_pane",
+            id,
+            crate::latency_prof::bytes_id(placement.public_pane_id.as_bytes()),
+            0,
+            crate::latency_prof::now(),
+            runtime_instance,
+        );
+        #[cfg(feature = "latency-prof")]
+        let diagnostic_times = diagnostic_opportunity_times(now);
+        #[cfg(feature = "latency-prof")]
+        record_opportunity_times(id, diagnostic_times);
+        let opportunity = Opportunity {
+            id,
+            accepted_at: now,
+            expires_at: now + INTERVAL,
+            origin,
+            work: Work::Terminal {
+                placement,
+                terminal_id,
+                runtime_instance,
+                baseline_revision,
+            },
+            attempts: 0,
+            awaiting_delivery: false,
+            #[cfg(feature = "latency-prof")]
+            diagnostic_times,
+        };
+        self.opportunities.push(opportunity.clone());
+        Some(opportunity)
+    }
+
+    pub(crate) fn acknowledge_terminal(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        runtime_instance: u64,
+        revision: u64,
+        client_id: u64,
+        context: crate::latency_prof::TraceContext,
+        attempt: Option<TerminalAttempt>,
+    ) -> Option<TerminalFeedbackAdvance> {
+        if !self.enabled() || runtime_instance == 0 || revision == 0 || !revision.is_multiple_of(2)
+        {
+            return None;
+        }
+        self.expire(Instant::now());
+        let mut advance = None;
+        let capacity = self.capacity(Instant::now(), false);
+        self.opportunities.retain_mut(|opportunity| {
+            let Work::Terminal {
+                terminal_id: target,
+                runtime_instance: instance,
+                baseline_revision,
+                placement,
+            } = &mut opportunity.work
+            else {
+                return true;
+            };
+            if target != terminal_id
+                || *instance != runtime_instance
+                || revision <= *baseline_revision
+            {
+                return true;
+            }
+            let matching_delivery = attempt.is_some_and(|attempt| {
+                opportunity.awaiting_delivery
+                    && attempt.opportunity == opportunity.id
+                    && attempt.ordinal == opportunity.attempts
+            });
+            // An ordinary or stale saved frame cannot unlock a charged construction.
+            if (opportunity.awaiting_delivery || attempt.is_some()) && !matching_delivery {
+                return true;
+            }
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::record_context_at(
+                "opportunity.terminal_presented",
+                opportunity.id,
+                revision,
+                client_id,
+                crate::latency_prof::now(),
+                crate::latency_prof::TraceContext {
+                    runtime_instance,
+                    ..context
+                },
+            );
+            opportunity.awaiting_delivery = false;
+            let remaining = opportunity.attempts < 2;
+            if remaining {
+                *baseline_revision = revision;
+                advance = Some(TerminalFeedbackAdvance {
+                    pane_id: placement.pane_id,
+                    runtime_instance,
+                    revision,
+                    opportunity: opportunity.id,
+                    wake_allowed: capacity,
+                });
+                #[cfg(feature = "latency-prof")]
+                crate::latency_prof::record_context_at(
+                    "opportunity.terminal_floor_advanced",
+                    opportunity.id,
+                    revision,
+                    client_id,
+                    crate::latency_prof::now(),
+                    crate::latency_prof::TraceContext {
+                        runtime_instance,
+                        ..context
+                    },
+                );
+                return true;
+            }
+            #[cfg(feature = "latency-prof")]
+            crate::latency_prof::record_context_at(
+                "opportunity.terminal_enqueued",
+                opportunity.id,
+                revision,
+                client_id,
+                crate::latency_prof::now(),
+                crate::latency_prof::TraceContext {
+                    runtime_instance,
+                    ..context
+                },
+            );
+            #[cfg(not(feature = "latency-prof"))]
+            let _ = (client_id, context);
+            false
+        });
+        advance
+    }
+
+    pub(crate) fn prune_terminals(&mut self, now: Instant, mut valid: impl FnMut(&Work) -> bool) {
+        self.expire(now);
+        self.opportunities.retain(|opportunity| {
+            let keep =
+                !matches!(opportunity.work, Work::Terminal { .. }) || valid(&opportunity.work);
+            if !keep {
+                crate::latency_prof::record("opportunity.revoked", opportunity.id, 0);
+            }
+            keep
+        });
+    }
+
+    pub(crate) fn cancel_terminal(&mut self, terminal_id: &crate::terminal::TerminalId) {
+        self.opportunities.retain(|opportunity| {
+            let keep = !matches!(&opportunity.work,Work::Terminal{terminal_id:target,..} if target==terminal_id);
+            if !keep {
+                crate::latency_prof::record("opportunity.revoked", opportunity.id, 0);
+            }
+            keep
+        });
+    }
+
+    pub(crate) fn cancel_client(&mut self, client_id: u64) {
+        self.opportunities.retain(|opportunity| {
+            if opportunity
+                .origin
+                .is_none_or(|origin| origin.client_id != client_id)
+            {
+                return true;
+            }
+            crate::latency_prof::record("opportunity.revoked", opportunity.id, client_id);
+            false
+        });
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.opportunities.retain(|opportunity| {
+            if now < opportunity.expires_at {
+                return true;
+            }
+            crate::latency_prof::record("opportunity.expired", opportunity.id, 0);
+            false
+        });
+    }
+}
+
+impl super::App {
+    /// Captures a fresh P decision while preserving B's existing time sample.
+    pub(crate) fn early_action_ready(
+        &mut self,
+        now: Instant,
+        mut origin_valid: impl FnMut(OriginLease) -> bool,
+    ) -> Option<Opportunity> {
+        let state = &self.state;
+        self.early_presentation.oldest_ready(now, |opportunity| {
+            if opportunity
+                .origin
+                .is_some_and(|origin| !origin_valid(origin))
+            {
+                return false;
+            }
+
+            let Work::Action {
+                workspace_id,
+                label,
+                ..
+            } = &opportunity.work
+            else {
+                return false;
+            };
+            state.workspaces.iter().any(|workspace| {
+                &workspace.id == workspace_id && workspace.custom_name.as_ref() == Some(label)
+            })
+        })
+    }
+}
+
+fn record_origin(id: u64, origin: Option<OriginLease>) {
+    crate::latency_prof::record_at(
+        "opportunity.origin",
+        id,
+        origin.map_or(0, |origin| origin.client_id),
+        origin.map_or(0, |origin| origin.projection_revision),
+        crate::latency_prof::now(),
+    );
+}
+
+#[cfg(feature = "latency-prof")]
+fn diagnostic_opportunity_times(accepted: Instant) -> (u64, u64) {
+    if !crate::latency_prof::active() {
+        return (0, 0);
+    }
+    let anchor = Instant::now();
+    let anchor_ns = crate::latency_prof::now();
+    let accepted_ns = if accepted >= anchor {
+        anchor_ns.saturating_add(accepted.duration_since(anchor).as_nanos() as u64)
+    } else {
+        anchor_ns.saturating_sub(anchor.duration_since(accepted).as_nanos() as u64)
+    };
+    (
+        accepted_ns,
+        accepted_ns.saturating_add(INTERVAL.as_nanos() as u64),
+    )
+}
+
+#[cfg(feature = "latency-prof")]
+fn record_opportunity_times(id: u64, times: (u64, u64)) {
+    if times.0 == 0 {
+        return;
+    }
+    let ns = crate::latency_prof::now();
+    crate::latency_prof::record_at("opportunity.accepted_at", id, times.0, 0, ns);
+    crate::latency_prof::record_at("opportunity.expires_at", id, times.1, 0, ns);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn placement() -> TerminalPlacement {
+        TerminalPlacement {
+            workspace_id: "w1".into(),
+            tab_root: crate::layout::PaneId::alloc(),
+            pane_id: crate::layout::PaneId::alloc(),
+            public_pane_id: "w1:p1".into(),
+        }
+    }
+
+    fn accept_both(presentation: &mut EarlyPresentation, now: Instant) -> Option<Opportunity> {
+        presentation.accepted_action("w1".into(), "label".into(), "request".into(), now);
+        presentation.accepted_terminal(
+            crate::terminal::TerminalId::alloc(),
+            placement(),
+            1,
+            2,
+            None,
+            now,
+        )
+    }
+
+    fn action_id(presentation: &mut EarlyPresentation, now: Instant) -> Option<u64> {
+        presentation
+            .oldest_ready(now, |opportunity| {
+                matches!(opportunity.work, Work::Action { .. })
+            })
+            .map(|opportunity| opportunity.id)
+    }
+
+    #[test]
+    fn actions_and_terminals_share_one_admission_budget() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new();
+        assert!(presentation.enabled());
+        let terminal = accept_both(&mut presentation, now).expect("terminal opportunity");
+        let action = action_id(&mut presentation, now).expect("action opportunity");
+
+        assert!(presentation.admit(action, now, false));
+        // Selected work can use the second global slot after expensive work.
+        assert!(presentation.admit(terminal.id, now + Duration::from_millis(15), false));
+        assert!(!presentation.admit(terminal.id, now + INTERVAL, false));
+    }
+
+    #[test]
+    fn early_feedback_never_preempts_a_due_ordinary_frame() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new();
+        let terminal = accept_both(&mut presentation, now).expect("terminal opportunity");
+        let action = action_id(&mut presentation, now).expect("action opportunity");
+        assert!(!presentation.admit(action, now, true));
+        assert!(!presentation.admit(terminal.id, now, true));
+        assert!(presentation.admit(terminal.id, now, false));
+    }
+
+    #[test]
+    fn ordinary_target_delivery_preserves_unused_feedback_until_expiry() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let opportunity = presentation
+            .accepted_terminal(terminal_id.clone(), placement(), 1, 20, None, now)
+            .expect("accepted input opportunity");
+
+        presentation.acknowledge_terminal(
+            &terminal_id,
+            1,
+            22,
+            4,
+            crate::latency_prof::TraceContext::default(),
+            None,
+        );
+        let ready = presentation
+            .oldest_ready(now + Duration::from_millis(2), |opportunity| {
+                matches!(opportunity.work, Work::Terminal { baseline_revision, .. } if 24 > baseline_revision)
+            })
+            .expect("later echo retains its unused early opportunity");
+        assert_eq!(ready.id, opportunity.id);
+        assert_eq!(ready.expires_at, now + INTERVAL);
+        assert!(matches!(
+            ready.work,
+            Work::Terminal {
+                baseline_revision: 22,
+                ..
+            }
+        ));
+        assert!(presentation.admit(ready.id, now + Duration::from_millis(2), false));
+        let attempt = presentation.terminal_attempt(&terminal_id);
+        presentation.finish_terminal_attempt();
+        assert!(presentation
+            .acknowledge_terminal(
+                &terminal_id,
+                1,
+                24,
+                4,
+                crate::latency_prof::TraceContext::default(),
+                attempt
+            )
+            .is_some());
+        assert!(
+            presentation.pending(),
+            "first delivery retains one follow-up"
+        );
+    }
+
+    #[test]
+    fn duplicate_target_delivery_and_coalesced_input_cannot_renew_feedback() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let placement = placement();
+        let opportunity = presentation
+            .accepted_terminal(terminal_id.clone(), placement.clone(), 1, 20, None, now)
+            .expect("accepted input opportunity");
+        let context = crate::latency_prof::TraceContext::default();
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 1, 22, 4, context, None)
+            .is_some());
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 1, 22, 5, context, None)
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 1, 20, 5, context, None)
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 2, 24, 5, context, None)
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 1, 23, 5, context, None)
+            .is_none());
+        let coalesced = presentation
+            .accepted_terminal(
+                terminal_id.clone(),
+                placement.clone(),
+                1,
+                20,
+                None,
+                now + Duration::from_millis(1),
+            )
+            .expect("coalesced input");
+        assert_eq!(coalesced.id, opportunity.id);
+        assert_eq!(coalesced.expires_at, opportunity.expires_at);
+        assert!(matches!(
+            coalesced.work,
+            Work::Terminal {
+                baseline_revision: 22,
+                ..
+            }
+        ));
+        assert!(presentation.admit(opportunity.id, now + Duration::from_millis(2), false));
+        let coalesced = presentation
+            .accepted_terminal(
+                terminal_id.clone(),
+                placement,
+                1,
+                22,
+                None,
+                now + Duration::from_millis(3),
+            )
+            .expect("spent input remains coalesced");
+        assert_eq!(coalesced.id, opportunity.id);
+        assert!(!presentation.admit(opportunity.id, now + Duration::from_millis(4), false));
+        assert!(presentation
+            .acknowledge_terminal(&terminal_id, 1, 24, 5, context, None)
+            .is_none());
+        assert!(
+            presentation.pending(),
+            "ordinary delivery cannot unlock charged work"
+        );
+        assert!(presentation
+            .oldest_ready(now + Duration::from_millis(5), |_| true)
+            .is_none());
+    }
+
+    #[test]
+    fn ordinary_delivery_cannot_extend_feedback_expiry() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        presentation.accepted_terminal(terminal_id.clone(), placement(), 1, 20, None, now);
+        presentation.acknowledge_terminal(
+            &terminal_id,
+            1,
+            22,
+            4,
+            crate::latency_prof::TraceContext::default(),
+            None,
+        );
+        assert!(presentation
+            .oldest_ready(now + INTERVAL, |_| true)
+            .is_none());
+        assert!(!presentation.pending());
+    }
+    #[test]
+    fn burst_requires_exact_delivery_and_rejects_stale_fanout() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new();
+        let terminal = crate::terminal::TerminalId::alloc();
+        let grant = presentation
+            .accepted_terminal(terminal.clone(), placement(), 1, 20, None, now)
+            .unwrap();
+        let context = crate::latency_prof::TraceContext::default();
+        assert!(presentation.admit(grant.id, now, false));
+        let first = presentation.terminal_attempt(&terminal).unwrap();
+        presentation.finish_terminal_attempt();
+        assert!(!presentation.admit(grant.id, now, false));
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 22, 1, context, None)
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 22, 1, context, Some(first))
+            .is_some());
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 22, 2, context, Some(first))
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 24, 1, context, None)
+            .is_some());
+        assert!(presentation.admit(grant.id, now + Duration::from_millis(1), false));
+        let second = presentation.terminal_attempt(&terminal).unwrap();
+        presentation.finish_terminal_attempt();
+        assert_eq!(second.ordinal, 2);
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 26, 2, context, Some(first))
+            .is_none());
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 26, 1, context, Some(second))
+            .is_none());
+        assert!(!presentation.contains(grant.id));
+        assert!(presentation
+            .acknowledge_terminal(&terminal, 1, 26, 2, context, Some(first))
+            .is_none());
+        assert!(!presentation.admit(grant.id, now + Duration::from_millis(2), false));
+    }
+
+    #[test]
+    fn rolling_budget_survives_cancellation_and_expires_at_exact_boundary() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new();
+        for offset in [0, 1] {
+            let terminal = crate::terminal::TerminalId::alloc();
+            let grant = presentation
+                .accepted_terminal(terminal.clone(), placement(), 1, 2, None, now)
+                .unwrap();
+            assert!(presentation.admit(grant.id, now + Duration::from_millis(offset), false));
+            presentation.finish_terminal_attempt();
+            presentation.cancel_terminal(&terminal);
+        }
+        let grant = presentation
+            .accepted_terminal(
+                crate::terminal::TerminalId::alloc(),
+                placement(),
+                1,
+                2,
+                None,
+                now + Duration::from_millis(2),
+            )
+            .unwrap();
+        assert!(!presentation.admit(grant.id, now + INTERVAL - Duration::from_nanos(1), false));
+        assert!(presentation.admit(grant.id, now + INTERVAL, false));
+    }
+
+    #[test]
+    fn expensive_work_keeps_its_single_rolling_allowance() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new();
+        let first = presentation
+            .accepted_terminal(
+                crate::terminal::TerminalId::alloc(),
+                placement(),
+                1,
+                2,
+                None,
+                now,
+            )
+            .unwrap();
+        assert!(presentation.admit(first.id, now, false));
+        presentation.finish_terminal_attempt();
+        presentation.accepted_action("w1".into(), "one".into(), "1".into(), now);
+        let action = presentation.opportunities.last().unwrap().id;
+        assert!(presentation.admit(action, now + Duration::from_millis(1), false));
+        presentation.accepted_action(
+            "w2".into(),
+            "two".into(),
+            "2".into(),
+            now + Duration::from_millis(2),
+        );
+        let second = presentation.opportunities.last().unwrap().id;
+        assert!(!presentation.admit(second, now + Duration::from_millis(15), false));
+        assert!(!presentation.admit(second, now + INTERVAL, false));
+        assert!(presentation.admit(second, now + INTERVAL + Duration::from_millis(1), false));
+    }
+
+    #[test]
+    fn failed_delivery_and_coalesced_input_cannot_refund_or_extend() {
+        let now = Instant::now();
+        let mut presentation = EarlyPresentation::new();
+        let terminal = crate::terminal::TerminalId::alloc();
+        let where_ = placement();
+        let grant = presentation
+            .accepted_terminal(terminal.clone(), where_.clone(), 1, 20, None, now)
+            .unwrap();
+        assert!(presentation.admit(grant.id, now, false));
+        let saved = presentation.terminal_attempt(&terminal);
+        presentation.finish_terminal_attempt();
+        let coalesced = presentation
+            .accepted_terminal(
+                terminal.clone(),
+                where_,
+                1,
+                22,
+                None,
+                now + Duration::from_millis(15),
+            )
+            .unwrap();
+        assert_eq!(coalesced.id, grant.id);
+        assert_eq!(coalesced.expires_at, grant.expires_at);
+        assert!(!presentation.admit(grant.id, now + Duration::from_millis(15), false));
+        presentation.prune_terminals(now + INTERVAL, |_| true);
+        assert!(presentation
+            .acknowledge_terminal(
+                &terminal,
+                1,
+                22,
+                1,
+                crate::latency_prof::TraceContext::default(),
+                saved
+            )
+            .is_none());
+        assert!(!presentation.pending());
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn early_feedback_matches_platform_support() {
+        let mut presentation = EarlyPresentation::new();
+        let supported = crate::platform::early_presentation_supported();
+        assert_eq!(presentation.enabled(), supported);
+        presentation.accepted_action(
+            "workspace".into(),
+            "label".into(),
+            "request".into(),
+            Instant::now(),
+        );
+        assert_eq!(presentation.pending(), supported);
+    }
+}

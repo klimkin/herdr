@@ -234,3 +234,113 @@ it does not guarantee an end-to-end maximum latency.
 If the native timer cannot initialize or fails, the server logs a warning
 and uses Tokio deadline sleeping. macOS and Windows retain Tokio sleeping;
 native high-resolution implementations remain out of scope.
+
+## Early-action presentation
+
+Linux presents committed workspace renames before the regular cadence when
+safe. Actions and selected-terminal feedback share two construction slots per
+rolling 16 ms. Actions consume at most one slot per interval; only selected
+terminal text can use the additional slot. Unused opportunities expire after
+16 ms without a refill or expiry timer. Due regular frames keep priority.
+Renames that change no state receive no opportunity.
+
+Early feedback is built in and independent of profiling. macOS and Windows
+retain cadence-based presentation. Server queues retain their fixed ordering
+and 64-message batch limit.
+
+Measure recording-disabled behavior with the standard build:
+
+```sh
+just latency-build ''
+latency_artifacts="${CARGO_TARGET_DIR:-target}/release"
+env -u HERDR_LATENCY_TRACE_DIR \
+  "$latency_artifacts/examples/latency_bench" \
+  --binary "$latency_artifacts/herdr" \
+  --probe "$latency_artifacts/examples/latency_probe" \
+  --path action --clients 3 --samples 1100 --warmups 10 --interval-ms 40 \
+  --load visible --layout active --panes 15 \
+  --output .local/latency/action
+```
+
+Compare saved binaries using identical geometry, workload, and seed. Retain
+required outcomes and CPU coverage alongside latency percentiles.
+
+For causal diagnostics, build with `just latency-build` and set
+`HERDR_LATENCY_TRACE_DIR=1` for the benchmark. After the run finishes, use the
+printed run directory and place derived reports outside its raw artifacts:
+
+```sh
+latency_run=.local/latency/action-diagnostic/REPLACE_WITH_PRINTED_RUN_ID
+mkdir -p .local/latency/reports
+python3 scripts/latency_action_report.py "$latency_run/samples.json" \
+  --traces "$latency_run/traces" \
+  --output .local/latency/reports/action.json
+```
+
+The action report separates an opportunity's grant, admission, and coherent
+enqueue from client output completion. `critical_paths` carries completed
+server/client paths; an `early_enqueued` opportunity alone does not prove a
+committed client presentation. Missing identities remain unassigned.
+
+## Early terminal feedback
+
+Linux presents selected-terminal feedback before the regular cadence when safe. Accepted nonempty terminal input creates one opportunity for that
+terminal/runtime. Its original 16 ms expiry remains fixed across coalesced
+input. Successful ordinary delivery advances the presented revision floor and
+preserves the unused early allowance. Later output newer than that floor can
+still request early presentation, including output arriving during enqueue.
+Changed target state can spend up to two global constructions per rolling 16 ms.
+The first construction stays immediate. Exact successful delivery advances the
+floor and retains one selected-text follow-up within the original input lease.
+Equal, older, or stale attempt receipts cannot renew the allowance. Ordinary
+frames can advance an unused or unlocked floor; they cannot unlock a construction
+still awaiting its own delivery.
+
+Unchanged or unsafe construction spends its attempt and waits for ordinary
+recovery without a refund. Empty/rejected input creates no opportunity. Saved
+patches retry delivery on writer drain without rebuilding or charging another
+construction. Blocked recipients cannot drive extra construction; healthy peers
+remain eligible. Graphics keep ordinary recovery. No activity extends the lease.
+
+Selected-terminal feedback uses a coherent retained update. Residual sources,
+titles, and generic work keep their regular deadline. Unsafe retained state
+falls back to regular scheduling. Neither early path changes the presentation
+interval or adds an expiry, refill, or idle timer.
+
+An early action frame also carries ready terminal output; arbitrary output does
+not prove echo completion. Delayed or multipart responses can exhaust the shared
+budget or outlive the fixed lease.
+
+Measure echo with the same recording-disabled build:
+
+```sh
+latency_artifacts="${CARGO_TARGET_DIR:-target}/release"
+env -u HERDR_LATENCY_TRACE_DIR \
+  "$latency_artifacts/examples/latency_bench" \
+  --binary "$latency_artifacts/herdr" \
+  --probe "$latency_artifacts/examples/latency_probe" \
+  --path echo --clients 3 --samples 1100 --warmups 10 --interval-ms 40 \
+  --load visible --layout active --panes 15 \
+  --output .local/latency/echo
+```
+
+Recording can affect latency. Use diagnostic runs to explain mechanisms and
+separate recording-disabled runs to judge operating cost.
+
+For target diagnostics, build with `just latency-build`, enable
+`HERDR_LATENCY_TRACE_DIR=1`, and pass the printed run's PID-named trace files:
+
+```sh
+python3 scripts/latency_target_report.py "$latency_run"/traces/[0-9]*.jsonl \
+  > .local/latency/reports/target.json
+```
+
+The target report preserves accepted, empty, rejected, coalesced, and unassigned
+input outcomes. `deliveries` separates ordinary floor advances from opportunity
+retirement; unused windows remain pending until expiry or cancellation.
+Exact runtime/revision/recipient/serialization receipts establish
+which target state reached a queue. A receipt alone does not prove controlled
+process echo or every client's committed output. Use the regular latency report
+and owned-PTY outcomes for those boundaries. An earlier extra attempt can still
+consume urgency before a later echo; delayed-response tests must retain that
+outcome rather than extend expiry to hide it.

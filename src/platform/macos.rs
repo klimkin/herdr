@@ -39,6 +39,11 @@ pub(crate) use power::monitor_host_power;
 mod launchd_spawn;
 pub(crate) use launchd_spawn::{leave_launchd_job, spawn_launchd_job};
 
+/// macOS retains cadence-based presentation.
+pub(crate) fn early_presentation_supported() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod config_file_tests;
 
