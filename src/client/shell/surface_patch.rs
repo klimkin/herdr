@@ -10,6 +10,66 @@ pub(crate) enum ClientPaneSurfacePatchOutcome {
     Applied(Option<ClientComposedSurfacePatch>),
 }
 
+pub(super) struct RetainedRename {
+    pub(super) rename: ClientRenameOverlay,
+    pub(super) area: Rect,
+    pub(super) cursor: Option<crate::protocol::CursorState>,
+    pub(super) size: (u16, u16),
+    pub(super) projection_revision: u64,
+}
+
+fn retained_rename<'a>(
+    state: &'a ClientShellState,
+    patch: &crate::protocol::PaneSurfacePatch,
+) -> Option<&'a RetainedRename> {
+    let Some(ClientShellOverlay::Rename(rename)) = state.overlay.as_ref() else {
+        return None;
+    };
+    let retained = state.retained_rename.as_ref()?;
+    (retained.rename == *rename
+        && Some(retained.size) == state.last_composed_size
+        && retained.projection_revision == patch.projection_revision
+        && state.pending_pane_surface.is_none()
+        && state.word_selection_gesture.is_none()
+        && state.popup_terminal_id.is_none()
+        && state.endpoint_status(&state.active_endpoint_id) == Some(ClientEndpointStatus::Online))
+    .then_some(retained)
+}
+
+fn rename_rows_safe(state: &ClientShellState, patch: &crate::protocol::PaneSurfacePatch) -> bool {
+    let Some(retained) = retained_rename(state, patch) else {
+        return false;
+    };
+    let area = state.layout(retained.size.0, retained.size.1).pane_surface;
+    patch.rows.iter().all(|row| {
+        let x = area.x.saturating_add(row.x);
+        let y = area.y.saturating_add(row.y);
+        let width = row.cells.len().min(u16::MAX as usize) as u16;
+        let rect = Rect::new(x, y, width, 1);
+        let covered =
+            retained.area.contains((x, y).into()) && rect.right() <= retained.area.right();
+        // A wide glyph can extend one column past its nominal changed row.
+        // Intersections and adjacent horizontal edges retain full composition.
+        let guarded = Rect::new(x.saturating_sub(1), y, width.saturating_add(2), 1);
+        let covered_style_unchanged = covered
+            && state.pane_surface.as_ref().is_some_and(|surface| {
+                let start =
+                    usize::from(row.y) * usize::from(surface.frame.width) + usize::from(row.x);
+                row.cells.iter().enumerate().all(|(offset, next)| {
+                    surface.frame.cells.get(start + offset).is_some_and(|old| {
+                        old.fg == next.fg
+                            && old.bg == next.bg
+                            && old.modifier == next.modifier
+                            && old.skip == next.skip
+                            && old.hyperlink.is_none()
+                            && next.hyperlink.is_none()
+                    })
+                })
+            });
+        covered_style_unchanged || !guarded.intersects(retained.area)
+    })
+}
+
 fn row_fits_frame(row: &crate::protocol::PaneSurfacePatchRow, frame: &FrameData) -> bool {
     row.x
         .saturating_add(row.cells.len().min(u16::MAX as usize) as u16)
@@ -60,7 +120,7 @@ fn fast_path_blocker(
 ) -> Option<&'static str> {
     if state.mode != ClientShellMode::Terminal {
         Some("client_surface_patch.fallback.mode")
-    } else if state.overlay.is_some() {
+    } else if state.overlay.is_some() && !rename_rows_safe(state, patch) {
         Some("client_surface_patch.fallback.overlay")
     } else if state.endpoint_error.is_some() {
         Some("client_surface_patch.fallback.endpoint_error")
@@ -176,26 +236,6 @@ impl ClientShellState {
             let (cols, rows) = self.last_composed_size.unwrap_or_default();
             self.layout(cols, rows).pane_surface
         });
-        let composed_patch = fast_path_area.map(|area| ClientComposedSurfacePatch {
-            rows: patch
-                .rows
-                .iter()
-                .map(|row| crate::protocol::PaneSurfacePatchRow {
-                    x: area.x.saturating_add(row.x),
-                    y: area.y.saturating_add(row.y),
-                    cells: row.cells.clone(),
-                })
-                .collect(),
-            cursor: patch
-                .cursor
-                .clone()
-                .map(|cursor| crate::protocol::CursorState {
-                    x: area.x.saturating_add(cursor.x),
-                    y: area.y.saturating_add(cursor.y),
-                    visible: cursor.visible,
-                    shape: cursor.shape,
-                }),
-        });
         if let Some(area) = fast_path_area {
             let applied = self
                 .pane_surface
@@ -252,6 +292,27 @@ impl ClientShellState {
             }
             self.set_pane_surface(next);
         }
+        let composed_patch = fast_path_area.map(|area| {
+            let mut rows: Vec<_> = patch.rows.iter().map(|row| crate::protocol::PaneSurfacePatchRow {
+                x: area.x.saturating_add(row.x), y: area.y.saturating_add(row.y), cells: row.cells.clone(),
+            }).collect();
+            let cursor = if let Some(retained) = retained_rename(self, &patch) {
+                rows.retain(|row| !retained.area.contains((row.x, row.y).into()));
+                for row in &mut rows {
+                    for cell in &mut row.cells {
+                        cell.modifier = crate::protocol::modifier_to_u16(Modifier::from_bits_truncate(cell.modifier) | Modifier::DIM);
+                    }
+                }
+                retained.cursor.clone()
+            } else {
+                patch.cursor.map(|mut cursor| {
+                    cursor.x = area.x.saturating_add(cursor.x);
+                    cursor.y = area.y.saturating_add(cursor.y);
+                    cursor
+                })
+            };
+            ClientComposedSurfacePatch { rows, cursor }
+        });
         ClientPaneSurfacePatchOutcome::Applied(composed_patch)
     }
 }

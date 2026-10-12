@@ -1145,6 +1145,205 @@ fn retained_surface_patch_recomposes_client_owned_mode_and_diagnostic_rows() {
 }
 
 #[test]
+fn retained_rename_patch_matches_full_composition_and_reveals_covered_output() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.sidebar_collapsed = true;
+    state.config.sidebar_collapsed_mode = SidebarCollapsedModeConfig::Hidden;
+    let mut pane_surface = surface();
+    let buffer = Buffer::empty(Rect::new(0, 0, 70, 28));
+    pane_surface.frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
+    pane_surface.panes[0].rect.width = 70;
+    pane_surface.panes[0].rect.height = 28;
+    pane_surface.panes[0].inner_rect = pane_surface.panes[0].rect;
+    state.set_pane_surface(pane_surface.clone());
+    state.overlay = Some(ClientShellOverlay::Rename(ClientRenameOverlay {
+        title: "rename workspace",
+        input: "new label".into(),
+        target: ClientRenameTarget::Workspace {
+            workspace_id: "ws_1".into(),
+        },
+    }));
+    let mut composed = state.compose(100, 30).unwrap().frame;
+    let layout = state.layout(100, 30);
+    let modal = state.retained_rename.as_ref().unwrap().area;
+    let modal_cursor = composed.cursor.clone();
+    let cells_ptr = state.pane_surface.as_ref().unwrap().frame.cells.as_ptr();
+    for (offset, (x, y, symbol)) in [
+        (0, 0, "N"),
+        (
+            modal.x - layout.pane_surface.x + 1,
+            modal.y - layout.pane_surface.y + 1,
+            "C",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let revision = pane_surface.surface_revision + offset as u64;
+        let current = state.pane_surface.as_ref().unwrap();
+        let mut pane = current.panes[0].clone();
+        pane.content_revision += 2;
+        let patch = crate::protocol::PaneSurfacePatch {
+            boot_id: current.boot_id.clone(),
+            projection_revision: current.projection_revision,
+            base_surface_revision: revision,
+            surface_revision: revision + 1,
+            rows: vec![crate::protocol::PaneSurfacePatchRow {
+                x,
+                y,
+                cells: vec![crate::protocol::CellData {
+                    symbol: symbol.into(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                }],
+            }],
+            panes: vec![pane],
+            cursor: Some(crate::protocol::CursorState {
+                x: 3,
+                y: 2,
+                visible: true,
+                shape: 2,
+            }),
+        };
+        let ClientPaneSurfacePatchOutcome::Applied(Some(patch)) =
+            state.apply_pane_surface_patch(patch)
+        else {
+            panic!("stable rename should retain damage");
+        };
+        assert_eq!(patch.cursor, modal_cursor);
+        composed = apply_composed_surface_patch(&composed, patch).unwrap();
+        assert_eq!(
+            state.pane_surface.as_ref().unwrap().frame.cells.as_ptr(),
+            cells_ptr
+        );
+    }
+    assert_eq!(composed, state.compose(100, 30).unwrap().frame);
+    state.overlay = None;
+    let revealed = state.compose(100, 30).unwrap().frame;
+    let x = modal.x + 1;
+    let y = modal.y + 1;
+    assert_eq!(
+        revealed.cells[usize::from(y) * 100 + usize::from(x)].symbol,
+        "C"
+    );
+}
+
+#[test]
+fn retained_rename_recomposes_intersecting_rows_and_changed_modal_input() {
+    for edit_input in [false, true] {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.sidebar_collapsed = true;
+        state.config.sidebar_collapsed_mode = SidebarCollapsedModeConfig::Hidden;
+        let mut pane_surface = surface();
+        pane_surface.frame =
+            FrameData::from_ratatui_buffer(&Buffer::empty(Rect::new(0, 0, 100, 28)), None);
+        pane_surface.panes[0].rect.width = 100;
+        pane_surface.panes[0].rect.height = 28;
+        pane_surface.panes[0].inner_rect = pane_surface.panes[0].rect;
+        state.set_pane_surface(pane_surface);
+        state.overlay = Some(ClientShellOverlay::Rename(ClientRenameOverlay {
+            title: "rename workspace",
+            input: "name".into(),
+            target: ClientRenameTarget::Workspace {
+                workspace_id: "ws_1".into(),
+            },
+        }));
+        state.compose(100, 30).unwrap();
+        let modal = state.retained_rename.as_ref().unwrap().area;
+        let area = state.layout(100, 30).pane_surface;
+        if edit_input {
+            let Some(ClientShellOverlay::Rename(rename)) = state.overlay.as_mut() else {
+                unreachable!()
+            };
+            rename.input.insert("changed");
+        }
+        let current = state.pane_surface.as_ref().unwrap();
+        let patch = crate::protocol::PaneSurfacePatch {
+            boot_id: current.boot_id.clone(),
+            projection_revision: current.projection_revision,
+            base_surface_revision: 1,
+            surface_revision: 2,
+            rows: vec![crate::protocol::PaneSurfacePatchRow {
+                x: if edit_input { 0 } else { modal.x - area.x - 1 },
+                y: if edit_input { 0 } else { modal.y - area.y },
+                cells: vec![
+                    crate::protocol::CellData {
+                        symbol: "界".into(),
+                        fg: 0,
+                        bg: 0,
+                        modifier: 0,
+                        skip: false,
+                        hyperlink: None
+                    };
+                    3
+                ],
+            }],
+            panes: vec![current.panes[0].clone()],
+            cursor: None,
+        };
+        assert!(matches!(
+            state.apply_pane_surface_patch(patch),
+            ClientPaneSurfacePatchOutcome::Applied(None)
+        ));
+    }
+}
+
+#[test]
+fn retained_rename_recomposes_covered_style_changes() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.sidebar_collapsed = true;
+    state.config.sidebar_collapsed_mode = SidebarCollapsedModeConfig::Hidden;
+    let mut pane_surface = surface();
+    pane_surface.frame =
+        FrameData::from_ratatui_buffer(&Buffer::empty(Rect::new(0, 0, 100, 28)), None);
+    pane_surface.panes[0].rect.width = 100;
+    pane_surface.panes[0].rect.height = 28;
+    pane_surface.panes[0].inner_rect = pane_surface.panes[0].rect;
+    state.set_pane_surface(pane_surface);
+    state.overlay = Some(ClientShellOverlay::Rename(ClientRenameOverlay {
+        title: "rename workspace",
+        input: "name".into(),
+        target: ClientRenameTarget::Workspace {
+            workspace_id: "ws_1".into(),
+        },
+    }));
+    state.compose(100, 30).unwrap();
+    let modal = state.retained_rename.as_ref().unwrap().area;
+    let area = state.layout(100, 30).pane_surface;
+    let current = state.pane_surface.as_ref().unwrap();
+    let patch = crate::protocol::PaneSurfacePatch {
+        boot_id: current.boot_id.clone(),
+        projection_revision: current.projection_revision,
+        base_surface_revision: 1,
+        surface_revision: 2,
+        rows: vec![crate::protocol::PaneSurfacePatchRow {
+            x: modal.x - area.x + 1,
+            y: modal.y - area.y + 1,
+            cells: vec![crate::protocol::CellData {
+                symbol: " ".into(),
+                fg: 0,
+                bg: 0,
+                modifier: Modifier::REVERSED.bits(),
+                skip: false,
+                hyperlink: None,
+            }],
+        }],
+        panes: vec![current.panes[0].clone()],
+        cursor: None,
+    };
+    assert!(matches!(
+        state.apply_pane_surface_patch(patch),
+        ClientPaneSurfacePatchOutcome::Applied(None)
+    ));
+}
+
+#[test]
 fn retained_surface_patch_updates_scrollbar_cells_and_pane_hit_metadata() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));

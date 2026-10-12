@@ -162,6 +162,7 @@ impl ClientShellState {
         rows: u16,
     ) -> Option<crate::client::frame_output::ComposedFrame> {
         crate::latency_prof::zone!("client.compose");
+        self.retained_rename = None;
         self.last_composed_at = Some(std::time::Instant::now());
         self.selection_repaint_deadline = None;
         if self.last_composed_size != Some((cols, rows)) && self.mode == ClientShellMode::Navigate {
@@ -673,6 +674,7 @@ impl ClientShellState {
         }
         if let Some(overlay) = self.overlay.as_ref() {
             let mut composed = reusable_frame_buffer(&frame, self.overlay_buffer.take())?;
+            let mut overlay_area = Rect::default();
             let cursor = if let ClientShellOverlay::ContextMenu(menu) = overlay {
                 let rendered =
                     render::render_context_menu(&mut composed, menu, &self.config.palette)?;
@@ -700,6 +702,7 @@ impl ClientShellState {
                     &self.config.keybinds,
                     &self.config.palette,
                 )?;
+                overlay_area = rendered.area;
                 occlusion.cover(rendered.area);
                 self.hits.overlay_primary = rendered.primary;
                 self.hits.overlay_clear = rendered.clear;
@@ -730,6 +733,15 @@ impl ClientShellState {
             };
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
             self.overlay_buffer = Some(composed);
+            if let ClientShellOverlay::Rename(rename) = overlay {
+                self.retained_rename = Some(super::surface_patch::RetainedRename {
+                    rename: rename.clone(),
+                    area: overlay_area,
+                    cursor: frame.cursor.clone(),
+                    size: (cols, rows),
+                    projection_revision: surface.projection_revision,
+                });
+            }
         }
         if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
             help.scroll = help.scroll.min(self.hits.help_max_scroll);
