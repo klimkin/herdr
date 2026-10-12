@@ -168,7 +168,7 @@ fn pane_geometry_matches(
 impl ClientShellState {
     pub(crate) fn apply_pane_surface_patch(
         &mut self,
-        patch: crate::protocol::PaneSurfacePatch,
+        mut patch: crate::protocol::PaneSurfacePatch,
     ) -> ClientPaneSurfacePatchOutcome {
         let Some(current) = self.pane_surface.as_ref() else {
             return ClientPaneSurfacePatchOutcome::Rejected;
@@ -236,6 +236,8 @@ impl ClientShellState {
             let (cols, rows) = self.last_composed_size.unwrap_or_default();
             self.layout(cols, rows).pane_surface
         });
+        let rename =
+            retained_rename(self, &patch).map(|retained| (retained.area, retained.cursor.clone()));
         if let Some(area) = fast_path_area {
             let applied = self
                 .pane_surface
@@ -293,17 +295,23 @@ impl ClientShellState {
             self.set_pane_surface(next);
         }
         let composed_patch = fast_path_area.map(|area| {
-            let mut rows: Vec<_> = patch.rows.iter().map(|row| crate::protocol::PaneSurfacePatchRow {
-                x: area.x.saturating_add(row.x), y: area.y.saturating_add(row.y), cells: row.cells.clone(),
-            }).collect();
-            let cursor = if let Some(retained) = retained_rename(self, &patch) {
-                rows.retain(|row| !retained.area.contains((row.x, row.y).into()));
+            // Surface storage has received its copy. Transfer the decoded row
+            // buffers directly to presentation instead of cloning each string.
+            let mut rows = std::mem::take(&mut patch.rows);
+            for row in &mut rows {
+                row.x = area.x.saturating_add(row.x);
+                row.y = area.y.saturating_add(row.y);
+            }
+            let cursor = if let Some((overlay, cursor)) = rename {
+                rows.retain(|row| !overlay.contains((row.x, row.y).into()));
                 for row in &mut rows {
                     for cell in &mut row.cells {
-                        cell.modifier = crate::protocol::modifier_to_u16(Modifier::from_bits_truncate(cell.modifier) | Modifier::DIM);
+                        cell.modifier = crate::protocol::modifier_to_u16(
+                            Modifier::from_bits_truncate(cell.modifier) | Modifier::DIM,
+                        );
                     }
                 }
-                retained.cursor.clone()
+                cursor
             } else {
                 patch.cursor.map(|mut cursor| {
                     cursor.x = area.x.saturating_add(cursor.x);
