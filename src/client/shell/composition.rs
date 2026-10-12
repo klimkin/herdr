@@ -29,6 +29,11 @@ impl ClientShellState {
         self.composition_frame = frame;
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_composition_time(&self) -> Option<std::time::Instant> {
+        self.last_composed_at
+    }
+
     fn compose_unavailable(&mut self, cols: u16, rows: u16) -> FrameData {
         let layout = self.layout(cols, rows);
         let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));

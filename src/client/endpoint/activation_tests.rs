@@ -82,6 +82,247 @@ fn shell_and_registry() -> TestFixture {
     shell_and_registry_with_source_failure(false)
 }
 
+#[test]
+fn revision_only_inactive_snapshot_skips_composition_at_runtime_boundary() {
+    let (shell, mut endpoints, _, _) = shell_and_registry();
+    let remote = endpoint();
+    let mut state = crate::client::ClientState::test_new();
+    state.reported_size = (120, 40);
+    state.shell = Some(shell);
+    let mut prefix = crate::platform::RealPrefixInputSource::default();
+    let first = Box::new(test_snapshot("remote-boot", 1));
+    crate::client::shell_runtime::install_client_shell_snapshot(
+        &mut state,
+        &remote,
+        first,
+        false,
+        &mut endpoints,
+        &mut prefix,
+    )
+    .unwrap();
+    let first_compose = state.shell.as_ref().unwrap().last_composition_time();
+    assert!(first_compose.is_some());
+    crate::client::shell_runtime::install_client_shell_snapshot(
+        &mut state,
+        &remote,
+        Box::new(test_snapshot("remote-boot", 2)),
+        false,
+        &mut endpoints,
+        &mut prefix,
+    )
+    .unwrap();
+    assert_eq!(
+        state.shell.as_ref().unwrap().last_composition_time(),
+        first_compose
+    );
+    let mut changed = test_snapshot("remote-boot", 3);
+    changed.update_available = Some("0.10.0".into());
+    crate::client::shell_runtime::install_client_shell_snapshot(
+        &mut state,
+        &remote,
+        Box::new(changed),
+        false,
+        &mut endpoints,
+        &mut prefix,
+    )
+    .unwrap();
+    assert_ne!(
+        state.shell.as_ref().unwrap().last_composition_time(),
+        first_compose
+    );
+}
+
+/// Isolate one client's metadata dispatch from SSH and server scheduling.
+/// Run the same fixture against both production revisions; stdout is captured
+/// by the harness so real composition, encoding, write and commit still run.
+#[test]
+#[ignore = "local supporting profile; no wall-clock CI limit"]
+fn inactive_metadata_three_endpoint_profile() {
+    use crate::protocol::{ClientShellPane, ClientShellTab, ClientShellWorkspace};
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let iterations = std::env::var("HERDR_METADATA_PROFILE_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(2_000);
+    for pane_count in [1, 15] {
+        for change_label in [false, true] {
+            let mut shell = crate::client::ClientShellState::new(
+                crate::client::ClientShellConfig::from_config(&crate::config::Config::default()),
+            );
+            let mut endpoints = EndpointRegistry::new(
+                FakeTransport {
+                    sent: Default::default(),
+                    fail_after_write: false,
+                },
+                1,
+                negotiation(),
+            );
+            let profiles = [
+                super::super::SavedSshEndpoint::new("Remote A", "a", "main").unwrap(),
+                super::super::SavedSshEndpoint::new("Remote B", "b", "main").unwrap(),
+            ];
+            let remote_ids = profiles
+                .iter()
+                .map(|profile| ClientEndpointId::Ssh(profile.id.clone()))
+                .collect::<Vec<_>>();
+            shell.set_endpoint_catalog(&profiles);
+            for remote in &remote_ids {
+                endpoints.insert(
+                    remote.clone(),
+                    FakeTransport {
+                        sent: Default::default(),
+                        fail_after_write: false,
+                    },
+                    7,
+                    negotiation(),
+                    false,
+                );
+            }
+            let mut baseline = test_snapshot("metadata-boot", 1);
+            baseline.focused_workspace_id = Some("workspace".into());
+            baseline.focused_tab_id = Some("tab".into());
+            baseline.focused_pane_id = Some("pane-0".into());
+            baseline.workspaces.push(ClientShellWorkspace {
+                workspace_id: "workspace".into(),
+                active_tab_id: "tab".into(),
+                new_workspace_cwd: "/repo".into(),
+                number: 1,
+                label: "metadata".into(),
+                custom_label: true,
+                branch: Some("main".into()),
+                git_ahead_behind: None,
+                tokens: Vec::new(),
+                worktree: None,
+                focused: true,
+                agent_status: crate::api::schema::AgentStatus::Idle,
+            });
+            baseline.tabs.push(ClientShellTab {
+                tab_id: "tab".into(),
+                workspace_id: "workspace".into(),
+                number: 1,
+                label: "tab".into(),
+                custom_label: false,
+                zoomed: false,
+                focused: true,
+                agent_status: crate::api::schema::AgentStatus::Idle,
+            });
+            baseline.panes = (0..pane_count)
+                .map(|index| ClientShellPane {
+                    pane_id: format!("pane-{index}"),
+                    workspace_id: "workspace".into(),
+                    tab_id: "tab".into(),
+                    label: None,
+                    cwd: Some("/repo".into()),
+                    foreground_cwd: Some("/repo".into()),
+                    focused: index == 0,
+                    right_click_passthrough: false,
+                })
+                .collect();
+            let mut local = baseline.clone();
+            local.boot_id = "local-boot".into();
+            shell.set_snapshot(Box::new(local));
+            let size = shell.surface_size(120, 40);
+            let rect = ratatui::layout::Rect::new(0, 0, size.cols, size.rows);
+            let mut buffer = ratatui::buffer::Buffer::empty(rect);
+            let panes = baseline
+                .panes
+                .iter()
+                .enumerate()
+                .map(|(index, pane)| {
+                    let top = index as u16 * size.rows / pane_count as u16;
+                    let bottom = (index + 1) as u16 * size.rows / pane_count as u16;
+                    let area = ratatui::layout::Rect::new(0, top, size.cols, bottom - top);
+                    buffer.set_string(0, top, "LIVE TERMINAL", ratatui::style::Style::default());
+                    crate::protocol::PaneSurfacePane {
+                        pane_id: pane.pane_id.clone(),
+                        content_revision: 1,
+                        rect: area.into(),
+                        inner_rect: area.into(),
+                        scrollbar_rect: None,
+                        scroll: None,
+                        focused: index == 0,
+                        mouse_reporting: false,
+                        sgr_pixel_mouse: false,
+                        alternate_screen_active: false,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    }
+                })
+                .collect();
+            shell.set_pane_surface(crate::protocol::PaneSurfaceFrame {
+                boot_id: "local-boot".into(),
+                projection_revision: 1,
+                surface_revision: 1,
+                frame: crate::protocol::FrameData::from_ratatui_buffer_with_hyperlinks(
+                    &buffer,
+                    None,
+                    &[],
+                ),
+                panes,
+                splits: Vec::new(),
+                popup: None,
+                graphics: Default::default(),
+            });
+            let mut state = crate::client::ClientState::test_new();
+            state.reported_size = (120, 40);
+            state.shell = Some(shell);
+            let mut prefix = crate::platform::RealPrefixInputSource::default();
+            for remote in &remote_ids {
+                crate::client::shell_runtime::install_client_shell_snapshot(
+                    &mut state,
+                    remote,
+                    Box::new(baseline.clone()),
+                    false,
+                    &mut endpoints,
+                    &mut prefix,
+                )
+                .unwrap();
+            }
+            let mut compose_count = 0;
+            let mut samples = Vec::with_capacity(iterations);
+            for iteration in 0..iterations {
+                let remote = &remote_ids[iteration % remote_ids.len()];
+                let mut snapshot = baseline.clone();
+                snapshot.revision = 2 + iteration as u64;
+                if change_label {
+                    snapshot.workspaces[0].label = format!("metadata-{iteration}");
+                }
+                let previous = state.shell.as_ref().unwrap().last_composition_time();
+                let started = Instant::now();
+                crate::client::shell_runtime::install_client_shell_snapshot(
+                    &mut state,
+                    remote,
+                    black_box(Box::new(snapshot)),
+                    false,
+                    &mut endpoints,
+                    &mut prefix,
+                )
+                .unwrap();
+                samples.push(started.elapsed().as_nanos());
+                compose_count +=
+                    usize::from(previous != state.shell.as_ref().unwrap().last_composition_time());
+            }
+            samples.sort_unstable();
+            eprintln!(
+                "METADATA_PROFILE panes={pane_count} changed={change_label} updates={iterations} compositions={compose_count} p50_ns={} p95_ns={} p99_ns={}",
+                samples[iterations / 2],
+                samples[(iterations - 1) * 95 / 100],
+                samples[(iterations - 1) * 99 / 100],
+            );
+            // Both inactive caches advance without changing the active owner.
+            assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
+            assert!(state
+                .shell
+                .as_ref()
+                .unwrap()
+                .endpoint_is_active(&ClientEndpointId::Local));
+        }
+    }
+}
+
 fn shell_and_registry_with_source_failure(source_fail_after_write: bool) -> TestFixture {
     let mut shell = crate::client::ClientShellState::new(
         crate::client::ClientShellConfig::from_config(&crate::config::Config::default()),
