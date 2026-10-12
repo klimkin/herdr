@@ -293,7 +293,7 @@ pub(super) enum ClientShellOverlayKind {
     Settings,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ClientRenameTarget {
     NewWorkspace {
         source_workspace_id: Option<String>,
@@ -317,7 +317,7 @@ pub(super) enum ClientRenameTarget {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ClientRenameOverlay {
     pub(super) title: &'static str,
     pub(super) input: TextEditor,
@@ -909,6 +909,7 @@ pub(crate) struct ClientShellState {
     pub(super) composition_frame: Option<FrameData>,
     pub(super) composition_buffer: Option<Buffer>,
     pub(super) overlay_buffer: Option<Buffer>,
+    pub(super) retained_rename: Option<super::surface_patch::RetainedRename>,
     pub(super) selection_repaint_deadline: Option<std::time::Instant>,
     pub(super) hits: ShellHitMap,
     pub(super) endpoints: Vec<ClientShellEndpoint>,
@@ -1050,6 +1051,7 @@ impl ClientShellState {
             composition_frame: None,
             composition_buffer: None,
             overlay_buffer: None,
+            retained_rename: None,
             config,
             snapshot: None,
             #[cfg(feature = "latency-prof")]
