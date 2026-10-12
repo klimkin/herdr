@@ -64,6 +64,10 @@ impl ClientShellState {
         )
     }
 
+    pub(crate) fn has_machine_diagnostic(&self, id: &ClientEndpointId) -> bool {
+        self.machine_diagnostics.errors.contains_key(id)
+    }
+
     pub(crate) fn set_machine_diagnostic(&mut self, id: &ClientEndpointId, message: String) {
         if !id.is_local() {
             self.machine_diagnostics.errors.insert(

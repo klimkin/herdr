@@ -44,6 +44,44 @@ pub(crate) enum ClientEndpointFocusTarget {
 }
 
 impl ClientShellState {
+    /// A revision-only inactive replacement changes cached authority, not pixels.
+    /// Compare every snapshot field; new fields conservatively invalidate chrome.
+    pub(crate) fn inactive_snapshot_changes_chrome(
+        &self,
+        endpoint_id: &ClientEndpointId,
+        generation: u64,
+        snapshot: &mut ClientShellSnapshot,
+    ) -> bool {
+        if endpoint_id == &self.active_endpoint_id
+            || self.overlay.is_some()
+            || self.mode != ClientShellMode::Terminal
+            || self.has_machine_diagnostic(endpoint_id)
+            || self.pending_pane_surface.is_some()
+        {
+            return true;
+        }
+        let Some(endpoint) = self
+            .endpoints
+            .iter()
+            .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+        else {
+            return true;
+        };
+        if endpoint.status != ClientEndpointStatus::Online
+            || endpoint.snapshot_generation != Some(generation)
+        {
+            return true;
+        }
+        let Some(previous) = endpoint.snapshot.as_deref() else {
+            return true;
+        };
+        let revision = snapshot.revision;
+        snapshot.revision = previous.revision;
+        let changed = previous != snapshot;
+        snapshot.revision = revision;
+        changed
+    }
+
     pub(crate) fn set_endpoint_catalog(&mut self, profiles: &[SavedSshEndpoint]) {
         let mut next = Vec::with_capacity(profiles.len().saturating_add(1));
         let local = self
@@ -554,14 +592,14 @@ impl ClientShellState {
         endpoint_id: &ClientEndpointId,
         generation: u64,
         snapshot: Box<ClientShellSnapshot>,
-    ) {
+    ) -> bool {
         #[cfg(feature = "latency-prof")]
         if endpoint_id == &self.active_endpoint_id {
             // An inactive cache can replace equal-revision bytes without
             // projecting them. Reusing the previous transport link is unsafe.
             self.snapshot_diagnostic = None;
         }
-        self.cache_endpoint_snapshot_with_surface(endpoint_id, Some(generation), snapshot, false);
+        self.cache_endpoint_snapshot_with_surface(endpoint_id, Some(generation), snapshot, false)
     }
 
     fn cache_endpoint_snapshot_with_surface(
@@ -570,7 +608,7 @@ impl ClientShellState {
         generation: Option<u64>,
         mut snapshot: Box<ClientShellSnapshot>,
         acknowledge_surface: bool,
-    ) {
+    ) -> bool {
         snapshot
             .commands
             .retain(|command| command.action != crate::protocol::ClientShellCommandAction::Unknown);
@@ -579,7 +617,7 @@ impl ClientShellState {
             .iter()
             .position(|endpoint| &endpoint.endpoint_id == endpoint_id)
         else {
-            return;
+            return false;
         };
         if self.endpoints[index].snapshot_generation == generation
             && self.endpoints[index]
@@ -589,7 +627,7 @@ impl ClientShellState {
                     previous.boot_id == snapshot.boot_id && previous.revision > snapshot.revision
                 })
         {
-            return;
+            return false;
         }
         let boot_changed = self.endpoints[index]
             .snapshot
@@ -612,6 +650,12 @@ impl ClientShellState {
                 .acknowledge_surface(&mut snapshot, surface, self.outer_focused);
         }
         let previous = self.endpoints[index].snapshot.as_deref();
+        // Agent completion projection can change pixels even when raw metadata
+        // differs only by revision. Compare after consuming its companions.
+        let revision = snapshot.revision;
+        snapshot.revision = previous.map_or(revision, |old| old.revision);
+        let chrome_changed = previous != Some(snapshot.as_ref());
+        snapshot.revision = revision;
         let mut next_recency = self
             .endpoints
             .iter()
@@ -681,6 +725,7 @@ impl ClientShellState {
                 endpoint.agent_view_projection = None;
             }
         }
+        chrome_changed
     }
 
     pub(crate) fn acknowledge_active_surface_agents(&mut self, surface: &PaneSurfaceFrame) -> bool {
