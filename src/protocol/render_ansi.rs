@@ -131,10 +131,19 @@ impl BlitEncoder {
     }
 
     pub(crate) fn commit(&mut self, frame: FrameData, encoded: EncodedBlit) {
+        let _ = self.commit_recycling(frame, encoded);
+    }
+
+    /// A successful commit releases the previous baseline for client scratch.
+    pub(crate) fn commit_recycling(
+        &mut self,
+        frame: FrameData,
+        encoded: EncodedBlit,
+    ) -> Option<FrameData> {
         self.last_visible_cursor = encoded.next_last_visible_cursor;
         self.last_cursor_shape = encoded.next_last_cursor_shape;
         self.suppress_visible_cursor = encoded.suppress_visible_cursor;
-        self.last_frame = Some(frame);
+        self.last_frame.replace(frame)
     }
 
     pub(crate) fn is_current(&self, frame: &FrameData) -> bool {
