@@ -725,6 +725,16 @@ impl Clone for CellData {
 }
 
 impl CellData {
+    fn replace_from_ratatui_cell(&mut self, cell: &ratatui::buffer::Cell) {
+        self.symbol.clear();
+        self.symbol.push_str(cell.symbol());
+        self.fg = color_to_u32(cell.fg);
+        self.bg = color_to_u32(cell.bg);
+        self.modifier = modifier_to_u16(cell.modifier);
+        self.skip = cell.skip;
+        self.hyperlink = None;
+    }
+
     pub(crate) fn from_ratatui_cell(cell: &ratatui::buffer::Cell) -> Self {
         Self {
             symbol: cell.symbol().to_owned(),
@@ -841,45 +851,101 @@ impl FrameData {
         buffer: &ratatui::buffer::Buffer,
         cursor: Option<CursorState>,
     ) {
-        let width = self.width;
-        let hyperlinks = if width == 0 {
-            Vec::new()
-        } else {
-            self.cells
+        if self.width != buffer.area.width || self.height != buffer.area.height {
+            // Resizing needs original coordinates; ordinary composition keeps geometry.
+            let width = usize::from(self.width);
+            let hyperlinks = self
+                .cells
                 .iter()
                 .enumerate()
                 .filter_map(|(index, cell)| {
                     let uri = self.hyperlinks.get(cell.hyperlink? as usize)?;
-                    let x = u16::try_from(index % usize::from(width)).ok()?;
-                    let y = u16::try_from(index / usize::from(width)).ok()?;
-                    Some(((x, y), cell.symbol.clone(), uri.clone()))
+                    if width == 0 {
+                        return None;
+                    }
+                    Some((
+                        (
+                            u16::try_from(index % width).ok()?,
+                            u16::try_from(index / width).ok()?,
+                        ),
+                        cell.symbol.clone(),
+                        uri.clone(),
+                    ))
                 })
-                .collect::<Vec<_>>()
-        };
-        let graphics = std::mem::take(&mut self.graphics);
-        let mut replacement =
-            Self::from_ratatui_buffer_with_hyperlinks(buffer, cursor, &hyperlinks);
-        replacement.graphics = graphics;
-        *self = replacement;
+                .collect::<Vec<_>>();
+            let graphics = std::mem::take(&mut self.graphics);
+            *self = Self::from_ratatui_buffer_with_hyperlinks(buffer, cursor, &hyperlinks);
+            self.graphics = graphics;
+            return;
+        }
+        let mut links = Vec::new();
+        let mut indices = HashMap::new();
+        for (cell, source) in self.cells.iter_mut().zip(&buffer.content) {
+            let hyperlink = (cell.symbol == source.symbol())
+                .then_some(cell.hyperlink)
+                .flatten()
+                .and_then(|old| self.hyperlinks.get(old as usize).map(|uri| (old, uri)))
+                .map(|(old, uri)| {
+                    *indices.entry(old).or_insert_with(|| {
+                        let next = links.len() as u32;
+                        links.push(uri.clone());
+                        next
+                    })
+                });
+            cell.replace_from_ratatui_cell(source);
+            cell.hyperlink = hyperlink;
+        }
+        self.cursor = cursor;
+        self.hyperlinks = links;
+    }
+
+    /// Overwrite client scratch while retaining cell and string capacity.
+    pub(crate) fn replace_from_ratatui_buffer(
+        &mut self,
+        buffer: &ratatui::buffer::Buffer,
+        cursor: Option<CursorState>,
+    ) {
+        let expected = usize::from(buffer.area.width) * usize::from(buffer.area.height);
+        self.cells.resize_with(expected, || {
+            CellData::from_ratatui_cell(&ratatui::buffer::Cell::default())
+        });
+        for (cell, source) in self.cells.iter_mut().zip(&buffer.content) {
+            cell.replace_from_ratatui_cell(source);
+        }
+        self.width = buffer.area.width;
+        self.height = buffer.area.height;
+        self.cursor = cursor;
+        self.hyperlinks.clear();
+        self.graphics.clear();
     }
 
     /// Reconstructs a ratatui `Buffer` from this frame data.
     ///
     /// Returns `None` if the cells vector length doesn't match `width * height`.
+    #[cfg(test)]
     pub(crate) fn to_ratatui_buffer(&self) -> Option<ratatui::buffer::Buffer> {
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::default());
+        self.write_ratatui_buffer(&mut buffer).then_some(buffer)
+    }
+
+    /// Reconstruct into client scratch without allocating the cell vector again.
+    pub(crate) fn write_ratatui_buffer(&self, buffer: &mut ratatui::buffer::Buffer) -> bool {
         let expected = (self.width as usize) * (self.height as usize);
         if self.cells.len() != expected {
-            return None;
+            return false;
         }
 
         let area = ratatui::layout::Rect::new(0, 0, self.width, self.height);
-        let mut buffer = ratatui::buffer::Buffer::filled(area, ratatui::buffer::Cell::new(" "));
+        buffer.resize(area);
 
         for row in 0..self.height {
             for col in 0..self.width {
                 let idx = (row as usize) * (self.width as usize) + (col as usize);
                 let cell_data = &self.cells[idx];
                 let cell = buffer.cell_mut((col, row)).expect("cell within bounds");
+                // Reset attributes absent from the wire representation, such as
+                // Ratatui's underline color, while retaining symbol storage.
+                cell.set_style(ratatui::style::Style::reset());
                 cell.set_symbol(&cell_data.symbol);
                 cell.fg = u32_to_color(cell_data.fg);
                 cell.bg = u32_to_color(cell_data.bg);
@@ -888,7 +954,7 @@ impl FrameData {
             }
         }
 
-        Some(buffer)
+        true
     }
 }
 
@@ -3453,6 +3519,57 @@ mod tests {
             graphics: Vec::new(),
         };
         assert!(frame.to_ratatui_buffer().is_none());
+    }
+
+    #[test]
+    fn frame_reuse_preserves_effects_and_clears_overwritten_links() {
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 4, 2));
+        buffer[(1, 0)].set_symbol("linked");
+        let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(
+            &buffer,
+            None,
+            &[((1, 0), "linked".into(), "https://example.com".into())],
+        );
+        frame.graphics = b"graphics".to_vec();
+        let cells = frame.cells.as_ptr();
+        let symbol = frame.cells[1].symbol.as_ptr();
+        buffer[(1, 0)].set_style(
+            ratatui::style::Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::DIM),
+        );
+        let cursor = Some(CursorState {
+            x: 1,
+            y: 1,
+            visible: true,
+            shape: 5,
+        });
+        frame.replace_from_ratatui_buffer_preserving_effects(&buffer, cursor.clone());
+        assert_eq!(frame.cells.as_ptr(), cells);
+        assert_eq!(frame.cells[1].symbol.as_ptr(), symbol);
+        assert_eq!(frame.cells[1].hyperlink, Some(0));
+        assert_eq!(frame.cells[1].fg, color_to_u32(Color::Red));
+        assert_eq!(frame.cursor, cursor);
+        assert_eq!(frame.graphics, b"graphics");
+        buffer[(1, 0)].set_symbol("new");
+        frame.replace_from_ratatui_buffer_preserving_effects(&buffer, None);
+        assert_eq!(frame.cells[1].hyperlink, None);
+        assert!(frame.hyperlinks.is_empty());
+        assert_eq!(frame.graphics, b"graphics");
+        frame.replace_from_ratatui_buffer(&buffer, None);
+        assert!(frame.graphics.is_empty());
+        assert_eq!(frame.cells.as_ptr(), cells);
+        buffer.resize(ratatui::layout::Rect::new(0, 0, 2, 2));
+        frame.replace_from_ratatui_buffer(&buffer, None);
+        assert_eq!(frame, FrameData::from_ratatui_buffer(&buffer, None));
+        buffer.resize(ratatui::layout::Rect::new(0, 0, 8, 4));
+        frame.replace_from_ratatui_buffer(&buffer, None);
+        assert_eq!(frame, FrameData::from_ratatui_buffer(&buffer, None));
+        let mut scratch = ratatui::buffer::Buffer::empty(buffer.area);
+        let scratch_cells = scratch.content.as_ptr();
+        assert!(frame.write_ratatui_buffer(&mut scratch));
+        assert_eq!(scratch.content.as_ptr(), scratch_cells);
+        assert_eq!(scratch, buffer);
     }
 
     // ---- Color conversion coverage ----
