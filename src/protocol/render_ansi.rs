@@ -195,13 +195,21 @@ impl BlitEncoder {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn patch_rows_with_drawn_cursor(
         &self,
         rows: &[PaneSurfacePatchRow],
         cursor: Option<&CursorState>,
     ) -> Option<Vec<PaneSurfacePatchRow>> {
+        self.patch_owned_rows_with_drawn_cursor(rows.to_vec(), cursor)
+    }
+
+    pub(crate) fn patch_owned_rows_with_drawn_cursor(
+        &self,
+        mut rows: Vec<PaneSurfacePatchRow>,
+        cursor: Option<&CursorState>,
+    ) -> Option<Vec<PaneSurfacePatchRow>> {
         let frame = self.last_frame.as_ref()?;
-        let mut rows = rows.to_vec();
         let previous = frame
             .cursor
             .as_ref()

@@ -336,7 +336,7 @@ impl ClientState {
         let rows = if self.draw_host_cursor {
             let Some(rows) = self
                 .blit_encoder
-                .patch_rows_with_drawn_cursor(&patch.rows, patch.cursor.as_ref())
+                .patch_owned_rows_with_drawn_cursor(patch.rows, patch.cursor.as_ref())
             else {
                 crate::render_prof::event("client_surface_patch.fallback.drawn_cursor");
                 return Ok(false);

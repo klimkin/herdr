@@ -1087,10 +1087,16 @@ fn retained_surface_patch_updates_only_pane_cells_without_recomposing_chrome() {
         cursor: None,
     };
 
+    let row_buffer = patch.rows.as_ptr();
+    let cell_buffer = patch.rows[0].cells.as_ptr();
+    let symbol_buffer = patch.rows[0].cells[0].symbol.as_ptr();
     let ClientPaneSurfacePatchOutcome::Applied(Some(patch)) = state.apply_pane_surface_patch(patch)
     else {
         panic!("expected fast retained patch");
     };
+    assert_eq!(patch.rows.as_ptr(), row_buffer);
+    assert_eq!(patch.rows[0].cells.as_ptr(), cell_buffer);
+    assert_eq!(patch.rows[0].cells[0].symbol.as_ptr(), symbol_buffer);
     let patched = apply_composed_surface_patch(&composed, patch).expect("apply composed patch");
     let pane_index = usize::from(layout.pane_surface.y) * usize::from(patched.width)
         + usize::from(layout.pane_surface.x);
