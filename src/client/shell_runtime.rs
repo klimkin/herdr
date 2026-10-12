@@ -711,7 +711,7 @@ pub(super) fn handle_endpoint_attention(
 pub(super) fn install_client_shell_snapshot(
     state: &mut ClientState,
     endpoint_id: &endpoint::ClientEndpointId,
-    snapshot: Box<crate::protocol::ClientShellSnapshot>,
+    mut snapshot: Box<crate::protocol::ClientShellSnapshot>,
     projection_pending: bool,
     endpoints: &mut endpoint::EndpointRegistry,
     prefix_input_source: &mut impl crate::platform::PrefixInputSource,
@@ -724,6 +724,11 @@ pub(super) fn install_client_shell_snapshot(
         !projection_pending && endpoints.active_id() == endpoint_id && connection.surface_active;
     let pixel_mouse_available = state.pixel_mouse_available();
     let (composed, resize, graphics_cleanup) = if let Some(shell) = &mut state.shell {
+        let mut chrome_changed = project_snapshot
+            || projection_pending
+            || state.presentation_frozen
+            || endpoints.active_id() == endpoint_id
+            || shell.inactive_snapshot_changes_chrome(endpoint_id, generation, &mut snapshot);
         let waits_for_selected_surface = projection_pending
             || (endpoints.active_id() == endpoint_id
                 && !project_snapshot
@@ -735,7 +740,7 @@ pub(super) fn install_client_shell_snapshot(
         if project_snapshot {
             shell.set_endpoint_snapshot_for_generation(endpoint_id, generation, snapshot);
         } else {
-            shell.cache_endpoint_snapshot_inactive_for_generation(
+            chrome_changed |= shell.cache_endpoint_snapshot_inactive_for_generation(
                 endpoint_id,
                 generation,
                 snapshot,
@@ -744,7 +749,9 @@ pub(super) fn install_client_shell_snapshot(
         let graphics_cleanup = shell.take_pending_graphics_cleanup();
         let next_size = shell.surface_size(state.reported_size.0, state.reported_size.1);
         (
-            shell.compose(state.reported_size.0, state.reported_size.1),
+            chrome_changed
+                .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                .flatten(),
             (previous_size != next_size).then(|| {
                 client_shell_resize_message(
                     shell,

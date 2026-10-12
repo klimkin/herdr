@@ -1,5 +1,96 @@
 use super::*;
 
+#[test]
+fn inactive_revision_only_snapshot_keeps_chrome_and_updates_cached_authority() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let profile = SavedSshEndpoint::new("Remote", "remote", "main").unwrap();
+    let remote = ClientEndpointId::Ssh(profile.id.clone());
+    state.set_endpoint_catalog(&[profile]);
+    state.set_endpoint_status(&remote, ClientEndpointStatus::Online);
+    let mut previous = snapshot();
+    previous.boot_id = "remote-boot".into();
+    state.cache_endpoint_snapshot_inactive_for_generation(&remote, 7, Box::new(previous.clone()));
+    let mut next = previous.clone();
+    next.revision += 1;
+    assert!(!state.inactive_snapshot_changes_chrome(&remote, 7, &mut next));
+    assert_eq!(next.revision, 2);
+    state.cache_endpoint_snapshot_inactive_for_generation(&remote, 7, Box::new(next.clone()));
+    assert_eq!(
+        state
+            .endpoints
+            .iter()
+            .find(|e| e.endpoint_id == remote)
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .revision,
+        2
+    );
+    assert_eq!(state.snapshot.as_ref().unwrap().boot_id, "boot-1");
+    next.workspaces[0].label = "changed visible label".into();
+    assert!(state.inactive_snapshot_changes_chrome(&remote, 7, &mut next));
+    next = previous.clone();
+    assert!(state.inactive_snapshot_changes_chrome(&remote, 8, &mut next));
+    next.boot_id = "restarted".into();
+    assert!(state.inactive_snapshot_changes_chrome(&remote, 7, &mut next));
+    state.set_machine_diagnostic(&remote, "authentication required".into());
+    next = previous;
+    assert!(state.inactive_snapshot_changes_chrome(&remote, 7, &mut next));
+    assert!(state.inactive_snapshot_changes_chrome(&ClientEndpointId::Local, 1, &mut next));
+}
+
+#[test]
+fn inactive_completion_projection_invalidates_chrome_after_acceptance() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let profile = remote_profile();
+    let remote = ClientEndpointId::Ssh(profile.id.clone());
+    state.set_endpoint_catalog(&[profile]);
+    state.set_endpoint_status(&remote, ClientEndpointStatus::Online);
+    let mut baseline = snapshot();
+    baseline.boot_id = "remote-boot".into();
+    baseline.agents = vec![agent("worker", AgentStatus::Idle, 4)];
+    state.cache_endpoint_snapshot_inactive_for_generation(&remote, 7, Box::new(baseline.clone()));
+    let mut settled = baseline;
+    settled.revision = 2;
+    settled.agents[0].state_change_seq = 6;
+    state.set_endpoint_agent_completions(
+        &remote,
+        7,
+        crate::protocol::endpoint::EndpointAgentCompletions {
+            boot_id: settled.boot_id.clone(),
+            revision: 2,
+            completions: Default::default(),
+        },
+    );
+    state.cache_endpoint_snapshot_inactive_for_generation(&remote, 7, Box::new(settled.clone()));
+    let mut next = settled;
+    next.revision = 3;
+    assert!(!state.inactive_snapshot_changes_chrome(&remote, 7, &mut next));
+    state.set_endpoint_agent_completions(
+        &remote,
+        7,
+        crate::protocol::endpoint::EndpointAgentCompletions {
+            boot_id: next.boot_id.clone(),
+            revision: 3,
+            completions: std::collections::BTreeMap::from([("pane_1".into(), 6)]),
+        },
+    );
+    assert!(state.cache_endpoint_snapshot_inactive_for_generation(&remote, 7, Box::new(next)));
+    let accepted = state
+        .endpoints
+        .iter()
+        .find(|e| e.endpoint_id == remote)
+        .unwrap()
+        .snapshot
+        .as_ref()
+        .unwrap();
+    assert_eq!(accepted.agents[0].agent_status, AgentStatus::Done);
+    assert_eq!(accepted.workspaces[0].agent_status, AgentStatus::Done);
+}
+
 #[path = "workspace_navigation.rs"]
 mod workspace_navigation;
 use crate::client::endpoint::{
