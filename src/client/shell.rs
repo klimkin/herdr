@@ -261,7 +261,7 @@ fn blit_pane_surface(target: &mut FrameData, source: &FrameData, area: Rect) {
             ) else {
                 continue;
             };
-            *target_cell = source_cell.clone();
+            target_cell.clone_from(source_cell);
             target_cell.hyperlink = source_cell.hyperlink.and_then(|index| {
                 ((index as usize) < source.hyperlinks.len()).then_some(hyperlink_base + index)
             });

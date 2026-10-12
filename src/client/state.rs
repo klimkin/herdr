@@ -642,7 +642,10 @@ impl ClientState {
             self.repaint_pending = true;
             return false;
         }
-        self.blit_encoder.commit(frame_data, encoded);
+        let previous = self.blit_encoder.commit_recycling(frame_data, encoded);
+        if let Some(shell) = self.shell.as_mut() {
+            shell.recycle_composition_frame(previous);
+        }
         self.repaint_pending = false;
         true
     }

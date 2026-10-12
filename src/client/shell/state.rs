@@ -905,6 +905,10 @@ pub(crate) struct ClientShellState {
     pub(super) last_tab_bar_width: Option<u16>,
     pub(super) last_composed_size: Option<(u16, u16)>,
     pub(super) last_composed_at: Option<std::time::Instant>,
+    /// Client scratch is separate from the encoder's committed frame.
+    pub(super) composition_frame: Option<FrameData>,
+    pub(super) composition_buffer: Option<Buffer>,
+    pub(super) overlay_buffer: Option<Buffer>,
     pub(super) selection_repaint_deadline: Option<std::time::Instant>,
     pub(super) hits: ShellHitMap,
     pub(super) endpoints: Vec<ClientShellEndpoint>,
@@ -1043,6 +1047,9 @@ impl ClientShellState {
         }
         Self {
             machine_diagnostics: Default::default(),
+            composition_frame: None,
+            composition_buffer: None,
+            overlay_buffer: None,
             config,
             snapshot: None,
             #[cfg(feature = "latency-prof")]

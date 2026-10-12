@@ -1,5 +1,10 @@
 use super::*;
 
+fn reusable_frame_buffer(frame: &FrameData, buffer: Option<Buffer>) -> Option<Buffer> {
+    let mut buffer = buffer.unwrap_or_else(|| Buffer::empty(Rect::default()));
+    frame.write_ratatui_buffer(&mut buffer).then_some(buffer)
+}
+
 fn restore_mode_bar(
     frame: &mut FrameData,
     bar: Option<Rect>,
@@ -20,6 +25,10 @@ fn restore_mode_bar(
 }
 
 impl ClientShellState {
+    pub(crate) fn recycle_composition_frame(&mut self, frame: Option<FrameData>) {
+        self.composition_frame = frame;
+    }
+
     fn compose_unavailable(&mut self, cols: u16, rows: u16) -> FrameData {
         let layout = self.layout(cols, rows);
         let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
@@ -205,7 +214,13 @@ impl ClientShellState {
             ),
             _ => (None, None),
         };
-        let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
+        let area = Rect::new(0, 0, cols, rows);
+        let mut buffer = self
+            .composition_buffer
+            .take()
+            .unwrap_or_else(|| Buffer::empty(area));
+        buffer.resize(area);
+        buffer.reset();
         self.hits = render::render_shell(
             &mut buffer,
             layout,
@@ -339,7 +354,13 @@ impl ClientShellState {
             self.hits.tab_scroll_left = Rect::default();
             self.hits.tab_scroll_right = Rect::default();
         }
-        let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
+        let mut frame = if let Some(mut frame) = self.composition_frame.take() {
+            frame.replace_from_ratatui_buffer(&buffer, None);
+            frame
+        } else {
+            FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[])
+        };
+        self.composition_buffer = Some(buffer);
         let mode_bar_cells = mode_bar.map(|bar| {
             let start = usize::from(bar.y) * usize::from(frame.width) + usize::from(bar.x);
             frame.cells[start..start + usize::from(bar.width)].to_vec()
@@ -357,7 +378,7 @@ impl ClientShellState {
             .is_some_and(|copy_mode| !copy_mode.search_matches.is_empty());
         if has_selection || has_search {
             let cursor = frame.cursor.clone();
-            let mut composed = frame.to_ratatui_buffer()?;
+            let mut composed = reusable_frame_buffer(&frame, self.overlay_buffer.take())?;
             for hit in &self.hits.panes {
                 let copy_surface_coherent =
                     client_copy_surface_coherent(self.copy_mode.as_ref(), hit);
@@ -412,6 +433,7 @@ impl ClientShellState {
                 }
             }
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
+            self.overlay_buffer = Some(composed);
         }
         self.render_link_hover(&mut frame, &mut occlusion);
         if self.mode == ClientShellMode::Copy {
@@ -433,7 +455,8 @@ impl ClientShellState {
                         && x < frame.width
                         && y < frame.height
                     {
-                        let mut composed = frame.to_ratatui_buffer()?;
+                        let mut composed =
+                            reusable_frame_buffer(&frame, self.overlay_buffer.take())?;
                         occlusion.cover(Rect::new(x, y, 1, 1));
                         composed[(x, y)].set_style(
                             Style::default()
@@ -445,6 +468,7 @@ impl ClientShellState {
                                 .add_modifier(Modifier::BOLD),
                         );
                         frame.replace_from_ratatui_buffer_preserving_effects(&composed, None);
+                        self.overlay_buffer = Some(composed);
                     } else {
                         frame.cursor = None;
                     }
@@ -466,7 +490,7 @@ impl ClientShellState {
             || self.visible_notification.is_some()
         {
             let cursor = frame.cursor.clone();
-            let mut composed = frame.to_ratatui_buffer()?;
+            let mut composed = reusable_frame_buffer(&frame, self.overlay_buffer.take())?;
             if let Some(diagnostic) = self.config_diagnostic.as_deref() {
                 let diagnostic_area = if layout.mobile_header.is_empty() {
                     Rect::new(0, 0, cols, rows)
@@ -532,10 +556,11 @@ impl ClientShellState {
             }
             occlusion.cover(self.hits.notification_toast);
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
+            self.overlay_buffer = Some(composed);
         }
         if let Some(feedback) = self.copy_feedback.as_ref() {
             let cursor = frame.cursor.clone();
-            let mut composed = frame.to_ratatui_buffer()?;
+            let mut composed = reusable_frame_buffer(&frame, self.overlay_buffer.take())?;
             let base_offset = u16::from(has_config_diagnostic);
             let feedback_area = if layout.mobile_header.is_empty() {
                 layout.pane_surface
@@ -558,6 +583,7 @@ impl ClientShellState {
                 &self.config.palette,
             ));
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
+            self.overlay_buffer = Some(composed);
         }
         self.hits.popup = None;
         if let Some(popup) = surface.popup.as_deref() {
@@ -567,7 +593,7 @@ impl ClientShellState {
                 crate::popup_size::resolve_popup_geometry(width, height, layout.pane_surface)
             {
                 occlusion.start_popup(geometry.outer);
-                let mut composed = frame.to_ratatui_buffer()?;
+                let mut composed = reusable_frame_buffer(&frame, self.overlay_buffer.take())?;
                 let block = ratatui::widgets::Block::default()
                     .borders(ratatui::widgets::Borders::ALL)
                     .border_style(ratatui::style::Style::default().fg(self.config.palette.accent))
@@ -580,6 +606,7 @@ impl ClientShellState {
                 );
                 ratatui::widgets::Widget::render(block, geometry.outer, &mut composed);
                 frame.replace_from_ratatui_buffer_preserving_effects(&composed, None);
+                self.overlay_buffer = Some(composed);
                 blit_pane_surface(&mut frame, &popup.frame, geometry.inner);
                 self.hits.popup = Some(PaneHit {
                     rect: geometry.outer,
@@ -599,7 +626,7 @@ impl ClientShellState {
             && self.mode == ClientShellMode::Navigate
             && self.overlay.is_none()
         {
-            let mut composed = frame.to_ratatui_buffer()?;
+            let mut composed = reusable_frame_buffer(&frame, self.overlay_buffer.take())?;
             occlusion.cover(composed.area);
             super::mobile::render_mobile_switcher(
                 &mut composed,
@@ -635,6 +662,7 @@ impl ClientShellState {
                 );
             }
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, None);
+            self.overlay_buffer = Some(composed);
             self.hits.panes.clear();
             self.hits.pane_splits.clear();
             self.hits.popup = None;
@@ -644,7 +672,7 @@ impl ClientShellState {
             occlusion.cover(bar);
         }
         if let Some(overlay) = self.overlay.as_ref() {
-            let mut composed = frame.to_ratatui_buffer()?;
+            let mut composed = reusable_frame_buffer(&frame, self.overlay_buffer.take())?;
             let cursor = if let ClientShellOverlay::ContextMenu(menu) = overlay {
                 let rendered =
                     render::render_context_menu(&mut composed, menu, &self.config.palette)?;
@@ -701,6 +729,7 @@ impl ClientShellState {
                 rendered.cursor
             };
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
+            self.overlay_buffer = Some(composed);
         }
         if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
             help.scroll = help.scroll.min(self.hits.help_max_scroll);
