@@ -26,8 +26,11 @@ impl DeadlineStream {
         stream: interprocess::local_socket::Stream,
         timeout: std::time::Duration,
     ) -> std::io::Result<Self> {
-        use interprocess::local_socket::traits::Stream as _;
-        stream.set_nonblocking(true)?;
+        #[cfg(unix)]
+        {
+            use interprocess::local_socket::traits::Stream as _;
+            stream.set_nonblocking(true)?;
+        }
         Ok(Self {
             stream,
             deadline: std::time::Instant::now() + timeout,
@@ -59,6 +62,15 @@ impl std::io::Read for DeadlineStream {
                     "local operation timed out",
                 ));
             }
+            #[cfg(windows)]
+            match windows_named_pipe_available(&mut self.stream)? {
+                Some(0) => {
+                    self.retry()?;
+                    continue;
+                }
+                Some(_) => {}
+                None => return Ok(0),
+            }
             match std::io::Read::read(&mut self.stream, bytes) {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => self.retry()?,
                 result => return result,
@@ -84,6 +96,42 @@ impl std::io::Write for DeadlineStream {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn windows_named_pipe_available(
+    stream: &mut interprocess::local_socket::Stream,
+) -> std::io::Result<Option<u32>> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+
+    let interprocess::local_socket::Stream::NamedPipe(pipe) = stream;
+    let mut available = 0;
+    let ok = unsafe {
+        windows_sys::Win32::System::Pipes::PeekNamedPipe(
+            pipe.as_handle().as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        return Ok(Some(available));
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::UnexpectedEof
+    ) || matches!(error.raw_os_error(), Some(6 | 109 | 232 | 233))
+    {
+        return Ok(None);
+    }
+    Err(error)
 }
 
 /// One outstanding PTY input write; blocked input cannot stall the stimulus loop.

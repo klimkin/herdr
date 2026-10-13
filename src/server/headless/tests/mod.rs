@@ -5144,6 +5144,8 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
                 server.app.event_tx.try_send(death()).unwrap();
                 let (respond_to, response_rx) = std::sync::mpsc::channel();
                 server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                    #[cfg(feature = "latency-prof")]
+                    diagnostic_trace: crate::latency_prof::event::EventTrace::default(),
                     request: api::schema::Request {
                         id: "shutdown-race".into(),
                         method: api::schema::Method::WorkspaceRename(

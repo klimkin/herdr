@@ -127,11 +127,12 @@ impl Session {
         self.server = Some(command.spawn()?);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if self.api("pane.list", json!({})).is_ok() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err("owned server startup timed out".into());
+            match self.api("pane.list", json!({})) {
+                Ok(_) => return Ok(()),
+                Err(error) if Instant::now() >= deadline => {
+                    return Err(format!("owned server startup timed out: {error}").into())
+                }
+                Err(_) => {}
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -187,6 +188,11 @@ impl Session {
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
         let input = platform::InputWriter::new(pair.master.take_writer()?);
+        #[cfg(windows)]
+        let mut input = input;
+        #[cfg(windows)]
+        // ConPTY requests an inherited cursor position before starting the child.
+        input.write_all(b"\x1b[1;1R")?;
         let screen = Arc::new(Mutex::new(observer::Observer::new(120, 40)?));
         let screen_thread = screen.clone();
         let (sender, completed) = mpsc::channel();

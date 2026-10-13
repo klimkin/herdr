@@ -615,7 +615,7 @@ fn record_opportunity_times(id: u64, times: (u64, u64)) {
     crate::latency_prof::record_at("opportunity.expires_at", id, times.1, 0, ns);
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::*;
 

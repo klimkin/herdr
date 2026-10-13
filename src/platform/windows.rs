@@ -523,9 +523,9 @@ pub(crate) fn write_existing_config(
     config_backup::write_existing(target, contents)
 }
 
-/// Windows retains cadence-based presentation.
+/// Windows supports bounded action and selected-terminal feedback.
 pub(crate) fn early_presentation_supported() -> bool {
-    false
+    true
 }
 
 #[cfg(test)]
