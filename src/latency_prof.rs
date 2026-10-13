@@ -604,6 +604,9 @@ pub(crate) struct InputStimuli {
     tail: Vec<u8>,
 }
 impl InputStimuli {
+    // Raw-byte input observation is a no-op outside latency profiling, and Windows has no direct
+    // raw stdin/PTY call site for it.
+    #[cfg_attr(not(feature = "latency-prof"), allow(dead_code))]
     pub(crate) fn observe(&mut self, bytes: &[u8], stage: &'static str, scope: u64) {
         #[cfg(feature = "latency-prof")]
         {
