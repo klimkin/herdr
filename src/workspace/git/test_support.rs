@@ -99,6 +99,8 @@ pub(super) fn write_fake_tracked_repo(root: &Path) {
 
 pub(super) fn run_git(cwd: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
+        .arg("-c")
+        .arg("safe.bareRepository=all")
         .arg("-C")
         .arg(cwd)
         .args(args)

@@ -9,6 +9,15 @@ pub(crate) fn command_for_argv_in_dir(program: &str, args: &[String], cwd: &Path
     command
 }
 
+pub(crate) fn resolve_argv_for_cwd(argv: &mut [String], cwd: &Path) {
+    let Some(program) = argv.first_mut() else {
+        return;
+    };
+    *program = program_for_cwd(program, cwd).display().to_string();
+    #[cfg(windows)]
+    resolve_cmd_shell_argv_for_cwd(argv, cwd);
+}
+
 pub(crate) fn program_for_cwd(program: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(program);
     let has_separator = program.contains('/') || (cfg!(windows) && program.contains('\\'));
@@ -24,6 +33,42 @@ pub(crate) fn program_for_cwd(program: &str, cwd: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
+}
+
+#[cfg(windows)]
+fn resolve_cmd_shell_argv_for_cwd(argv: &mut [String], cwd: &Path) {
+    if argv.len() < 3 || !is_cmd_program(Path::new(&argv[0])) {
+        return;
+    }
+    let Some(command_idx) = argv
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(idx, arg)| is_cmd_execute_switch(arg).then_some(idx + 1))
+    else {
+        return;
+    };
+    let Some(command) = argv.get_mut(command_idx) else {
+        return;
+    };
+    let resolved = program_for_cwd(command, cwd);
+    if resolved.as_os_str() != Path::new(command).as_os_str() {
+        *command = resolved.display().to_string();
+    }
+}
+
+#[cfg(windows)]
+fn is_cmd_execute_switch(arg: &str) -> bool {
+    matches!(arg.to_ascii_lowercase().as_str(), "/c" | "/k")
+}
+
+#[cfg(windows)]
+fn is_cmd_program(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
+        })
 }
 
 #[cfg(not(windows))]
@@ -153,6 +198,31 @@ mod tests {
         assert!(is_windows_batch_file_name(OsStr::new("script.BAT")));
         assert!(!is_windows_batch_file_name(OsStr::new("node.exe")));
         assert!(!is_windows_batch_file_name(OsStr::new("node")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolves_cmd_execute_target_against_working_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-plugin-cmd-resolution-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create cmd resolution fixture");
+        std::fs::write(root.join("slot.cmd"), "@echo off\r\n").expect("write cmd fixture");
+        let mut argv = vec![
+            "cmd.exe".to_string(),
+            "/d".to_string(),
+            "/c".to_string(),
+            "slot.cmd".to_string(),
+            "path".to_string(),
+        ];
+
+        resolve_argv_for_cwd(&mut argv, &root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(argv[0], "cmd.exe");
+        assert_eq!(Path::new(&argv[3]), root.join("slot.cmd"));
+        assert_eq!(argv[4], "path");
     }
 
     #[cfg(windows)]
