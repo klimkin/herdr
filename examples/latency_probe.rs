@@ -16,7 +16,7 @@ fn emit(output: &Mutex<std::io::Stdout>, marker: &str, row: u16) -> std::io::Res
     let mut output = output
         .lock()
         .map_err(|_| std::io::Error::other("output lock poisoned"))?;
-    write!(output, "\x1b[{row};1H{marker}\x1b[K")?;
+    output.write_all(format!("\x1b[{row};1H{marker}\x1b[K").as_bytes())?;
     output.flush()
 }
 
