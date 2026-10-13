@@ -482,12 +482,10 @@ impl App {
         ) {
             return encode_error(id, code, message);
         }
-        pane.command[0] = crate::plugin_command::program_for_cwd(
-            &pane.command[0],
+        crate::plugin_command::resolve_argv_for_cwd(
+            &mut pane.command,
             std::path::Path::new(&plugin.plugin_root),
-        )
-        .display()
-        .to_string();
+        );
         let placement = params.placement.unwrap_or(pane.placement);
         if placement != PluginPanePlacement::Popup
             && (params.width.is_some() || params.height.is_some())
