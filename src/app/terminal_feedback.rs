@@ -159,9 +159,9 @@ impl super::App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     use crate::app::early_presentation::{EarlyPresentation, Opportunity};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     use std::time::Instant;
 
     #[test]
@@ -175,14 +175,14 @@ mod tests {
         assert_eq!(input_watermark(u64::MAX), None);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn ready(app: &mut super::super::App, revision: u64) -> Option<Opportunity> {
         app.early_presentation.oldest_ready(Instant::now(), |opportunity| {
             matches!(opportunity.work, Work::Terminal { baseline_revision, .. } if revision > baseline_revision)
         })
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[tokio::test]
     async fn input_during_terminal_update_preserves_later_feedback() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

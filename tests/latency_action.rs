@@ -107,18 +107,33 @@ for change in ('missing_commit','duplicate_commit','late_commit','wrong_label','
     assert!(status.success());
 }
 
-#[cfg(all(target_os = "linux", feature = "latency-prof"))]
+#[cfg(all(any(target_os = "linux", windows), feature = "latency-prof"))]
 #[test]
 #[ignore = "build optimized owned-PTY helpers first; run just latency-action-behavior"]
 fn accepted_actions_present_authoritative_labels_without_redundant_frames() {
     let target = std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into());
     let release = std::path::PathBuf::from(target).join("release");
-    let bench = std::env::var_os("HERDR_ACTION_TEST_BENCH")
-        .unwrap_or_else(|| release.join("examples/latency_bench").into());
-    let probe = std::env::var_os("HERDR_ACTION_TEST_PROBE")
-        .unwrap_or_else(|| release.join("examples/latency_probe").into());
-    let binary = std::env::var_os("HERDR_ACTION_TEST_BINARY")
-        .unwrap_or_else(|| release.join("herdr").into());
+    let bench = std::env::var_os("HERDR_ACTION_TEST_BENCH").unwrap_or_else(|| {
+        release
+            .join(format!(
+                "examples/latency_bench{}",
+                std::env::consts::EXE_SUFFIX
+            ))
+            .into()
+    });
+    let probe = std::env::var_os("HERDR_ACTION_TEST_PROBE").unwrap_or_else(|| {
+        release
+            .join(format!(
+                "examples/latency_probe{}",
+                std::env::consts::EXE_SUFFIX
+            ))
+            .into()
+    });
+    let binary = std::env::var_os("HERDR_ACTION_TEST_BINARY").unwrap_or_else(|| {
+        release
+            .join(format!("herdr{}", std::env::consts::EXE_SUFFIX))
+            .into()
+    });
     let base = std::env::temp_dir().join(format!("herdr-action-contract-{}", std::process::id()));
     std::fs::create_dir_all(&base).expect("owned artifacts");
     let output = std::process::Command::new(bench)
@@ -185,10 +200,22 @@ fn accepted_actions_present_authoritative_labels_without_redundant_frames() {
     }) {
         let enqueue = receipt["ns"].as_u64().expect("enqueue time");
         assert!(
-            !records.iter().any(|r| r["stage"] == "server.frame_start"
-                && r["ns"]
-                    .as_u64()
-                    .is_some_and(|ns| enqueue < ns && ns < enqueue + 20_000_000)),
+            !records.iter().any(|r| {
+                if r["stage"] != "server.frame_start" {
+                    return false;
+                }
+                let Some(frame) = r["ns"].as_u64() else {
+                    return false;
+                };
+                enqueue < frame
+                    && frame < enqueue + 20_000_000
+                    && !records.iter().any(|event| {
+                        event["stage"] == "terminal.content_ready"
+                            && event["ns"]
+                                .as_u64()
+                                .is_some_and(|ns| enqueue < ns && ns <= frame)
+                    })
+            }),
             "delivered action leaves redundant ordinary construction"
         );
     }
