@@ -210,10 +210,13 @@ fn accepted_actions_present_authoritative_labels_without_redundant_frames() {
                 enqueue < frame
                     && frame < enqueue + 20_000_000
                     && !records.iter().any(|event| {
-                        event["stage"] == "terminal.content_ready"
-                            && event["ns"]
-                                .as_u64()
-                                .is_some_and(|ns| enqueue < ns && ns <= frame)
+                        // Cursor settling can create real presentation work without new bytes.
+                        matches!(
+                            event["stage"].as_str(),
+                            Some("terminal.content_ready" | "render.notify_delayed")
+                        ) && event["ns"]
+                            .as_u64()
+                            .is_some_and(|ns| enqueue < ns && ns <= frame)
                     })
             }),
             "delivered action leaves redundant ordinary construction"

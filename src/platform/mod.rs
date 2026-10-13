@@ -49,10 +49,10 @@ async fn wait_portable_deadline(deadline: Option<std::time::Instant>) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub(super) struct PortableDeadlineWaiter;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 impl PortableDeadlineWaiter {
     pub(super) fn new() -> std::io::Result<Self> {
         Ok(Self)
