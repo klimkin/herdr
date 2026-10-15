@@ -720,7 +720,7 @@ pub(crate) struct QueuedFrame {
     pub(crate) context: TraceContext,
 }
 
-#[cfg(any(feature = "latency-prof", test))]
+#[cfg(any(feature = "latency-prof", all(test, unix)))]
 pub(crate) fn queued_frames(bytes: &[u8], connection: u64) -> Vec<QueuedFrame> {
     #[cfg(feature = "latency-prof")]
     {

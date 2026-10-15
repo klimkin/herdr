@@ -445,6 +445,7 @@ fn main() -> Result<()> {
     }
     let slow_reader_ms: u64 = argument("--slow-reader-ms", "0").parse()?;
     let interval_ms: u64 = argument("--interval-ms", "30").parse()?;
+    let idle_ms: u64 = argument("--idle-ms", "60000").parse()?;
     let load_hz: u64 = argument("--load-hz", "60").parse()?;
     let path = argument("--path", "output");
     let load = argument("--load", "quiet");
@@ -456,7 +457,9 @@ fn main() -> Result<()> {
         || max_pending == 0
         || max_pending > 4096
         || warmups > 1000
-        || interval_ms > 10000
+        || (path != "idle" && interval_ms > 10000)
+        || idle_ms == 0
+        || idle_ms > 300000
         || count == 0
         || count > 100_000
         || clients == 0
@@ -471,8 +474,9 @@ fn main() -> Result<()> {
         || !matches!(action_phase.as_str(), "none" | "output")
         || (action_phase == "output"
             && (path != "action" || action_entry != "json" || load != "quiet"))
-        || !matches!(path.as_str(), "output" | "echo" | "action")
+        || !matches!(path.as_str(), "output" | "echo" | "action" | "idle")
         || !matches!(load.as_str(), "quiet" | "visible" | "hidden")
+        || (path == "idle" && load != "quiet")
     {
         return Err("invalid sample/client/pane count, path, or load".into());
     }
@@ -618,6 +622,60 @@ fn main() -> Result<()> {
         }
     }
     control_reader.get_ref().set_read_timeout(None)?;
+    if path == "idle" {
+        let started_ns = platform::monotonic_ns()?;
+        std::thread::sleep(Duration::from_millis(idle_ms));
+        let finished_ns = platform::monotonic_ns()?;
+        let observer_cost = session.clients.iter().map(|client| json!({"parse_ns":client.observer_ns.load(Ordering::Relaxed),"bytes":client.observer_bytes.load(Ordering::Relaxed)})).collect::<Vec<_>>();
+        let binary_sha256 = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(std::fs::read(&session.binary)?))
+        };
+        let report = json!({
+            "run_id": run_id,
+            "path": path,
+            "load": load,
+            "load_hz": load_hz,
+            "panes": panes,
+            "clients": clients,
+            "samples": [],
+            "summary": [],
+            "started_ns": started_ns,
+            "finished_ns": finished_ns,
+            "duration_ns": finished_ns - started_ns,
+            "idle_ms": idle_ms,
+            "warmups": warmups,
+            "burst": burst,
+            "max_pending": max_pending,
+            "interval_ms": interval_ms,
+            "seed": 92341,
+            "layout": layout,
+            "pane_ids": pane_ids,
+            "estimated_pane_areas": areas,
+            "pane_layout": pane_layout,
+            "slow_reader_ms": slow_reader_ms,
+            "stall_ms": stall_ms,
+            "action_entry": action_entry,
+            "action_phase": action_phase,
+            "observer_cost": observer_cost,
+            "binary_sha256": binary_sha256,
+            "server_pid": session.server.as_ref().map(std::process::Child::id),
+            "client_pids": session.clients.iter().map(|client| client.child.process_id()).collect::<Vec<_>>(),
+            "base": session.base,
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "clock_validation_ns": [before, helper, after],
+            "geometry": [120, 40],
+            "endpoint": "owned server and outer PTY left idle after helper readiness"
+        });
+        std::fs::write(
+            output.join("samples.json"),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report["summary"])?);
+        println!("Report: {}", output.join("samples.json").display());
+        return Ok(());
+    }
     let (write_sender, write_times) = mpsc::channel();
     let (stop_sender, stopped) = mpsc::channel();
     std::thread::spawn(move || loop {
