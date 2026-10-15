@@ -289,6 +289,7 @@ impl HeadlessServer {
         self.render_retained_pane_surface_traced(
             pty_sources,
             crate::latency_prof::TraceContext::default(),
+            None,
         )
     }
 
@@ -296,8 +297,9 @@ impl HeadlessServer {
         &mut self,
         pty_sources: &HashSet<crate::layout::PaneId>,
         context: crate::latency_prof::TraceContext,
+        interactive_at: Option<Instant>,
     ) -> bool {
-        self.render_retained_pane_surface_selected(pty_sources, context, None)
+        self.render_retained_pane_surface_selected(pty_sources, context, None, interactive_at)
             != RetainedOutcome::Fallback
     }
 
@@ -311,6 +313,7 @@ impl HeadlessServer {
             &HashSet::from([source]),
             context,
             Some(instance),
+            None,
         )
     }
 
@@ -319,6 +322,7 @@ impl HeadlessServer {
         pty_sources: &HashSet<crate::layout::PaneId>,
         context: crate::latency_prof::TraceContext,
         selected_instance: Option<u64>,
+        interactive_at: Option<Instant>,
     ) -> RetainedOutcome {
         let attempt = crate::latency_prof::AttemptTrace::begin(context, true, self.clients.len());
         crate::latency_prof::zone!("server.retained_render");
@@ -999,6 +1003,7 @@ impl HeadlessServer {
                         client.shell_graphics_delivery = delivery;
                     }
                     if graphics_pending {
+                        client.ordinary_drain_recovery = None;
                         client.defer_full_render();
                     } else {
                         client.clear_deferred_render();
@@ -1039,6 +1044,18 @@ impl HeadlessServer {
                         }
                     } else {
                         client.defer_full_render();
+                        if let Some(now) = interactive_at.filter(|_| {
+                            graphics_delivery.is_none()
+                                && native_upload.is_none()
+                                && !self.native_graphics.is_pending(client_id)
+                        }) {
+                            self.preserve_ordinary_drain_recovery(
+                                client_id,
+                                pty_sources,
+                                prepared.incorporated_panes(),
+                                now,
+                            );
+                        }
                     }
                     deferred += 1;
                 }

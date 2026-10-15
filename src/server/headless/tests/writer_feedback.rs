@@ -1,5 +1,482 @@
 use super::*;
 
+struct OrdinaryDrainFixture {
+    server: HeadlessServer,
+    pane: crate::layout::PaneId,
+    writer: ClientWriter,
+    peer: std::sync::mpsc::Receiver<Vec<u8>>,
+    input_at: Instant,
+}
+
+fn rejected_ordinary_echo() -> OrdinaryDrainFixture {
+    let mut server = test_headless_server();
+    let pane = install_shared_view_test_runtime(&mut server);
+    let (control, render) = connect_matching_test_shell(&mut server, 27);
+    let _ = control.recv().unwrap();
+    let (peer_control, peer) = connect_matching_test_shell(&mut server, 28);
+    let _ = peer_control.recv().unwrap();
+    server.render_and_stream();
+    let _ = render.recv().unwrap();
+    let _ = peer.recv().unwrap();
+    server.app.render_dirty.take();
+    server.sync_immediate_pty_sources();
+
+    let writer = ClientWriter::test_paused();
+    server.clients.get_mut(&27).unwrap().writer = Some(writer.clone());
+    write_shared_test_pane(&mut server, pane, b"\rOLDER");
+    server.app.render_dirty.request_pty(pane);
+    let older = server.app.render_dirty.take_pending();
+    assert!(server.render_retained_pane_surface_and_stream(&older.request.pty_sources));
+    older.complete();
+    let _ = peer.recv().unwrap();
+    let baseline = server.clients[&27]
+        .render_state
+        .last_pane_surface()
+        .unwrap()
+        .clone();
+
+    let input_at = Instant::now() + Duration::from_secs(1);
+    let echo_at = input_at + Duration::from_millis(1);
+    server.note_interactive_input(pane, input_at);
+    write_shared_test_pane(&mut server, pane, b"\rECHO");
+    server.app.render_dirty.request_pty(pane);
+    assert!(server.can_render_interactive(echo_at));
+    let echo = server.app.render_dirty.take_pending();
+    assert!(server.render_retained_pane_surface_traced(
+        &echo.request.pty_sources,
+        crate::latency_prof::TraceContext::default(),
+        Some(echo_at),
+    ));
+    echo.complete();
+    server.app.record_render_attempt(echo_at, true);
+    server.record_interactive_render(echo_at);
+    assert_eq!(server.clients[&27].deferred_render(), DeferredRender::Full);
+    assert_eq!(
+        server.clients[&27].render_state.last_pane_surface(),
+        Some(&baseline)
+    );
+    assert!(!server.app.render_dirty.is_pending());
+    assert!(matches!(
+        read_server_message(peer.recv().unwrap()),
+        ServerMessage::PaneSurfacePatch(_)
+    ));
+    assert_eq!(server.ready_ordinary_drain_recovery(echo_at), None);
+    OrdinaryDrainFixture {
+        server,
+        pane,
+        writer,
+        peer,
+        input_at,
+    }
+}
+
+fn drain_ordinary_writer(server: &mut HeadlessServer, writer: &ClientWriter) {
+    assert_eq!(writer.test_drain().len(), 1);
+    assert_eq!(
+        server.handle_server_event_with_render_impact(ServerEvent::ClientWriterDrained {
+            client_id: 27
+        }),
+        RenderImpact::None,
+    );
+    assert!(!server.app.render_dirty.is_pending());
+}
+
+fn assert_recovered_echo(server: &HeadlessServer, writer: &ClientWriter) {
+    let recovered = writer.test_drain();
+    assert_eq!(recovered.len(), 1);
+    let ServerMessage::PaneSurface(surface) =
+        read_server_message(recovered.into_iter().next().unwrap())
+    else {
+        panic!("ordinary drain needs a full recovery surface");
+    };
+    assert!(frame_text(&surface.frame).contains("ECHO"));
+    assert_eq!(
+        server.clients[&27]
+            .render_state
+            .last_pane_surface()
+            .unwrap()
+            .surface_revision,
+        surface.surface_revision
+    );
+    assert_eq!(server.clients[&27].deferred_render(), DeferredRender::None);
+}
+
+#[tokio::test]
+async fn ordinary_writer_drain_retries_interactive_echo_before_cadence() {
+    let OrdinaryDrainFixture {
+        mut server,
+        writer,
+        peer,
+        input_at,
+        ..
+    } = rejected_ordinary_echo();
+    let drained_at = input_at + Duration::from_millis(2);
+    let previous_revision = server.clients[&27]
+        .render_state
+        .last_pane_surface()
+        .unwrap()
+        .surface_revision;
+    drain_ordinary_writer(&mut server, &writer);
+    assert!(!server.app.can_render_now(drained_at));
+    assert!(!server.app.can_present_now(drained_at));
+    assert_eq!(
+        server.ready_ordinary_drain_recovery(drained_at),
+        Some(27),
+        "drained rejected echo should recover while its input lease is live"
+    );
+    server.render_ordinary_drain_recovery_traced(
+        27,
+        drained_at,
+        crate::latency_prof::TraceContext::default(),
+    );
+    assert_recovered_echo(&server, &writer);
+    assert!(
+        server.clients[&27]
+            .render_state
+            .last_pane_surface()
+            .unwrap()
+            .surface_revision
+            > previous_revision
+    );
+    assert_eq!(server.interactive_render_budget.unwrap().1, 2);
+    assert!(
+        peer.try_recv().is_err(),
+        "healthy peer receives no recovery frame"
+    );
+    assert_eq!(server.ready_ordinary_drain_recovery(drained_at), None);
+    assert!(!server.has_ready_feedback_recovery());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn ordinary_writer_drain_recovers_accepted_nonfocused_input() {
+    let mut server = test_headless_server();
+    let focused = install_shared_view_test_runtime(&mut server);
+    let pane = server.app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            80, 23, 0, b"BASE", 4,
+        );
+    server.app.state.workspaces[0].insert_test_runtime(pane, runtime);
+    server.app.state.workspaces[0].tabs[0]
+        .layout
+        .focus_pane(focused);
+    let (control, render) = connect_matching_test_shell(&mut server, 27);
+    let _ = control.recv().unwrap();
+    server.render_and_stream();
+    let _ = render.recv().unwrap();
+    server.app.render_dirty.take();
+    server.sync_immediate_pty_sources();
+    let writer = ClientWriter::test_paused();
+    server.clients.get_mut(&27).unwrap().writer = Some(writer.clone());
+    write_shared_test_pane(&mut server, pane, b"\rOLDER");
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane])));
+    let public_pane = server.app.public_pane_id(0, pane).unwrap();
+    server.handle_server_event(ServerEvent::ClientShellPaneInput {
+        client_id: 27,
+        pane_id: public_pane,
+        events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+            "e".into(),
+        )],
+    });
+    assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"e"));
+    assert_eq!(
+        server.app.state.workspaces[0].tabs[0].layout.focused(),
+        focused
+    );
+    let input_at = server.interactive_input_deadlines[&pane] - INTERACTIVE_RENDER_WINDOW;
+    let echo_at = input_at + Duration::from_millis(1);
+    write_shared_test_pane(&mut server, pane, b"\rECHO");
+    server.app.render_dirty.request_pty(pane);
+    let echo = server.app.render_dirty.take_pending();
+    assert!(server.render_retained_pane_surface_traced(
+        &echo.request.pty_sources,
+        crate::latency_prof::TraceContext::default(),
+        Some(echo_at)
+    ));
+    echo.complete();
+    server.app.record_render_attempt(echo_at, true);
+    drain_ordinary_writer(&mut server, &writer);
+    assert_eq!(
+        server.select_render(echo_at, false, false, false),
+        Some(render::RenderAdmission::DrainRecovery(27))
+    );
+    server.app.state.workspaces[0].tabs[0].zoomed = true;
+    assert_eq!(
+        server.ready_ordinary_drain_recovery(echo_at),
+        None,
+        "zoom hides the accepted input target"
+    );
+    server.app.state.workspaces[0].tabs[0].zoomed = false;
+    server.render_ordinary_drain_recovery_traced(
+        27,
+        echo_at,
+        crate::latency_prof::TraceContext::default(),
+    );
+    assert_recovered_echo(&server, &writer);
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn ordinary_writer_drain_batch_admission_preserves_unrelated_deadlines() {
+    let OrdinaryDrainFixture {
+        mut server,
+        writer,
+        input_at,
+        ..
+    } = rejected_ordinary_echo();
+    let now = input_at + Duration::from_millis(15);
+    assert_eq!(server.select_render(now, false, false, false), None);
+    let ordinary_deadline = input_at + Duration::from_millis(1) + crate::app::MIN_RENDER_INTERVAL;
+    assert!(!server
+        .app
+        .can_render_now(ordinary_deadline - Duration::from_nanos(1)));
+    assert!(server.app.can_render_now(ordinary_deadline));
+    assert!(!server
+        .app
+        .can_present_now(ordinary_deadline - Duration::from_nanos(1)));
+    assert!(server.app.can_present_now(ordinary_deadline));
+    drain_ordinary_writer(&mut server, &writer);
+    assert_eq!(
+        server.select_render(now, false, false, false),
+        Some(render::RenderAdmission::DrainRecovery(27)),
+        "a drain handled after the turn's work sample must admit recovery immediately",
+    );
+    server.app.render_dirty.request_generic();
+    server.render_ordinary_drain_recovery_traced(
+        27,
+        now,
+        crate::latency_prof::TraceContext::default(),
+    );
+    assert_recovered_echo(&server, &writer);
+    assert!(!server
+        .app
+        .can_render_now(ordinary_deadline - Duration::from_nanos(1)));
+    assert!(server.app.can_render_now(ordinary_deadline));
+    assert!(!server
+        .app
+        .can_present_now(ordinary_deadline - Duration::from_nanos(1)));
+    assert!(server.app.can_present_now(ordinary_deadline));
+    assert!(server.app.render_dirty.is_pending());
+    assert_eq!(
+        server.select_render(ordinary_deadline, true, true, false),
+        Some(render::RenderAdmission::Ordinary { interactive: false }),
+        "unrelated work retains its original cadence",
+    );
+    let unrelated = server.app.render_dirty.take_pending();
+    assert!(unrelated.request.generic);
+    assert!(unrelated.request.pty_sources.is_empty());
+    unrelated.complete();
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn ordinary_writer_drain_retry_preserves_expiry_and_waits_for_next_drain() {
+    let OrdinaryDrainFixture {
+        mut server,
+        pane,
+        writer,
+        peer,
+        input_at,
+    } = rejected_ordinary_echo();
+    for millis in [2, 3] {
+        drain_ordinary_writer(&mut server, &writer);
+        let now = input_at + Duration::from_millis(millis);
+        assert_eq!(server.ready_ordinary_drain_recovery(now), Some(27));
+        writer.test_fill_render(vec![0]);
+        server.render_ordinary_drain_recovery_traced(
+            27,
+            now,
+            crate::latency_prof::TraceContext::default(),
+        );
+        assert_eq!(server.ready_ordinary_drain_recovery(now), None);
+        assert!(
+            !server.has_ready_feedback_recovery(),
+            "rejected retry must wait for actual writer drain"
+        );
+        assert_eq!(server.clients[&27].deferred_render(), DeferredRender::Full);
+    }
+    server.note_interactive_input(pane, input_at + Duration::from_millis(20));
+    drain_ordinary_writer(&mut server, &writer);
+    assert_eq!(
+        server.ready_ordinary_drain_recovery(
+            input_at + INTERACTIVE_RENDER_WINDOW - Duration::from_nanos(1)
+        ),
+        Some(27)
+    );
+    let expired_at = input_at + INTERACTIVE_RENDER_WINDOW;
+    assert_eq!(
+        server.ready_ordinary_drain_recovery(expired_at),
+        None,
+        "new input must not renew rejected delivery"
+    );
+    assert!(server.has_ready_feedback_recovery());
+    assert!(server.app.can_render_now(expired_at));
+    server.render_feedback_recovery_traced(crate::latency_prof::TraceContext::default());
+    assert_recovered_echo(&server, &writer);
+    assert!(peer.try_recv().is_err());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn ordinary_writer_drain_budget_exhaustion_keeps_cadence_recovery() {
+    let OrdinaryDrainFixture {
+        mut server,
+        writer,
+        peer,
+        input_at,
+        ..
+    } = rejected_ordinary_echo();
+    drain_ordinary_writer(&mut server, &writer);
+    let now = input_at + Duration::from_millis(2);
+    server.interactive_render_budget = Some((now, INTERACTIVE_RENDER_BUDGET));
+    assert_eq!(server.ready_ordinary_drain_recovery(now), None);
+    assert!(server.has_ready_feedback_recovery());
+    assert_eq!(server.clients[&27].deferred_render(), DeferredRender::Full);
+    assert!(!server.app.can_render_now(now));
+    assert!(server
+        .app
+        .can_render_now(now + crate::app::MIN_RENDER_INTERVAL));
+    server.render_feedback_recovery_traced(crate::latency_prof::TraceContext::default());
+    assert_recovered_echo(&server, &writer);
+    assert!(peer.try_recv().is_err());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn ordinary_writer_drain_synchronization_waits_for_producer() {
+    let OrdinaryDrainFixture {
+        mut server,
+        pane,
+        writer,
+        peer,
+        input_at,
+    } = rejected_ordinary_echo();
+    write_shared_test_pane(&mut server, pane, b"\x1b[?2026h");
+    drain_ordinary_writer(&mut server, &writer);
+    let now = input_at + Duration::from_millis(2);
+    assert_eq!(server.ready_ordinary_drain_recovery(now), None);
+    assert!(
+        !server.has_ready_feedback_recovery(),
+        "synchronized producer owns the next wake"
+    );
+    assert_eq!(server.clients[&27].deferred_render(), DeferredRender::Full);
+    write_shared_test_pane(&mut server, pane, b"\x1b[?2026l");
+    assert_eq!(server.ready_ordinary_drain_recovery(now), Some(27));
+    server.render_ordinary_drain_recovery_traced(
+        27,
+        now,
+        crate::latency_prof::TraceContext::default(),
+    );
+    assert_recovered_echo(&server, &writer);
+    assert!(peer.try_recv().is_err());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn ordinary_writer_drain_constructor_deferral_spends_one_drain() {
+    let OrdinaryDrainFixture {
+        mut server,
+        pane,
+        writer,
+        input_at,
+        ..
+    } = rejected_ordinary_echo();
+    drain_ordinary_writer(&mut server, &writer);
+    let now = input_at + Duration::from_millis(2);
+    assert_eq!(server.ready_ordinary_drain_recovery(now), Some(27));
+    write_shared_test_pane(&mut server, pane, b"\x1b[?2026h");
+    server.render_ordinary_drain_recovery_traced(
+        27,
+        now,
+        crate::latency_prof::TraceContext::default(),
+    );
+    assert!(writer.test_drain().is_empty());
+    write_shared_test_pane(&mut server, pane, b"\x1b[?2026l");
+    assert_eq!(
+        server.ready_ordinary_drain_recovery(now),
+        None,
+        "failed construction cannot reuse the drain"
+    );
+    assert!(server.has_ready_feedback_recovery());
+    server.render_feedback_recovery_traced(crate::latency_prof::TraceContext::default());
+    assert_recovered_echo(&server, &writer);
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn ordinary_writer_drain_invalidated_identity_keeps_full_obligation() {
+    for invalidation in [
+        "repaint",
+        "projection",
+        "geometry",
+        "cell_size",
+        "runtime",
+        "source",
+        "inactive",
+        "handoff",
+    ] {
+        let OrdinaryDrainFixture {
+            mut server,
+            pane,
+            writer,
+            input_at,
+            ..
+        } = rejected_ordinary_echo();
+        match invalidation {
+            "repaint" => server.clients.get_mut(&27).unwrap().request_repaint(),
+            "projection" => {
+                server
+                    .clients
+                    .get_mut(&27)
+                    .unwrap()
+                    .shell_projection_revision += 1
+            }
+            "geometry" => server.clients.get_mut(&27).unwrap().terminal_size.0 += 1,
+            "cell_size" => {
+                server.clients.get_mut(&27).unwrap().cell_size =
+                    crate::kitty_graphics::HostCellSize {
+                        width_px: 8,
+                        height_px: 16,
+                    }
+            }
+            "runtime" => server.app.state.workspaces[0].insert_test_runtime(
+                pane,
+                crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 23, b"NEW"),
+            ),
+            "source" => {
+                let focused = server.app.state.workspaces[0]
+                    .test_split(ratatui::layout::Direction::Horizontal);
+                server.app.state.workspaces[0].insert_test_runtime(
+                    focused,
+                    crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 23, b"OTHER"),
+                );
+                server.app.state.workspaces[0].tabs[0].zoomed = true;
+                assert_ne!(
+                    server.app.state.workspaces[0].tabs[0].layout.focused(),
+                    pane
+                );
+            }
+            "inactive" => server.clients.get_mut(&27).unwrap().shell_surface_active = false,
+            "handoff" => server.handoff_in_progress = true,
+            _ => unreachable!(),
+        }
+        drain_ordinary_writer(&mut server, &writer);
+        assert_eq!(
+            server.ready_ordinary_drain_recovery(input_at + Duration::from_millis(2)),
+            None,
+            "{invalidation}"
+        );
+        assert_eq!(
+            server.clients[&27].deferred_render(),
+            DeferredRender::Full,
+            "{invalidation}"
+        );
+        assert!(writer.test_drain().is_empty());
+        shutdown_test_runtimes(&mut server);
+    }
+}
+
 #[tokio::test]
 async fn render_drain_burst_retries_latest_deferred_output_once() {
     let mut server = test_headless_server();

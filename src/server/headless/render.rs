@@ -1,9 +1,22 @@
+use super::super::clients::OrdinaryDrainPhase;
 use super::*;
 
 /// Whether every detached ordinary source was handled or transferred to an
 /// existing recipient recovery owner. Target receipts are separate evidence.
 pub(super) struct FullRenderOutcome {
     pub(super) ordinary_work_handled: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RenderAdmission {
+    Ordinary { interactive: bool },
+    DrainRecovery(u64),
+}
+
+enum FullRenderScope {
+    Ordinary,
+    Recovery,
+    Recipient(u64),
 }
 
 impl HeadlessServer {
@@ -15,10 +28,7 @@ impl HeadlessServer {
     }
 
     pub(super) fn can_render_interactive(&self, now: Instant) -> bool {
-        if self.interactive_render_budget.is_some_and(|(epoch, used)| {
-            now.duration_since(epoch) < crate::app::MIN_RENDER_INTERVAL
-                && used >= INTERACTIVE_RENDER_BUDGET
-        }) {
+        if !self.interactive_render_budget_available(now) {
             return false;
         }
         self.app
@@ -28,6 +38,157 @@ impl HeadlessServer {
                     .get(&pane_id)
                     .is_some_and(|deadline| *deadline > now)
             })
+    }
+
+    fn interactive_render_budget_available(&self, now: Instant) -> bool {
+        self.interactive_render_budget.is_none_or(|(epoch, used)| {
+            now.duration_since(epoch) >= crate::app::MIN_RENDER_INTERVAL
+                || used < INTERACTIVE_RENDER_BUDGET
+        })
+    }
+
+    pub(super) fn preserve_ordinary_drain_recovery(
+        &mut self,
+        client_id: u64,
+        sources: &HashSet<crate::layout::PaneId>,
+        incorporated: Option<&[crate::protocol::PaneSurfacePane]>,
+        now: Instant,
+    ) {
+        let Some(client) = self.clients.get(&client_id) else {
+            return;
+        };
+        if client.ordinary_drain_recovery.is_some() || !client.is_active_shell_client() {
+            return;
+        }
+        let Some(delivery_epoch) = client.render_state.delivery_epoch() else {
+            return;
+        };
+        let Some((pane, runtime_instance, expires_at)) = incorporated
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let (workspace, pane) = self.app.parse_pane_id(&item.pane_id)?;
+                let expires_at = *self.interactive_input_deadlines.get(&pane)?;
+                if expires_at <= now
+                    || !sources.contains(&pane)
+                    || !self.shell_client_views_pane(client_id, workspace, pane)
+                {
+                    return None;
+                }
+                let runtime = self.app.state.runtime_for_pane_in_workspace(
+                    &self.app.terminal_runtimes,
+                    workspace,
+                    pane,
+                )?;
+                Some((pane, runtime.runtime_instance(), expires_at))
+            })
+            .min_by_key(|(_, _, deadline)| *deadline)
+        else {
+            return;
+        };
+        let lease = super::super::clients::OrdinaryDrainRecovery {
+            phase: OrdinaryDrainPhase::WaitingForDrain,
+            pane,
+            runtime_instance,
+            projection_revision: client.shell_projection_revision,
+            terminal_size: client.terminal_size,
+            cell_size: client.cell_size,
+            delivery_epoch,
+            expires_at,
+        };
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.ordinary_drain_recovery = Some(lease);
+        }
+    }
+
+    pub(super) fn ready_ordinary_drain_recovery(&self, now: Instant) -> Option<u64> {
+        if !self.interactive_render_budget_available(now)
+            || self.app.state.popup_pane.is_some()
+            || self.handoff_in_progress
+        {
+            return None;
+        }
+        self.feedback_recovery.iter().copied().find(|id| {
+            let Some(client) = self.clients.get(id) else {
+                return false;
+            };
+            let Some(lease) = &client.ordinary_drain_recovery else {
+                return false;
+            };
+            client.render_pending
+                && lease.phase == OrdinaryDrainPhase::Ready
+                && client.pending_feedback.is_none()
+                && lease.expires_at > now
+                && client.terminal_size == lease.terminal_size
+                && client.cell_size == lease.cell_size
+                && client.shell_projection_revision == lease.projection_revision
+                && client.render_state.delivery_epoch() == Some(lease.delivery_epoch)
+                && !client.render_state.requires_recompute()
+                && self
+                    .app
+                    .find_pane(lease.pane)
+                    .is_some_and(|(workspace, _)| {
+                        self.shell_client_views_pane(*id, workspace, lease.pane)
+                            && self
+                                .app
+                                .state
+                                .runtime_for_pane_in_workspace(
+                                    &self.app.terminal_runtimes,
+                                    workspace,
+                                    lease.pane,
+                                )
+                                .is_some_and(|runtime| {
+                                    runtime.runtime_instance() == lease.runtime_instance
+                                })
+                    })
+                && self.feedback_recovery_ready(*id)
+        })
+    }
+
+    pub(super) fn select_render(
+        &self,
+        now: Instant,
+        needs_render: bool,
+        needs_full_render: bool,
+        needs_graphics_render: bool,
+    ) -> Option<RenderAdmission> {
+        if !needs_render && !self.has_ready_feedback_recovery() {
+            return None;
+        }
+        if self.app.can_render_now(now)
+            || (self.app.can_present_now(now)
+                && self.has_pending_presentation_work(needs_full_render, needs_graphics_render))
+        {
+            return Some(RenderAdmission::Ordinary { interactive: false });
+        }
+        if self.can_render_interactive(now) {
+            return Some(RenderAdmission::Ordinary { interactive: true });
+        }
+        self.ready_ordinary_drain_recovery(now)
+            .map(RenderAdmission::DrainRecovery)
+    }
+
+    pub(super) fn render_ordinary_drain_recovery_traced(
+        &mut self,
+        client_id: u64,
+        now: Instant,
+        context: crate::latency_prof::TraceContext,
+    ) {
+        if let Some(lease) = self
+            .clients
+            .get_mut(&client_id)
+            .and_then(|client| client.ordinary_drain_recovery.as_mut())
+        {
+            lease.phase = OrdinaryDrainPhase::WaitingForDrain;
+        }
+        #[cfg(feature = "latency-prof")]
+        crate::latency_prof::record("ordinary.drain_recovery.begin", client_id, 0);
+        self.record_interactive_render(now);
+        self.render_and_stream_impl(
+            MAX_GRAPHICS_FRAME_SIZE,
+            context,
+            FullRenderScope::Recipient(client_id),
+        );
     }
 
     pub(super) fn record_interactive_render(&mut self, now: Instant) {
@@ -460,14 +621,14 @@ impl HeadlessServer {
         &mut self,
         context: crate::latency_prof::TraceContext,
     ) -> FullRenderOutcome {
-        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context, false)
+        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context, FullRenderScope::Ordinary)
     }
 
     pub(super) fn render_feedback_recovery_traced(
         &mut self,
         context: crate::latency_prof::TraceContext,
     ) {
-        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context, true);
+        self.render_and_stream_impl(MAX_GRAPHICS_FRAME_SIZE, context, FullRenderScope::Recovery);
     }
 
     #[cfg(all(test, unix))]
@@ -480,7 +641,7 @@ impl HeadlessServer {
         self.render_and_stream_impl(
             graphics_frame_limit,
             crate::latency_prof::TraceContext::default(),
-            false,
+            FullRenderScope::Ordinary,
         );
     }
 
@@ -488,8 +649,9 @@ impl HeadlessServer {
         &mut self,
         graphics_frame_limit: usize,
         context: crate::latency_prof::TraceContext,
-        recovery_only: bool,
+        scope: FullRenderScope,
     ) -> FullRenderOutcome {
+        let recovery_only = !matches!(scope, FullRenderScope::Ordinary);
         let mut outcome = FullRenderOutcome {
             ordinary_work_handled: true,
         };
@@ -499,7 +661,12 @@ impl HeadlessServer {
         let mut render_targets = render_targets(&self.clients, self.foreground_client_id);
         if recovery_only {
             render_targets.retain(|(id, _, _, _, _)| {
-                self.feedback_recovery.contains(id) && self.feedback_recovery_ready(*id)
+                self.feedback_recovery.contains(id)
+                    && self.feedback_recovery_ready(*id)
+                    && match scope {
+                        FullRenderScope::Recipient(recipient) => *id == recipient,
+                        _ => true,
+                    }
             });
         }
         render_targets.retain(|(id, _, _, _, _)| {
@@ -1107,6 +1274,7 @@ impl HeadlessServer {
                         !shell_graphics_pending && !shell_assets_deferred,
                     );
                     if shell_graphics_pending || shell_assets_deferred {
+                        client.ordinary_drain_recovery = None;
                         client.defer_full_render();
                     } else {
                         client.clear_deferred_render();
