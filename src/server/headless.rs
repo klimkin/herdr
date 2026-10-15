@@ -647,13 +647,12 @@ impl HeadlessServer {
             // 7. Render virtually and stream frames. Hidden-only PTY work keeps a
             // bounded classification cadence without delaying presentation work
             // that joins the same coalesced request.
-            let render_cadence_due = self.app.can_render_now(now);
-            let presentation_due = self.app.can_present_now(now)
-                && self.has_pending_presentation_work(needs_full_render, needs_graphics_render);
-            let interactive_due = needs_render
-                && !render_cadence_due
-                && !presentation_due
-                && self.can_render_interactive(now);
+            let admission =
+                self.select_render(now, needs_render, needs_full_render, needs_graphics_render);
+            let interactive_due = matches!(
+                admission,
+                Some(render::RenderAdmission::Ordinary { interactive: true })
+            );
             #[cfg(feature = "latency-prof")]
             if needs_render {
                 let deadline = self.app.render_attempt_deadline(now);
@@ -669,9 +668,22 @@ impl HeadlessServer {
                 );
             }
             if needs_render {
-                crate::latency_prof::record("render.gate", 0, u64::from(render_cadence_due));
+                crate::latency_prof::record(
+                    "render.gate",
+                    0,
+                    u64::from(self.app.can_render_now(now)),
+                );
             }
-            if needs_render && (render_cadence_due || presentation_due || interactive_due) {
+            if let Some(render::RenderAdmission::DrainRecovery(client_id)) = admission {
+                let presentation = crate::latency_prof::PresentationTrace::selected(now, now);
+                self.render_ordinary_drain_recovery_traced(client_id, now, presentation.context());
+                needs_render = needs_full_render
+                    || needs_graphics_render
+                    || self.app.render_dirty.is_pending()
+                    || self.has_ready_feedback_recovery();
+                continue;
+            }
+            if matches!(admission, Some(render::RenderAdmission::Ordinary { .. })) {
                 #[cfg(feature = "latency-prof")]
                 let presentation = crate::latency_prof::PresentationTrace::selected(
                     now,
@@ -761,6 +773,7 @@ impl HeadlessServer {
                         || self.render_retained_pane_surface_traced(
                             &render_request.pty_sources,
                             presentation.context(),
+                            interactive_due.then_some(now),
                         ))
                 {
                     if self.has_ready_feedback_recovery() {
@@ -3041,7 +3054,22 @@ impl HeadlessServer {
                     crate::latency_prof::record("writer.feedback.orphaned", client_id, 0);
                     return false;
                 };
-                if client.feedback_recovery && client.render_pending {
+                if (client.feedback_recovery || client.ordinary_drain_recovery.is_some())
+                    && client.render_pending
+                {
+                    if let Some(lease) = &mut client.ordinary_drain_recovery {
+                        lease.phase = super::clients::OrdinaryDrainPhase::Ready;
+                        #[cfg(feature = "latency-prof")]
+                        if let Some(writer) = &client.writer {
+                            crate::latency_prof::record_at(
+                                "writer.feedback.handled",
+                                client_id,
+                                1,
+                                writer.diagnostic_scope(),
+                                crate::latency_prof::now(),
+                            );
+                        }
+                    }
                     self.feedback_recovery.insert(client_id);
                     return false;
                 }
