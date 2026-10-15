@@ -9,6 +9,16 @@ use interprocess::local_socket::traits::Stream as _;
 
 pub(crate) type LocalListener = interprocess::local_socket::Listener;
 pub(crate) type LocalStream = interprocess::local_socket::Stream;
+#[cfg(unix)]
+pub(crate) type PrivateLocalListener = LocalListener;
+#[cfg(windows)]
+pub(crate) type PrivateLocalListener = crate::platform::PrivatePipeListener;
+
+/// Largest write a nonblocking private-stream writer should attempt at once.
+#[cfg(unix)]
+pub(crate) const PRIVATE_STREAM_WRITE_CHUNK: usize = 4 * 1024;
+#[cfg(windows)]
+pub(crate) const PRIVATE_STREAM_WRITE_CHUNK: usize = crate::platform::PRIVATE_PIPE_WRITE_CHUNK;
 
 pub(crate) enum LocalStreamRead {
     Data,
@@ -176,7 +186,7 @@ pub(crate) fn set_local_stream_polling(stream: &mut LocalStream, enabled: bool) 
 
 /// Binds a listener for private terminal traffic. Unix callers restrict the
 /// socket file after binding; Windows must set the named-pipe DACL at creation.
-pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListener> {
+pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<PrivateLocalListener> {
     #[cfg(unix)]
     {
         bind_local_listener(path)
@@ -184,21 +194,7 @@ pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListen
 
     #[cfg(windows)]
     {
-        use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
-        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
-        use interprocess::os::windows::security_descriptor::SecurityDescriptor;
-        use widestring::U16CString;
-
-        let sddl = U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-        let security_descriptor = SecurityDescriptor::deserialize(&sddl)?;
-        let name = path.to_string_lossy().to_string();
-        let name = name.to_ns_name::<GenericNamespaced>()?;
-        let listener = ListenerOptions::new()
-            .name(name)
-            .reclaim_name(false)
-            .security_descriptor(security_descriptor)
-            .create_sync()?;
+        let listener = crate::platform::PrivatePipeListener::bind(path)?;
         fs::write(path, windows_socket_marker())?;
         Ok(listener)
     }
@@ -417,6 +413,35 @@ mod tests {
             LocalStreamReadCount::Data(6)
         ));
         assert_eq!(&buffer[..6], b"remote");
+
+        drop(client);
+        drop(server);
+        drop(listener);
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_named_pipe_buffers_nonblocking_write_chunks() {
+        use interprocess::local_socket::traits::Stream as _;
+        use std::io::Write as _;
+
+        let path = temp_socket_marker_path("private-pipe-chunks");
+        let _ = fs::remove_file(&path);
+        let listener = bind_private_local_listener(&path).unwrap();
+        let mut client = connect_local_stream(&path).unwrap();
+        let mut server = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+
+        // Nonblocking named-pipe writes larger than the free buffer space make no
+        // progress, so the private pipe must queue several chunks unread.
+        let chunk = vec![7_u8; PRIVATE_STREAM_WRITE_CHUNK];
+        for _ in 0..2 {
+            assert_eq!(server.write(&chunk).unwrap(), chunk.len());
+        }
+        let mut received = vec![0_u8; chunk.len() * 2];
+        client.read_exact(&mut received).unwrap();
+        assert!(received.iter().all(|byte| *byte == 7));
 
         drop(client);
         drop(server);
