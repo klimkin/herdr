@@ -181,6 +181,10 @@ pub(crate) fn connect_local_stream_with_timeout(
     .map_err(local_server_connection_error)
 }
 
+/// Largest nonblocking write that always fits an empty private pipe buffer.
+/// A nonblocking byte-mode pipe write larger than the free space makes no progress.
+pub(crate) const PRIVATE_PIPE_WRITE_CHUNK: usize = 16 * 1024;
+
 pub(crate) fn local_server_security_descriptor(
 ) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
     use windows_sys::Win32::Security::{

@@ -10,9 +10,15 @@ use interprocess::local_socket::traits::Stream as _;
 pub(crate) type LocalListener = interprocess::local_socket::Listener;
 pub(crate) type LocalStream = interprocess::local_socket::Stream;
 #[cfg(unix)]
-type PrivateLocalListener = LocalListener;
+pub(crate) type PrivateLocalListener = LocalListener;
 #[cfg(windows)]
-type PrivateLocalListener = crate::platform::PrivateLocalListener;
+pub(crate) type PrivateLocalListener = crate::platform::PrivateLocalListener;
+
+/// Largest write a nonblocking private-stream writer should attempt at once.
+#[cfg(unix)]
+pub(crate) const PRIVATE_STREAM_WRITE_CHUNK: usize = 4 * 1024;
+#[cfg(windows)]
+pub(crate) const PRIVATE_STREAM_WRITE_CHUNK: usize = crate::platform::PRIVATE_PIPE_WRITE_CHUNK;
 
 pub(crate) enum LocalStreamRead {
     Data,
@@ -422,6 +428,35 @@ mod tests {
         assert_eq!(client.write(&payload).unwrap(), payload.len());
         server.read_exact(&mut received).unwrap();
         assert_eq!(received, payload);
+
+        drop(client);
+        drop(server);
+        drop(listener);
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_named_pipe_buffers_nonblocking_write_chunks() {
+        use interprocess::local_socket::traits::Stream as _;
+        use std::io::Write as _;
+
+        let path = temp_socket_marker_path("private-pipe-chunks");
+        let _ = fs::remove_file(&path);
+        let listener = bind_private_local_listener(&path).unwrap();
+        let mut client = connect_local_stream(&path).unwrap();
+        let mut server = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+
+        // Nonblocking named-pipe writes larger than the free buffer space make no
+        // progress, so the private pipe must queue several chunks unread.
+        let chunk = vec![7_u8; PRIVATE_STREAM_WRITE_CHUNK];
+        for _ in 0..2 {
+            assert_eq!(server.write(&chunk).unwrap(), chunk.len());
+        }
+        let mut received = vec![0_u8; chunk.len() * 2];
+        client.read_exact(&mut received).unwrap();
+        assert!(received.iter().all(|byte| *byte == 7));
 
         drop(client);
         drop(server);
