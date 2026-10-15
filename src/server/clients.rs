@@ -130,6 +130,23 @@ impl ClientShellLocation {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrdinaryDrainPhase {
+    WaitingForDrain,
+    Ready,
+}
+
+pub(crate) struct OrdinaryDrainRecovery {
+    pub(crate) phase: OrdinaryDrainPhase,
+    pub(crate) pane: crate::layout::PaneId,
+    pub(crate) runtime_instance: u64,
+    pub(crate) projection_revision: u64,
+    pub(crate) terminal_size: (u16, u16),
+    pub(crate) cell_size: crate::kitty_graphics::HostCellSize,
+    pub(crate) delivery_epoch: u64,
+    pub(crate) expires_at: std::time::Instant,
+}
+
 /// A connected client tracked by the server.
 pub(crate) struct ClientConnection {
     /// Whether this connection owns the Herdr shell or one direct terminal stream.
@@ -162,6 +179,7 @@ pub(crate) struct ClientConnection {
     pub(crate) render_pending: bool,
     /// Queue-pressure recovery stays scoped to this recipient after writer drain.
     pub(crate) feedback_recovery: bool,
+    pub(crate) ordinary_drain_recovery: Option<OrdinaryDrainRecovery>,
     /// One immutable admitted patch owns the baseline until enqueue or cancellation.
     pub(crate) pending_feedback: Option<Box<super::feedback_delivery::PendingFeedback>>,
     /// Whether this connection receives pane surfaces and may affect presentation state.
@@ -245,6 +263,7 @@ impl ClientConnection {
             render_pending: false,
             pending_feedback: None,
             feedback_recovery: false,
+            ordinary_drain_recovery: None,
             shell_surface_active: true,
             shell_mouse_capture: false,
             host_mouse_capture_active: None,
@@ -463,6 +482,7 @@ impl ClientConnection {
         self.render_pending = false;
         self.pending_feedback = None;
         self.feedback_recovery = false;
+        self.ordinary_drain_recovery = None;
     }
 
     pub(crate) fn defer_full_render(&mut self) {
