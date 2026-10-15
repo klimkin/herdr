@@ -449,6 +449,8 @@ fn main() -> Result<()> {
     let load_hz: u64 = argument("--load-hz", "60").parse()?;
     let path = argument("--path", "output");
     let load = argument("--load", "quiet");
+    let idle_seconds: u64 = argument("--idle-seconds", "0").parse()?;
+    let settle_seconds: u64 = argument("--settle-seconds", "5").parse()?;
     let action_entry = argument("--action-entry", "tui");
     let action_phase = argument("--action-phase", "none");
     let layout = argument("--layout", "tabs");
@@ -477,6 +479,14 @@ fn main() -> Result<()> {
         || !matches!(path.as_str(), "output" | "echo" | "action" | "idle")
         || !matches!(load.as_str(), "quiet" | "visible" | "hidden")
         || (path == "idle" && load != "quiet")
+        || idle_seconds > 3600
+        || settle_seconds > 60
+        || (idle_seconds > 0
+            && (clients != 1
+                || panes != 1
+                || load != "quiet"
+                || stall_ms != 0
+                || slow_reader_ms != 0))
     {
         return Err("invalid sample/client/pane count, path, or load".into());
     }
@@ -515,6 +525,40 @@ fn main() -> Result<()> {
         .parse()?;
     if helper < before || helper > after {
         return Err("helper clock does not share host domain".into());
+    }
+    if idle_seconds > 0 {
+        use sha2::{Digest, Sha256};
+        std::thread::sleep(Duration::from_secs(settle_seconds));
+        let initial_bytes = session.clients[0].observer_bytes.load(Ordering::Relaxed);
+        let start = platform::monotonic_ns()?;
+        std::thread::sleep(Duration::from_secs(idle_seconds));
+        let end = platform::monotonic_ns()?;
+        let terminal_bytes = session.clients[0]
+            .observer_bytes
+            .load(Ordering::Relaxed)
+            .saturating_sub(initial_bytes);
+        // Keep CPU counters readable for a sample after the measured endpoint.
+        std::thread::sleep(Duration::from_secs(1));
+        let report = json!({
+            "run_id": run_id, "path": "idle", "samples": [],
+            "measurement_first_intended_ns": start,
+            "measurement_last_intended_ns": end,
+            "idle_seconds": idle_seconds, "settle_seconds": settle_seconds,
+            "terminal_bytes_during_measurement": terminal_bytes,
+            "server_pid": session.server.as_ref().map(std::process::Child::id),
+            "client_pids": [session.clients[0].child.process_id()],
+            "base": session.base, "binary": session.binary, "probe": session.probe,
+            "binary_sha256": format!("{:x}", Sha256::digest(std::fs::read(&session.binary)?)),
+            "clock_validation_ns": [before, helper, after],
+            "geometry": [120, 40], "platform": std::env::consts::OS,
+            "endpoint": "outer-PTY committed terminal bytes"
+        });
+        std::fs::write(
+            output.join("samples.json"),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        println!("Report: {}", output.join("samples.json").display());
+        return Ok(());
     }
     let pane_list = session.api("pane.list", json!({}))?;
     let workspace = pane_list["panes"][0]["workspace_id"]
