@@ -15,6 +15,7 @@ use std::io::{self, IsTerminal, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
+#[cfg(unix)]
 use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::ListenerNonblockingMode;
@@ -3454,9 +3455,7 @@ fn copy_reader_to_local_stream<R: io::Read>(
             if connection_stop.load(Ordering::Acquire) || bridge_stop.load(Ordering::Acquire) {
                 return Ok(total);
             }
-            // Match the endpoint writer: larger nonblocking Windows writes can make
-            // no progress when a client polls its 512-byte named-pipe buffer.
-            let chunk_len = (read - written).min(if cfg!(windows) { 512 } else { 4 * 1024 });
+            let chunk_len = (read - written).min(crate::ipc::PRIVATE_STREAM_WRITE_CHUNK);
             match stream.write(&buffer[written..written + chunk_len]) {
                 Ok(0) => thread::sleep(BRIDGE_IO_POLL),
                 Ok(count) => written += count,

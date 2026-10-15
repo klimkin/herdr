@@ -134,6 +134,76 @@ pub(crate) fn connect_local_stream_with_timeout(
     .map_err(local_server_connection_error)
 }
 
+/// Per-direction buffer for private bridge pipes. interprocess defaults to
+/// 512 bytes, which limits a nonblocking writer to one tiny chunk per reader poll.
+const PRIVATE_PIPE_BUFFER_SIZE: u32 = 64 * 1024;
+
+/// Largest nonblocking write that always fits an empty private pipe buffer.
+/// A nonblocking byte-mode pipe write larger than the free space makes no progress.
+pub(crate) const PRIVATE_PIPE_WRITE_CHUNK: usize = 16 * 1024;
+
+/// Named-pipe listener for private terminal traffic with larger pipe buffers
+/// than `interprocess::local_socket::Listener` can configure.
+pub(crate) struct PrivatePipeListener {
+    listener: interprocess::os::windows::named_pipe::PipeListener<
+        interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+        interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+    >,
+    nonblocking: Mutex<interprocess::local_socket::ListenerNonblockingMode>,
+}
+
+impl PrivatePipeListener {
+    pub(crate) fn bind(path: &std::path::Path) -> std::io::Result<Self> {
+        use interprocess::os::windows::named_pipe::PipeListenerOptions;
+        use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+        use widestring::U16CString;
+
+        let sddl = U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+        let security_descriptor = SecurityDescriptor::deserialize(&sddl)?;
+        let name = U16CString::from_str(format!(r"\\.\pipe\{}", path.to_string_lossy()))
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+        let mut options = PipeListenerOptions::new();
+        options.path = std::borrow::Cow::Owned(name);
+        options.security_descriptor = Some(security_descriptor);
+        options.input_buffer_size_hint = PRIVATE_PIPE_BUFFER_SIZE;
+        options.output_buffer_size_hint = PRIVATE_PIPE_BUFFER_SIZE;
+        Ok(Self {
+            listener: options.create_duplex()?,
+            nonblocking: Mutex::new(interprocess::local_socket::ListenerNonblockingMode::Neither),
+        })
+    }
+
+    pub(crate) fn accept(&self) -> std::io::Result<crate::ipc::LocalStream> {
+        use interprocess::local_socket::ListenerNonblockingMode;
+        let stream = self.listener.accept()?;
+        match *self
+            .nonblocking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            ListenerNonblockingMode::Accept => stream.set_nonblocking(false)?,
+            ListenerNonblockingMode::Stream => stream.set_nonblocking(true)?,
+            ListenerNonblockingMode::Neither | ListenerNonblockingMode::Both => {}
+        }
+        Ok(crate::ipc::LocalStream::NamedPipe(stream.into()))
+    }
+
+    pub(crate) fn set_nonblocking(
+        &self,
+        nonblocking: interprocess::local_socket::ListenerNonblockingMode,
+    ) -> std::io::Result<()> {
+        let mut mode = self
+            .nonblocking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.listener
+            .set_nonblocking(nonblocking.accept_nonblocking())?;
+        *mode = nonblocking;
+        Ok(())
+    }
+}
+
 pub(crate) fn local_server_security_descriptor(
 ) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
     use windows_sys::Win32::Security::{
