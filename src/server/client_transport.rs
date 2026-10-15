@@ -137,7 +137,7 @@ impl ClientWriter {
         self.render.queue.discard_pending_render();
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn test_paused() -> Self {
         let queue = ClientWriterQueue::new();
         Self {
@@ -146,7 +146,7 @@ impl ClientWriter {
         }
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn test_drain(&self) -> Vec<Vec<u8>> {
         let mut state = self.render.queue.lock_state();
         let mut frames = state.control.drain(..).collect::<Vec<_>>();
@@ -1420,11 +1420,11 @@ fn client_writer_loop(
     debug!("client writer thread exiting");
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn write_framed_bytes(stream: &mut LocalStream, data: &[u8]) -> bool {
     write_scoped_bytes(stream, data, 0)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn write_scoped_bytes(stream: &mut LocalStream, data: &[u8], scope: u64) -> bool {
     let ids = crate::latency_prof::queued_frames(data, 0);
     crate::latency_prof::emit_queued_frames(
