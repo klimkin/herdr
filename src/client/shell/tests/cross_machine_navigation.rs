@@ -942,6 +942,87 @@ fn harness_on_remote_last_workspace() -> Harness {
     h
 }
 
+#[test]
+fn selection_during_handoff_target_release_keeps_connections_online() {
+    let mut h = harness_on_remote_last_workspace();
+    h.press_next_workspace();
+    h.run_until("Local is projected", |h| {
+        h.shell().endpoint_is_active(&ClientEndpointId::Local)
+    });
+    let remote = h.remote_id();
+    h.select_machine(remote.clone());
+    h.select_pane(remote.clone(), "remote_2:pane");
+
+    assert!(
+        h.endpoints.connection(&ClientEndpointId::Local).is_some(),
+        "a newer selection must not close a healthy target awaiting release"
+    );
+    h.settle();
+    assert_eq!(h.remote.focused, "remote_2");
+    assert_eq!(h.endpoints.active_id(), &remote);
+    assert!(h.endpoints.active_surface_available());
+    assert!(h.shell().visible_endpoint_notice.is_none());
+}
+
+#[test]
+fn selection_during_handoff_source_sync_keeps_latest_focus() {
+    let mut h = harness_on_remote_last_workspace();
+    h.press_next_workspace();
+    h.run_until("Local is projected", |h| {
+        h.shell().endpoint_is_active(&ClientEndpointId::Local)
+    });
+    let remote = h.remote_id();
+    h.select_pane(remote.clone(), "remote_1:pane");
+    h.run_until("source is projected", |h| {
+        h.shell().endpoint_is_active(&remote)
+    });
+    assert!(h.handoff_in_progress());
+    h.select_pane(remote.clone(), "remote_2:pane");
+    h.settle();
+
+    assert_eq!(h.remote.focused, "remote_2", "latest selection must win");
+    assert_eq!(h.endpoints.active_id(), &remote);
+    assert!(h.endpoints.active_surface_available());
+    assert!(h.shell().visible_endpoint_notice.is_none());
+}
+
+#[test]
+fn selection_during_handoff_source_effects_fence_stays_silent() {
+    let mut h = harness_on_remote_last_workspace();
+    h.remote.inbox.lock().unwrap().clear();
+    h.remote.read = 0;
+    h.press_next_workspace();
+    h.run_until("Local is projected", |h| {
+        h.shell().endpoint_is_active(&ClientEndpointId::Local)
+    });
+    let remote = h.remote_id();
+    h.select_machine(remote.clone());
+    h.run_until("source presentation effects fence is pending", |h| {
+        h.shell().endpoint_is_active(&remote)
+            && h.remote.inbox.lock().unwrap().iter().any(|message| {
+                matches!(message, ClientMessage::EndpointControl { kind, .. }
+                    if kind == crate::protocol::endpoint::PRESENTATION_EFFECTS_SYNC_KIND)
+            })
+    });
+    assert!(h.handoff_in_progress());
+    h.select_pane(remote.clone(), "remote_2:pane");
+
+    assert!(
+        h.shell().visible_endpoint_notice.is_none(),
+        "normal supersession must not show an unavailable popup: {:?}",
+        h.shell()
+            .visible_endpoint_notice
+            .as_ref()
+            .map(|notice| &notice.body)
+    );
+    h.settle();
+    assert_eq!(h.remote.focused, "remote_2");
+    assert_eq!(h.endpoints.active_id(), &remote);
+    assert!(h.endpoints.active_surface_available());
+    assert!(!h.state.presentation_frozen);
+    assert!(h.shell().visible_endpoint_notice.is_none());
+}
+
 /// Reverse direction, early handoff phase: the client still shows the saved machine while
 /// Local activates, so the next press resolves to Local's first workspace again.
 #[test]

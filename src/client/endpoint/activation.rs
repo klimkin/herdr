@@ -253,18 +253,19 @@ impl PendingEndpointActivation {
             endpoint_id,
             target,
         });
-        // Source-on is already ordered and must finish before any replacement is allowed to
-        // begin. Later rapid selections only replace the retained intent; they never turn a
-        // safe restoration into an unavailable state.
-        let source_restoration_in_flight = matches!(
-            self.phase,
-            ActivationPhase::RestoringSource { .. }
-        ) || matches!(
-            &self.phase,
+        let rollback_in_flight = match &self.phase {
+            ActivationPhase::ReleasingTargetForRollback { .. }
+            | ActivationPhase::RestoringSource { .. } => true,
             ActivationPhase::SynchronizingPresentation { completion, .. }
-                if matches!(completion.as_ref(), ActivationCompletion::RestoredSource { .. })
-        );
-        if source_restoration_in_flight {
+            | ActivationPhase::AwaitingPresentationEffects { completion, .. } => {
+                matches!(
+                    completion.as_ref(),
+                    ActivationCompletion::RestoredSource { .. }
+                )
+            }
+            _ => false,
+        };
+        if rollback_in_flight {
             return ActivationRollback::Pending;
         }
         self.rollback(
@@ -935,7 +936,11 @@ impl PendingEndpointActivation {
             ..
         } = &self.phase
         {
-            return Ok((**completion).clone());
+            let mut completion = (**completion).clone();
+            if let ActivationCompletion::RestoredSource { successor, .. } = &mut completion {
+                *successor = self.successor.clone();
+            }
+            return Ok(completion);
         }
 
         let (lease, evidence, acknowledgement_revision, completion) = match &self.phase {
