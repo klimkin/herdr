@@ -1391,9 +1391,13 @@ fn agent_manifest_info(
 #[cfg(test)]
 pub(super) mod test_support {
     pub(crate) fn exiting_test_command() -> &'static str {
+        // Console programs such as whoami.exe fail to initialize when a test
+        // closes the ConPTY right after spawning and raise error dialogs, so
+        // tests use the GUI-subsystem no-op helper built by build.rs.
         #[cfg(windows)]
         {
-            "C:\\Windows\\System32\\whoami.exe"
+            option_env!("HERDR_TEST_EXIT_HELPER")
+                .expect("build.rs builds herdr-test-exit.exe for native Windows test builds")
         }
         #[cfg(not(windows))]
         {
