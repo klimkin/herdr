@@ -11,8 +11,33 @@ use base64::Engine as _;
 pub(crate) struct ComposedFrame {
     pub(crate) frame: FrameData,
     pub(crate) graphics: GraphicsOutput,
+    pub(crate) presentation: FramePresentation,
     #[cfg(feature = "latency-prof")]
     pub(crate) snapshot_diagnostic: Option<crate::latency_prof::FrameIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FramePresentation {
+    Coherent,
+    Preview,
+}
+
+impl ComposedFrame {
+    pub(crate) fn preview(mut frame: FrameData) -> Self {
+        frame.cursor = None;
+        frame.graphics.clear();
+        frame.hyperlinks.clear();
+        for cell in &mut frame.cells {
+            cell.hyperlink = None;
+        }
+        Self {
+            frame,
+            graphics: GraphicsOutput::default(),
+            presentation: FramePresentation::Preview,
+            #[cfg(feature = "latency-prof")]
+            snapshot_diagnostic: None,
+        }
+    }
 }
 
 impl From<FrameData> for ComposedFrame {
@@ -21,6 +46,7 @@ impl From<FrameData> for ComposedFrame {
         Self {
             frame,
             graphics,
+            presentation: FramePresentation::Coherent,
             #[cfg(feature = "latency-prof")]
             snapshot_diagnostic: None,
         }

@@ -766,7 +766,7 @@ async fn run_client_loop(
                     let frame = shell.compose(state.reported_size.0, state.reported_size.1);
                     let frozen = state.presentation_frozen;
                     state.presentation_frozen = false;
-                    state.present_graphics(&cleanup);
+                    state.present_graphics_cleanup(&cleanup);
                     state.presentation_frozen = frozen;
                     if let Some(frame) = frame {
                         state.present_frozen_chrome(frame);
@@ -1073,7 +1073,8 @@ async fn run_client_loop(
                     && graphics_owner_is_active(&state, &write_stream, &owner)
                     && !state.presentation_frozen
                     && state.shell.as_ref().is_some_and(|shell| {
-                        shell.accepts_direct_graphics_asset(&asset, response.image_id)
+                        !shell.has_pending_preview()
+                            && shell.accepts_direct_graphics_asset(&asset, response.image_id)
                     });
                 let size = state.reported_size;
                 let prepared = eligible
@@ -1698,7 +1699,8 @@ async fn run_client_loop(
                             }
                             let surface_asset_valid = match (state.shell.as_ref(), &surface_asset) {
                                 (Some(shell), Some(asset)) => {
-                                    shell.accepts_direct_graphics_asset(asset, image_id)
+                                    !shell.has_pending_preview()
+                                        && shell.accepts_direct_graphics_asset(asset, image_id)
                                 }
                                 (None, None) => true,
                                 _ => false,

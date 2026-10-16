@@ -866,6 +866,7 @@ pub(super) struct SnapshotDiagnostic {
 }
 
 pub(crate) struct ClientShellState {
+    pub(super) previews: super::preview::TextPreviews,
     pub(super) machine_diagnostics: super::machine_diagnostics::MachineDiagnostics,
     pub(super) config: ClientShellConfig,
     pub(super) snapshot: Option<Box<ClientShellSnapshot>>,
@@ -1047,6 +1048,7 @@ impl ClientShellState {
                 .extend(saved.collapsed_groups);
         }
         Self {
+            previews: Default::default(),
             machine_diagnostics: Default::default(),
             composition_frame: None,
             composition_buffer: None,

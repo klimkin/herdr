@@ -33,6 +33,38 @@ pub(crate) struct OverlayRender {
     pub(crate) cursor: Option<crate::protocol::CursorState>,
 }
 
+impl ShellHitMap {
+    pub(in crate::client::shell) fn apply_overlay(
+        &mut self,
+        rendered: OverlayRender,
+    ) -> Option<crate::protocol::CursorState> {
+        self.overlay_primary = rendered.primary;
+        self.overlay_clear = rendered.clear;
+        self.overlay_cancel = rendered.cancel;
+        self.navigator_popup = rendered.navigator_popup;
+        self.navigator_search = rendered.navigator_search;
+        self.navigator_rows = rendered.navigator_rows;
+        self.navigator_scrollbar = rendered.navigator_scrollbar;
+        self.navigator_scroll_metrics = rendered.navigator_scroll_metrics;
+        self.worktree_search = rendered.worktree_search;
+        self.worktree_rows = rendered.worktree_rows;
+        self.help_popup = rendered.help_popup;
+        self.help_scrollbar = rendered.help_scrollbar;
+        self.help_scroll_metrics = rendered.help_scroll_metrics;
+        self.help_max_scroll = rendered.help_max_scroll;
+        self.settings_popup = rendered.settings_popup;
+        self.settings_tabs = rendered.settings_tabs;
+        self.settings_choices = rendered.settings_choices;
+        self.product_announcement_scrollbar = rendered.product_announcement_scrollbar;
+        self.product_announcement_scroll_metrics = rendered.product_announcement_scroll_metrics;
+        self.product_announcement_max_scroll = rendered.product_announcement_max_scroll;
+        self.release_notes_scrollbar = rendered.release_notes_scrollbar;
+        self.release_notes_scroll_metrics = rendered.release_notes_scroll_metrics;
+        self.release_notes_max_scroll = rendered.release_notes_max_scroll;
+        rendered.cursor
+    }
+}
+
 pub(crate) fn render_client_overlay(
     b: &mut Buffer,
     o: &ClientShellOverlay,

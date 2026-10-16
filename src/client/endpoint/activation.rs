@@ -201,6 +201,10 @@ impl PendingEndpointActivation {
         &self.target.endpoint_id
     }
 
+    pub(crate) fn has_successor(&self) -> bool {
+        self.successor.is_some()
+    }
+
     fn geometry(&self) -> crate::protocol::ClientSurfaceSize {
         resize_geometry(&self.resize).expect("activation resize was validated before construction")
     }

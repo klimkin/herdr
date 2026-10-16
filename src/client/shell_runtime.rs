@@ -266,6 +266,15 @@ pub(super) fn begin_endpoint_activation(
             .is_some_and(|activation| !activation.can_retarget(&endpoint_id));
     if !replace_pending {
         if let Some(activation) = pending.as_mut() {
+            if let Some(shell) = state.shell.as_mut() {
+                shell.select_pending_preview(
+                    &endpoint_id,
+                    endpoints
+                        .connection(&endpoint_id)
+                        .map(|connection| connection.generation),
+                    target.clone(),
+                );
+            }
             if activation.can_retarget(&endpoint_id) {
                 let retarget_error = activation.retarget(target, endpoints).err();
                 if let Some(error) = retarget_error {
@@ -279,6 +288,13 @@ pub(super) fn begin_endpoint_activation(
                     *pending = None;
                     present_handoff_unavailable(state, message, None);
                 }
+            }
+            if let Some(frame) = state
+                .shell
+                .as_mut()
+                .and_then(|shell| shell.compose(state.reported_size.0, state.reported_size.1))
+            {
+                state.present_frame(frame);
             }
             return Ok(());
         }
@@ -308,6 +324,11 @@ pub(super) fn begin_endpoint_activation(
         }
         return Ok(());
     }
+    if !state.presentation_frozen {
+        if let Some(shell) = state.shell.as_mut() {
+            shell.remember_text_preview(state.reported_size.0, state.reported_size.1);
+        }
+    }
     let Some(shell) = state.shell.as_ref() else {
         return Ok(());
     };
@@ -319,6 +340,7 @@ pub(super) fn begin_endpoint_activation(
         state.reported_cell_size.1,
         state.pixel_mouse_available(),
     );
+    let preview_target = target.clone();
     match endpoint::PendingEndpointActivation::prepare(
         shell,
         endpoints,
@@ -338,13 +360,31 @@ pub(super) fn begin_endpoint_activation(
         }
         activation.start(endpoints)
     }) {
-        Ok(activation) => install_pending_activation(
-            state,
-            endpoint_commands,
-            pending,
-            next_surface_serial,
-            activation,
-        ),
+        Ok(activation) => {
+            if let Some(shell) = state.shell.as_mut() {
+                shell.select_pending_preview(
+                    &endpoint_id,
+                    endpoints
+                        .connection(&endpoint_id)
+                        .map(|connection| connection.generation),
+                    preview_target,
+                );
+            }
+            install_pending_activation(
+                state,
+                endpoint_commands,
+                pending,
+                next_surface_serial,
+                activation,
+            );
+            if let Some(frame) = state
+                .shell
+                .as_mut()
+                .and_then(|shell| shell.compose(state.reported_size.0, state.reported_size.1))
+            {
+                state.present_frame(frame);
+            }
+        }
         Err(endpoint::ActivationBeginError::Preflight(error)) => {
             if let Some(shell) = state.shell.as_mut() {
                 shell.clear_endpoint_focus_intent();
@@ -422,12 +462,13 @@ pub(super) fn complete_endpoint_activation(
         state.unfreeze_presentation();
         let (cleanup, frame) = {
             let shell = state.shell.as_mut().expect("checked client shell");
+            shell.finish_coherent_preview();
             (
                 shell.take_pending_graphics_cleanup(),
                 shell.compose(state.reported_size.0, state.reported_size.1),
             )
         };
-        state.present_graphics(&cleanup);
+        state.present_graphics_cleanup(&cleanup);
         if let Some(frame) = frame {
             state.present_frame(frame);
         }
@@ -467,6 +508,11 @@ pub(super) fn complete_endpoint_activation(
         endpoint::ActivationCompletion::AwaitingPresentationSync { .. }
         | endpoint::ActivationCompletion::AwaitingPresentationEffects => unreachable!(),
     };
+    if successor.is_none() {
+        if let Some(shell) = state.shell.as_mut() {
+            shell.clear_pending_preview();
+        }
+    }
     state.unfreeze_presentation();
     if let Some(target) = late_focus {
         let shell = state.shell.as_mut().expect("checked client shell");
@@ -501,7 +547,7 @@ pub(super) fn complete_endpoint_activation(
             shell.compose(state.reported_size.0, state.reported_size.1),
         )
     };
-    state.present_graphics(&cleanup);
+    state.present_graphics_cleanup(&cleanup);
     if let Some(frame) = frame {
         state.present_frame(frame);
     }
@@ -560,6 +606,7 @@ pub(super) fn present_handoff_unavailable(
     // source output blocked, while allowing this client-owned chrome frame through the freeze.
     state.freeze_presentation();
     let frame = state.shell.as_mut().and_then(|shell| {
+        shell.clear_pending_preview();
         shell.clear_endpoint_focus_intent();
         if let Some(machine) = machine {
             shell.receive_machine_unavailable(machine, message);
@@ -583,6 +630,11 @@ pub(super) fn rollback_endpoint_activation(
     let Some(activation) = pending.as_mut() else {
         return;
     };
+    if !activation.has_successor() {
+        if let Some(shell) = state.shell.as_mut() {
+            shell.clear_pending_preview();
+        }
+    }
     match activation.rollback(endpoints, error.clone(), source_release_rejected) {
         endpoint::ActivationRollback::Pending => state.freeze_presentation(),
         endpoint::ActivationRollback::Unavailable(message) => {
@@ -768,7 +820,7 @@ pub(super) fn install_client_shell_snapshot(
         (None, None, Vec::new())
     };
     apply_client_shell_input_source_changes(state, prefix_input_source);
-    state.present_graphics(&graphics_cleanup);
+    state.present_graphics_cleanup(&graphics_cleanup);
     if let Some(resize) = resize {
         endpoints.send_to(endpoint_id, &resize);
     }
