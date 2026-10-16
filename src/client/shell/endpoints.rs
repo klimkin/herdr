@@ -140,6 +140,7 @@ impl ClientShellState {
                 .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
         });
         self.endpoints = next;
+        self.previews.retain_endpoints(&self.endpoints);
         if self.valid_endpoint_focus_intent().is_none() {
             self.clear_endpoint_focus_intent();
         }

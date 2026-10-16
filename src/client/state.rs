@@ -72,8 +72,7 @@ pub(super) struct ClientState {
         Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     pub(super) redraw_on_focus_gained: bool,
     pub(super) repaint_pending: bool,
-    /// During a source-off-first handoff the currently blitted frame remains authoritative until
-    /// an acknowledged target snapshot/surface pair commits.
+    /// During handoff only client-owned text previews may replace the coherent presentation.
     pub(super) presentation_frozen: bool,
     /// Latest explicit Local selection awaiting this client's replacement Local connection.
     pub(super) deferred_local_activation: Option<endpoint::EndpointActivationIntent>,
@@ -304,7 +303,13 @@ impl ClientState {
         &mut self,
         writer: &mut impl std::io::Write,
     ) -> io::Result<()> {
-        if self.presentation_frozen || self.pending_native_cleanup.is_empty() {
+        if self.presentation_frozen
+            || self
+                .shell
+                .as_ref()
+                .is_some_and(shell::ClientShellState::has_pending_preview)
+            || self.pending_native_cleanup.is_empty()
+        {
             return Ok(());
         }
         writer.write_all(&self.pending_native_cleanup)?;
@@ -313,7 +318,15 @@ impl ClientState {
         Ok(())
     }
 
-    pub(super) fn present_graphics(&mut self, graphics: &[u8]) {
+    pub(super) fn present_graphics_cleanup(&mut self, graphics: &[u8]) {
+        if self
+            .shell
+            .as_ref()
+            .is_some_and(shell::ClientShellState::has_pending_preview)
+        {
+            self.pending_native_cleanup.extend_from_slice(graphics);
+            return;
+        }
         if self.presentation_frozen || graphics.is_empty() || !self.kitty_graphics_enabled {
             return;
         }
@@ -327,6 +340,10 @@ impl ClientState {
         patch: shell::ClientComposedSurfacePatch,
     ) -> io::Result<bool> {
         if self.presentation_frozen
+            || self
+                .shell
+                .as_ref()
+                .is_some_and(shell::ClientShellState::has_pending_preview)
             || self.repaint_pending
             || (self.kitty_graphics_enabled && !self.pending_native_cleanup.is_empty())
         {
@@ -600,16 +617,19 @@ impl ClientState {
         writer: &mut impl io::Write,
         frame_data: impl Into<frame_output::ComposedFrame>,
     ) -> bool {
-        if self.presentation_frozen {
+        let frame_data = frame_data.into();
+        let preview = frame_data.presentation == frame_output::FramePresentation::Preview;
+        if self.presentation_frozen && !preview {
             return false;
         }
         crate::latency_prof::zone!("client.present");
         let frame_output::ComposedFrame {
             frame: mut frame_data,
             graphics,
+            presentation: _,
             #[cfg(feature = "latency-prof")]
             snapshot_diagnostic,
-        } = frame_data.into();
+        } = frame_data;
         // With capture enabled, host OSC 8 can intercept Ctrl-click before plugins.
         // Keep semantic links internally and restore native links when capture is off.
         if self.shell_mouse_capture_preference {
@@ -630,6 +650,7 @@ impl ClientState {
             };
             (frame_data, encoded)
         };
+        let deferred_cleanup = preview.then(|| std::mem::take(&mut self.pending_native_cleanup));
         let result = self.write_composed_output(
             writer,
             &encoded.bytes,
@@ -637,6 +658,9 @@ impl ClientState {
             #[cfg(feature = "latency-prof")]
             snapshot_diagnostic,
         );
+        if let Some(cleanup) = deferred_cleanup {
+            self.pending_native_cleanup = cleanup;
+        }
         if let Err(error) = result {
             tracing::warn!(%error, "failed to present client frame");
             self.repaint_pending = true;
