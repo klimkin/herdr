@@ -1683,6 +1683,47 @@ mod tests {
 
     #[tokio::test]
     async fn agent_explain_evaluates_with_server_manifest_cache() {
+        // Isolate manifest dirs so a local override in the developer's real
+        // config dir cannot replace the bundled Codex rules under test.
+        struct ManifestDirsGuard {
+            _lock: std::sync::MutexGuard<'static, ()>,
+            base: std::path::PathBuf,
+            old_config: Option<std::ffi::OsString>,
+            old_state: Option<std::ffi::OsString>,
+        }
+        impl Drop for ManifestDirsGuard {
+            fn drop(&mut self) {
+                for (key, value) in [
+                    ("XDG_CONFIG_HOME", self.old_config.take()),
+                    ("XDG_STATE_HOME", self.old_state.take()),
+                ] {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+                crate::detect::manifest::reload_manifests();
+                let _ = std::fs::remove_dir_all(&self.base);
+            }
+        }
+        let lock = crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = std::env::temp_dir().join(format!(
+            "herdr-agent-explain-manifest-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let _dirs = ManifestDirsGuard {
+            _lock: lock,
+            old_config: std::env::var_os("XDG_CONFIG_HOME"),
+            old_state: std::env::var_os("XDG_STATE_HOME"),
+            base: base.clone(),
+        };
+        std::env::set_var("XDG_CONFIG_HOME", base.join("config"));
+        std::env::set_var("XDG_STATE_HOME", base.join("state"));
+        crate::detect::manifest::reload_manifests();
+
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
