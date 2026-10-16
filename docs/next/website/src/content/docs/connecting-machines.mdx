@@ -59,6 +59,8 @@ Run `herdr` to open the UI. If a local client is already open, added and enabled
 
 Choose a machine or one of its workspaces in the sidebar. The selected machine receives your pane input and terminal size, and supplies the visible terminal content and graphics. Other connected machines keep updating their workspace information, agent states, and notifications without streaming their pane screens.
 
+During a machine switch, the selected workspace or agent highlights immediately while the connection synchronizes. When available, Herdr shows retained terminal text for that view until its fresh screen arrives. Retained views do not accept pane input or replay graphics. You can keep navigating machines and agents during synchronization. If the connection or terminal size changes, Herdr shows a syncing placeholder instead.
+
 Click the arrow beside any machine to collapse or expand its workspace list without switching away from your current workspace. This also works while that machine is reconnecting.
 
 For keyboard navigation, press `prefix+w`, then use the workspace navigation keys (Up/Down by default) to highlight workspaces across connected machines in sidebar order. Enter activates the highlighted workspace; Esc or the prefix key cancels without switching. Compact and expanded sidebars reveal the highlighted row, including under a collapsed machine. On desktop, navigation wraps at the ends; the mobile switcher stops at the first or last workspace. Disconnected machines are skipped.

@@ -96,6 +96,11 @@ bench-render-scale:
 bench-terminal-targets:
     cargo test --release --locked --bin herdr terminal_target_lookup_profile -- --ignored --nocapture --test-threads=1
 
+# Profile committed machine-selection output with controlled simulated RTT.
+[unix]
+bench-machine-switch:
+    cargo test --release --locked --bin herdr machine_switch_profile -- --ignored --nocapture --test-threads=1
+
 # Profile Windows foreground inspection of isolated idle shells, without a server.
 [windows]
 bench-process-inspection:

@@ -10,6 +10,9 @@ impl ClientShellState {
     }
 
     pub(super) fn enter_copy_mode(&mut self, outcome: &mut ClientShellInput) -> bool {
+        if self.has_pending_preview() {
+            return false;
+        }
         let pane_id = match self.focused_pane_id() {
             Some(pane_id) => pane_id,
             None => return false,

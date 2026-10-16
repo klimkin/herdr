@@ -25,6 +25,13 @@ use crate::protocol::{ClientMessage, ClientSurfaceSize, ServerMessage};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
+#[path = "machine_switch_profile.rs"]
+mod machine_switch_profile;
+
+#[path = "preview_regressions.rs"]
+mod preview_regressions;
+
 type SentMessages = Arc<Mutex<Vec<ClientMessage>>>;
 
 #[derive(Clone)]

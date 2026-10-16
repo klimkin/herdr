@@ -89,6 +89,7 @@ impl ClientShellState {
                 .filter(|_| valid_navigation_target)
                 .or_else(|| pending_workspace_highlight.map(|pending| &pending.target)),
             reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
+            selected_agent_id: None,
             dragged_workspace_id: None,
             workspace_drop_indicator_row: None,
         };
@@ -167,6 +168,9 @@ impl ClientShellState {
         rows: u16,
     ) -> Option<crate::client::frame_output::ComposedFrame> {
         crate::latency_prof::zone!("client.compose");
+        if self.previews.pending.is_some() {
+            return self.compose_pending_preview(cols, rows);
+        }
         self.retained_rename = None;
         self.last_composed_at = Some(std::time::Instant::now());
         self.selection_repaint_deadline = None;
@@ -253,6 +257,7 @@ impl ClientShellState {
                     .filter(|_| valid_navigation_target)
                     .or_else(|| pending_workspace_highlight.map(|pending| &pending.target)),
                 reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
+                selected_agent_id: None,
                 dragged_workspace_id,
                 workspace_drop_indicator_row,
             },
@@ -709,32 +714,7 @@ impl ClientShellState {
                 )?;
                 overlay_area = rendered.area;
                 occlusion.cover(rendered.area);
-                self.hits.overlay_primary = rendered.primary;
-                self.hits.overlay_clear = rendered.clear;
-                self.hits.overlay_cancel = rendered.cancel;
-                self.hits.navigator_popup = rendered.navigator_popup;
-                self.hits.navigator_search = rendered.navigator_search;
-                self.hits.navigator_rows = rendered.navigator_rows;
-                self.hits.navigator_scrollbar = rendered.navigator_scrollbar;
-                self.hits.navigator_scroll_metrics = rendered.navigator_scroll_metrics;
-                self.hits.worktree_search = rendered.worktree_search;
-                self.hits.worktree_rows = rendered.worktree_rows;
-                self.hits.help_popup = rendered.help_popup;
-                self.hits.help_scrollbar = rendered.help_scrollbar;
-                self.hits.help_scroll_metrics = rendered.help_scroll_metrics;
-                self.hits.help_max_scroll = rendered.help_max_scroll;
-                self.hits.settings_popup = rendered.settings_popup;
-                self.hits.settings_tabs = rendered.settings_tabs;
-                self.hits.settings_choices = rendered.settings_choices;
-                self.hits.product_announcement_scrollbar = rendered.product_announcement_scrollbar;
-                self.hits.product_announcement_scroll_metrics =
-                    rendered.product_announcement_scroll_metrics;
-                self.hits.product_announcement_max_scroll =
-                    rendered.product_announcement_max_scroll;
-                self.hits.release_notes_scrollbar = rendered.release_notes_scrollbar;
-                self.hits.release_notes_scroll_metrics = rendered.release_notes_scroll_metrics;
-                self.hits.release_notes_max_scroll = rendered.release_notes_max_scroll;
-                rendered.cursor
+                self.hits.apply_overlay(rendered)
             };
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
             self.overlay_buffer = Some(composed);
@@ -784,6 +764,7 @@ impl ClientShellState {
         Some(crate::client::frame_output::ComposedFrame {
             frame,
             graphics,
+            presentation: crate::client::frame_output::FramePresentation::Coherent,
             #[cfg(feature = "latency-prof")]
             snapshot_diagnostic,
         })
