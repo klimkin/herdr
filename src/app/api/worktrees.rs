@@ -650,14 +650,8 @@ mod tests {
         app
     }
 
-    #[cfg(windows)]
     fn test_shell() -> &'static str {
-        "C:\\Windows\\System32\\whoami.exe"
-    }
-
-    #[cfg(not(windows))]
-    fn test_shell() -> &'static str {
-        "/usr/bin/true"
+        crate::app::exiting_test_command()
     }
 
     fn app_with_parent(repo: &Path) -> App {

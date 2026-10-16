@@ -1024,7 +1024,7 @@ mod tests {
 
     #[cfg(windows)]
     fn test_restore_shell() -> &'static str {
-        "C:\\Windows\\System32\\whoami.exe"
+        crate::app::exiting_test_command()
     }
 
     #[cfg(not(windows))]
