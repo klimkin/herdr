@@ -56,8 +56,6 @@ impl NativeDeadlineWaiter {
     }
 
     fn arm(&self, deadline: Instant) -> io::Result<()> {
-        let now = Instant::now();
-        let delay = deadline.saturating_duration_since(now);
         let mut target = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -66,8 +64,9 @@ impl NativeDeadlineWaiter {
         if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut target) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        // Sample the kernel clock after Instant: sampling skew delays the
-        // target slightly rather than causing presentation before eligibility.
+        // Sample the kernel clock first so preemption cannot extend the deadline.
+        // The wait loop checks eligibility if sampling skew arms an early target.
+        let delay = deadline.saturating_duration_since(Instant::now());
         let seconds = delay.as_secs().try_into().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "deadline exceeds timer range")
         })?;
