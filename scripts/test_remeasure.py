@@ -10,7 +10,22 @@ import unittest
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 from remeasure_report import _verify_capture, cpu_intervals, distribution, report
-from remeasure_resources import Resources
+from remeasure_resources import Resources, descendants
+
+
+class Ownership(unittest.TestCase):
+    def test_descendants_skip_orphans_older_than_a_pid_reusing_parent(self):
+        def process(ppid, start):
+            return {"ppid": ppid, "start": start, "cpu_ns": 0, "name": "x"}
+
+        processes = {
+            10: process(1, 200),
+            20: process(10, 100),
+            21: process(20, 150),
+            30: process(10, 200),
+            40: process(30, 300),
+        }
+        self.assertEqual(descendants(processes, 10), {30, 40})
 
 
 class Distributions(unittest.TestCase):
