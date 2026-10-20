@@ -23,15 +23,21 @@ class Snapshot(TypedDict):
 
 
 def descendants(processes: Mapping[int, Process], pid: int) -> set[int]:
-    """Return descendant PIDs, excluding the root and tolerating parent cycles."""
+    """Return descendant PIDs, excluding the root and tolerating parent cycles.
+
+    An orphan keeps naming its exited parent's PID, so it looks like a child of
+    any later process reusing that PID. A real child never starts before its parent.
+    """
     children: dict[int, list[int]] = {}
     for child, process in processes.items():
         children.setdefault(process["ppid"], []).append(child)
     visited = {pid}
     pending = [pid]
     while pending:
-        for child in children.get(pending.pop(), ()):
-            if child not in visited:
+        parent = pending.pop()
+        parent_start = processes[parent]["start"] if parent in processes else None
+        for child in children.get(parent, ()):
+            if child not in visited and (parent_start is None or processes[child]["start"] >= parent_start):
                 visited.add(child)
                 pending.append(child)
     visited.remove(pid)
