@@ -1182,6 +1182,7 @@ struct WindowsProcessEntry {
     pid: u32,
     parent_pid: u32,
     name: String,
+    creation_time: OnceLock<Option<u64>>,
     command: OnceLock<WindowsProcessCommand>,
 }
 
@@ -1189,6 +1190,23 @@ impl WindowsProcessEntry {
     fn command(&self) -> &WindowsProcessCommand {
         self.command
             .get_or_init(|| read_process_command(self.pid, &self.name))
+    }
+
+    fn creation_time(&self) -> Option<u64> {
+        *self.creation_time.get_or_init(|| match self.command.get() {
+            Some(command) => command.creation_time,
+            None => process_start_token(self.pid),
+        })
+    }
+
+    /// Toolhelp keeps reporting an exited parent's pid, so an orphan looks
+    /// like a child of any later process that reuses that pid. A real child
+    /// never predates its parent.
+    fn may_have_created(&self, child: &Self) -> bool {
+        match (self.creation_time(), child.creation_time()) {
+            (Some(parent), Some(child)) => parent <= child,
+            _ => true,
+        }
     }
 }
 
@@ -2021,9 +2039,16 @@ fn process_is_ancestor(ancestor_pid: u32, descendant_pid: u32, snapshot: &Proces
     let mut current = descendant_pid;
     let mut visited = HashSet::new();
     while visited.insert(current) {
-        let Some(parent) = snapshot.entry(current).map(|entry| entry.parent_pid) else {
+        let Some(entry) = snapshot.entry(current) else {
             return false;
         };
+        let parent = entry.parent_pid;
+        if snapshot
+            .entry(parent)
+            .is_some_and(|parent| !parent.may_have_created(entry))
+        {
+            return false;
+        }
         if parent == ancestor_pid {
             return true;
         }
@@ -2038,25 +2063,19 @@ fn process_is_ancestor(ancestor_pid: u32, descendant_pid: u32, snapshot: &Proces
 
 fn descendant_entries(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<&WindowsProcessEntry> {
     let mut output = Vec::new();
-    let mut queue = VecDeque::new();
-    let mut visited = HashSet::new();
-    visited.insert(root_pid);
-    if let Some(root_children) = snapshot.children_by_parent.get(&root_pid) {
-        for &index in root_children {
-            let entry = &snapshot.entries[index];
-            if visited.insert(entry.pid) {
-                queue.push_back(entry);
-            }
-        }
-    }
-    while let Some(entry) = queue.pop_front() {
-        output.push(entry);
-        if let Some(next) = snapshot.children_by_parent.get(&entry.pid) {
-            for &index in next {
-                let child = &snapshot.entries[index];
-                if visited.insert(child.pid) {
-                    queue.push_back(child);
-                }
+    let mut visited = HashSet::from([root_pid]);
+    let mut queue = VecDeque::from([(root_pid, snapshot.entry(root_pid))]);
+    while let Some((pid, parent)) = queue.pop_front() {
+        let Some(children) = snapshot.children_by_parent.get(&pid) else {
+            continue;
+        };
+        for &index in children {
+            let child = &snapshot.entries[index];
+            if visited.insert(child.pid)
+                && parent.is_none_or(|parent| parent.may_have_created(child))
+            {
+                output.push(child);
+                queue.push_back((child.pid, Some(child)));
             }
         }
     }
@@ -2096,6 +2115,7 @@ fn snapshot_processes() -> Vec<WindowsProcessEntry> {
             pid,
             parent_pid: entry.th32ParentProcessID,
             name,
+            creation_time: OnceLock::new(),
             command: OnceLock::new(),
         });
         ok = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
@@ -5421,6 +5441,52 @@ mod tests {
     }
 
     #[test]
+    fn windows_process_tree_ignores_orphans_older_than_a_pid_reusing_parent() {
+        let entries = vec![
+            test_entry_with_creation_time(10, 1, "cmd.exe", &["cmd.exe"], Some(200)),
+            test_entry_with_creation_time(20, 10, "codex.exe", &["codex.exe"], Some(100)),
+            test_entry_with_creation_time(21, 20, "node.exe", &["node.exe"], Some(150)),
+            test_entry_with_creation_time(30, 10, "git.exe", &["git.exe"], Some(200)),
+            test_entry_with_creation_time(40, 30, "ssh.exe", &["ssh.exe"], Some(300)),
+        ];
+        let snapshot = super::ProcessSnapshot::new(entries.clone());
+
+        assert_eq!(
+            super::descendant_entries(10, &snapshot)
+                .iter()
+                .map(|entry| entry.pid)
+                .collect::<Vec<_>>(),
+            vec![30, 40]
+        );
+        assert!(!super::process_is_ancestor(10, 21, &snapshot));
+        assert!(super::process_is_ancestor(10, 40, &snapshot));
+        assert_eq!(
+            super::select_pane_foreground_job(10, &entries)
+                .unwrap()
+                .process_group_id,
+            10
+        );
+    }
+
+    #[test]
+    fn windows_idle_shell_with_pid_reused_parent_orphan_stays_available() {
+        let entries = vec![
+            test_entry_with_creation_time(10, 1, "cmd.exe", &["cmd.exe"], Some(200)),
+            test_entry_with_creation_time(20, 10, "vctip.exe", &["vctip.exe"], Some(100)),
+        ];
+        let snapshot = super::ProcessSnapshot::new(entries);
+
+        assert_eq!(
+            super::available_pane_shell_from_snapshot(10, &snapshot).as_deref(),
+            Some("cmd.exe")
+        );
+        assert_eq!(
+            super::session_processes_from_snapshot(10, &snapshot),
+            vec![10]
+        );
+    }
+
+    #[test]
     fn windows_process_tree_returns_shell_when_candidate_parent_chain_cycles() {
         let entries = vec![
             test_entry(10, 40, "powershell.exe", &["powershell.exe"]),
@@ -5487,6 +5553,7 @@ mod tests {
             pid,
             parent_pid,
             name: name.to_string(),
+            creation_time: super::OnceLock::new(),
             command,
         }
     }
@@ -5511,6 +5578,7 @@ mod tests {
             pid,
             parent_pid,
             name: name.to_string(),
+            creation_time: super::OnceLock::new(),
             command,
         }
     }
